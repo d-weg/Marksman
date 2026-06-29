@@ -313,19 +313,46 @@ pub fn commit_edits(
 
     let changed = vfs.changed();
     let changed_rel: Vec<String> = changed.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
+    let changed_set: HashSet<String> = changed_rel.iter().cloned().collect();
 
-    // Baseline = disk state of the touched files (disk is untouched until commit).
-    let baseline_files: Vec<(String, String)> = changed_rel
+    // Gate over the BLAST RADIUS, not just the edited files: an edit (e.g. a signature change)
+    // can break a CALLER in a file we never touched. "Affected" = the changed files + their
+    // direct reverse-import dependents — a bounded slice of the import graph, never the whole
+    // project. (A rename already rewrites every reference into `changed`; this matters for
+    // replace_node / structural edits whose ripple reaches importers.)
+    let mut affected: Vec<String> = changed_rel.clone();
+    {
+        let mut seen = changed_set.clone();
+        for c in &changed_rel {
+            for importer in reverse_imports(c) {
+                if seen.insert(importer.clone()) {
+                    affected.push(importer);
+                }
+            }
+        }
+    }
+
+    // Baseline = disk state of every affected file (disk is untouched until commit).
+    let baseline_files: Vec<(String, String)> = affected
         .iter()
         .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
         .collect();
     let baseline = lsp.diagnostics(&baseline_files)?;
     let baseline_keys: HashSet<String> = baseline.iter().map(diag_key).collect();
 
-    // After = overlay state of the touched files.
-    let after_files: Vec<(String, String)> = changed_rel
+    // After = overlay (edited) content for the changed files; disk content for the dependents
+    // (their source is unchanged, but tsserver re-checks them against the overlaid changed
+    // files, so a freshly-broken caller surfaces here).
+    let after_files: Vec<(String, String)> = affected
         .iter()
-        .filter_map(|rel| vfs.read(Path::new(rel)).map(|c| (rel.clone(), c)))
+        .filter_map(|rel| {
+            if changed_set.contains(rel) {
+                vfs.read(Path::new(rel))
+            } else {
+                std::fs::read_to_string(root.join(rel)).ok()
+            }
+            .map(|c| (rel.clone(), c))
+        })
         .collect();
     let after = lsp.diagnostics(&after_files)?;
     let new: Vec<&Diag> = after.iter().filter(|d| !baseline_keys.contains(&diag_key(d))).collect();
