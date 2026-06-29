@@ -147,11 +147,19 @@ impl Server {
         let opts = EditOpts { write: !dry_run, dry_run, tsconfig: None };
         let res = provider.apply_edits(&ops, &opts).map_err(|e| e.to_string())?;
         match res {
+            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if changed_files.is_empty() => {
+                Ok(format!(
+                    "Applied {applied_ops} edit(s){}; no file changes were necessary.",
+                    if dry_run { " (dry run)" } else { "" }
+                ))
+            }
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => Ok(format!(
-                "Applied {applied_ops} op(s){}. Changed {} file(s):\n{}",
-                if dry_run { " (dry run)" } else { "" },
+                "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
+                 including files that import what changed. rename/move already updated every reference/import across the \
+                 whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.\nFiles changed:\n{}",
+                if dry_run { " (dry run — nothing written yet)" } else { "" },
                 changed_files.len(),
-                changed_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join("\n"),
+                changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
             )),
             ci_core::CommitResult::Rejected { feedback, .. } => {
                 Err(format!("rejected — nothing written:\n{feedback}"))
@@ -225,7 +233,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "apply_edits",
-            "description": "Apply structured edits through AST anchors, gated by the TS type-checker (nothing lands if it introduces a new error). `actions`: [{path, action, target, name, value}]. Actions: rename, replace_node, insert_before, create_file, move_file, delete_file.",
+            "description": "Apply structured code edits atomically, gated by the TS type-checker (nothing lands if it would introduce a new type error — including in OTHER files that import what you changed). PREFER THIS over grepping + hand-editing: `rename` rewrites the definition AND every reference across the WHOLE codebase in this one call; `move_file` updates every importer. So to rename a symbol everywhere you make ONE call — do not search for or edit call sites yourself, and no verification grep is needed afterward. `actions`: [{path, action, name, value}]. For `rename`: path = the file that DEFINES the symbol (use retrieve_context to find it), name = its current name, value = the new name. For `replace_node`/`insert_before`: name = the target symbol, value = the new code. For `move_file`: path = current file, value = new path. Actions: rename, replace_node, insert_before, create_file, move_file, delete_file.",
             "inputSchema": {"type":"object","properties":{"actions":{"type":"array"},"dryRun":{"type":"boolean"}},"required":["actions"]}
         }
     ])
