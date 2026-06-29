@@ -51,7 +51,64 @@ The merge gives sub-symbol precision **with no external dependency** for the AST
 compiled-in Rust crate) and **no measurable index cost** — the best of both.
 
 ## Notes
-- Edit-gate latency is dominated by the TS language server warmup (~5s first call) and is not a
-  fair Rust-vs-Node number; omitted.
+- Edit-gate latency: the default write engine is now **ts-morph** (in-process, synchronous),
+  kept warm via prewarm, so a full rename + blast-radius gate is **~0.9s** (vs a cold LSP
+  server's ~68s; `CI_EDIT_ENGINE=lsp` keeps the generic fallback). End-to-end effect is in the
+  Agent A/B benchmark below.
 - Method: `--release` binary, `min of 3` after a discarded warmup run to control for
   scip-typescript / OS-cache effects.
+
+## Agent A/B benchmark — does the tool actually help an agent? (end-to-end, LIVE-AGENT)
+
+The above are micro-benchmarks. This is the one that matters: the **same agent (Claude Code
+headless, sonnet 4.6) on the same tasks**, with and without codeindex, fully accounted. Harness:
+`scripts/agent-bench/` (see its README for the trust properties — one variable, an objective
+per-task `check`, clean git + index reset each run, tokens straight from Claude Code's JSON,
+every task reported). Three arms: **baseline** (no tool), **rust** (codeindex-rs MCP), **ts** (the
+Node `codeindex` MCP). Target repo: the Node `codeindex` itself (~600-symbol TS). **Median of 3
+runs.** `sec` = wall-clock for the whole agent run.
+
+| task | arm | in_tok | out_tok | turns | sec | ok |
+|---|---|--:|--:|--:|--:|:--:|
+| T1-rename | baseline | 165658 | 940 | 8 | 23 | 3/3 |
+|  | **rust** | **102264** | **563** | **4** | **15** | 3/3 |
+|  | ts | 107015 | 604 | 4 | 19 | 3/3 |
+| T2-move | baseline | 231593 | 1190 | 11 | 31 | 3/3 |
+|  | **rust** | **75195** | **386** | **3** | **12** | 3/3 |
+|  | ts | 76504 | 389 | 3 | 12 | 3/3 |
+| T3-locate-edit | baseline | 100928 | 384 | 4 | 13 | 3/3 |
+|  | rust | 127121 | 549 | 5 | 14 | 3/3 |
+|  | ts | 130575 | 559 | 5 | 18 | 3/3 |
+
+### Totals (median per task, summed)
+
+| arm | input tok | output tok | sec | vs baseline (in / out / time) | success |
+|---|--:|--:|--:|---|--:|
+| baseline | 498179 | 2514 | 67 | — | 9/9 |
+| **rust** | **304580** | **1498** | **41** | **−39% / −40% / −38%** | 9/9 |
+| ts | 314094 | 1552 | 49 | −37% / −38% / −27% | 9/9 |
+
+**Headlines:**
+- **An agent with codeindex does ~39% less work (tokens) and finishes ~38% faster**, all 9/9.
+- **Rust ≈ the mature TS tool on tokens, but clearly faster on wall-clock** (−38% vs −27% time).
+  At equal turn counts (T1 4/4, T3 5/5) rust is faster end-to-end (T1 15s vs 19s, T3 14s vs 18s)
+  — native core + warm ts-morph + native embeddings. The time column is what surfaces the
+  rewrite's payoff that tokens alone hide.
+- **The win is concentrated in structural edits** — T2-move 3 turns vs baseline's 11, T1-rename
+  4 vs 8.
+
+**Honest caveats:**
+- **T3-locate is deliberately neutral** (a trivial one-liner): baseline is marginally leaner
+  (4 turns vs 5) because the tool call adds a step when the find is easy. Keeping a task the tool
+  does *not* win is what makes the average credible.
+- **All 9/9 succeeded, so the gate's robustness value is NOT in these numbers** — a type-checked
+  edit is insurance against broken edits, and insurance doesn't pay out on the happy path. The
+  measured win is efficiency; the resilience (catching an edit that breaks a caller in another
+  file) would surface only on harder, error-prone tasks.
+- **Scope:** 3 tasks, one single-package TS repo, sonnet 4.6, median of 3. The *shape* is robust;
+  the absolute deltas are this-repo/these-tasks.
+- The `ts` arm runs the original codeindex's **current** ranker; part of rust's edge may be its
+  improved retrieval ranking, not only Rust speed. A clean read-vs-write isolation needs ranker
+  parity.
+
+Reproduce: `bash scripts/agent-bench/go.sh --runs 3` (needs `$ANTHROPIC_API_KEY`).
