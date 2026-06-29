@@ -16,4 +16,5 @@ ci-index = { path = "../ci-index" }
 ci-retrieve = { path = "../ci-retrieve" }
 ci-build = { path = "../ci-build" }
 lang-ts = { path = "../lang-ts" }
+lang-rust = { path = "../lang-rust" }
 serde_json.workspace = true

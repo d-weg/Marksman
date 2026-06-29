@@ -1,0 +1,15 @@
+[package]
+name = "lang-rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust LanguageProvider: in-process tree-sitter (read). v0 = structure + import graph; edits via rust-analyzer on the roadmap."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+tree-sitter = "0.26.10"
+tree-sitter-rust = "0.24"
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

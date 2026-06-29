@@ -6,6 +6,7 @@ use std::path::Path;
 pub enum Lang {
     Ts,
     Tsx,
+    Rust,
     Markdown,
     Other,
 }
@@ -19,14 +20,15 @@ impl Lang {
         match path.extension().and_then(|e| e.to_str()) {
             Some("ts") | Some("mts") | Some("cts") => Lang::Ts,
             Some("tsx") => Lang::Tsx,
+            Some("rs") => Lang::Rust,
             Some("md") | Some("mdx") => Lang::Markdown,
             _ => Lang::Other,
         }
     }
 
-    /// True for languages a CodeDriver handles (indexed as code, editable).
+    /// True for languages a provider handles (indexed as code, editable).
     pub fn is_code(self) -> bool {
-        matches!(self, Lang::Ts | Lang::Tsx)
+        matches!(self, Lang::Ts | Lang::Tsx | Lang::Rust)
     }
 }
 

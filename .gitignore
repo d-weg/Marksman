@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 .codeindex/
+.codeindex-rs/
 .DS_Store
 
 # agent-bench: never commit the API key

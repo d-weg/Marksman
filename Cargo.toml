@@ -9,6 +9,7 @@ members = [
     "crates/ci-scip",
     "crates/ci-build",
     "crates/lang-ts",
+    "crates/lang-rust",
     "crates/ci-cli",
     "crates/ci-vfs",
     "crates/ci-lsp",

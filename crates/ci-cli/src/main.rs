@@ -7,10 +7,11 @@
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
 use ci_build::build_index;
-use ci_core::{Config, Manifest};
+use ci_core::{Config, LanguageProvider, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
+use lang_rust::RustProvider;
 use lang_ts::TsProvider;
 use std::path::{Path, PathBuf};
 use std::process::exit;
@@ -39,16 +40,39 @@ fn die(msg: impl std::fmt::Display) -> ! {
     exit(1);
 }
 
+/// Pick the language provider from the repo's manifests (and adjust the file globs for it),
+/// so Node tooling is only invoked for a TypeScript repo. Override with `CI_LANG=rust|ts`.
+/// v0 = dominant-language pick; full multi-provider dispatch is on the roadmap.
+fn select_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider> {
+    let forced = std::env::var("CI_LANG").ok();
+    let has_cargo = root.join("Cargo.toml").exists();
+    let has_pkg = root.join("package.json").exists();
+    let rust = match forced.as_deref() {
+        Some("rust") => true,
+        Some("ts") | Some("typescript") => false,
+        _ => has_cargo && !has_pkg,
+    };
+    if rust {
+        config.include = vec!["**/*.rs".into()];
+        config.languages = vec!["rust".into()];
+        config.exclude.push("**/target/**".into());
+        eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
+        Box::new(RustProvider::new(root))
+    } else {
+        eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
+        Box::new(TsProvider::index(root).unwrap_or_else(|e| die(e)))
+    }
+}
+
 fn cmd_index(root: &Path) {
-    let config = rust_config(root);
+    let mut config = rust_config(root);
     let embedder = StaticEmbedder::load(&model_dir()).unwrap_or_else(|e| die(e));
     let dim = embedder.dim();
 
-    eprintln!("[codeindex-rs] running scip-typescript on {} …", root.display());
-    let provider = TsProvider::index(root).unwrap_or_else(|e| die(e));
+    let provider = select_provider(root, &mut config);
 
     eprintln!("[codeindex-rs] embedding + indexing …");
-    let index = build_index(root, &config, &provider, |t| {
+    let index = build_index(root, &config, provider.as_ref(), |t| {
         embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim])
     })
     .unwrap_or_else(|e| die(e));
