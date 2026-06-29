@@ -5,31 +5,48 @@
 use ci_core::{
     CommitResult, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node, Result,
 };
+use ci_edit::GateEngine;
 use ci_scip::ScipIndex;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 mod ast;
+mod tsmorph;
 
 /// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`.
 fn npm_cache() -> PathBuf {
     std::env::var("CI_NPM_CACHE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
 }
 
-/// A persistent TS language server, loaded once and reused across edits. The whole
-/// reason rust `apply_edits` was 68s was a COLD tsserver per call (project typecheck
-/// from scratch); keeping one warm here is the fix. Behind a Mutex so [`prewarm`] can
-/// load the project on a background thread while the agent is still searching/thinking.
-type WarmLsp = Arc<Mutex<Option<ci_lsp::LspClient>>>;
+/// A persistent, warmed-once gate engine (ts-morph sidecar or LSP server), reused across
+/// edits. The whole reason rust `apply_edits` was 68s was a COLD engine per call (project
+/// typecheck from scratch); keeping one warm here is the fix. Behind a Mutex so [`prewarm`]
+/// can load the project on a background thread while the agent is still searching/thinking.
+type WarmEngine = Arc<Mutex<Option<Box<dyn GateEngine + Send>>>>;
 
 #[derive(Clone)]
 pub struct TsProvider {
     root: PathBuf,
-    // Arc so the provider is cheap to clone out of the MCP server's lock; the SCIP
-    // index and the warm LSP are shared, not copied.
+    // Arc so the provider is cheap to clone out of the MCP server's lock; the SCIP index and
+    // the warm engine are shared, not copied.
     scip: Arc<ScipIndex>,
-    lsp: WarmLsp,
+    engine: WarmEngine,
+}
+
+/// Start the lightest available write engine for `root`: ts-morph in-process (synchronous,
+/// no LSP settle race) when its sidecar can start, else the generic LSP server. Override with
+/// `CI_EDIT_ENGINE=lsp|tsmorph`.
+fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
+    let pref = std::env::var("CI_EDIT_ENGINE").unwrap_or_default();
+    if pref != "lsp" {
+        match tsmorph::TsMorphClient::start(root) {
+            Ok(c) => return Ok(Box::new(c)),
+            Err(e) if pref == "tsmorph" => return Err(e), // forced: surface the failure
+            Err(_) => {} // auto: fall back to LSP
+        }
+    }
+    Ok(Box::new(ci_lsp::LspClient::start(root, TsProvider::ts_lsp_command())?))
 }
 
 impl TsProvider {
@@ -66,20 +83,21 @@ impl TsProvider {
         Ok(Self {
             root: root.to_path_buf(),
             scip: Arc::new(ScipIndex::load(index_scip)?),
-            lsp: Arc::new(Mutex::new(None)),
+            engine: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Start the TS language server and load the project NOW, on a background thread,
-    /// so the first `apply_edits` finds a warm server instead of paying the ~30s cold
-    /// project typecheck inline. Opening any source file makes tsserver load the whole
-    /// tsconfig project. The thread holds the LSP lock for the duration, so an
-    /// `apply_edits` that arrives mid-warm simply waits for it rather than racing in a
-    /// second cold server. Safe no-op if the server can't start (apply_edits falls back).
+    /// Start the write engine and load the project NOW, on a background thread, so the first
+    /// `apply_edits` finds it warm instead of paying the ~seconds cold project load inline.
+    /// The thread holds the engine lock for the duration, so an `apply_edits` that arrives
+    /// mid-warm simply waits for it rather than racing in a second cold engine. Safe no-op if
+    /// the engine can't start (apply_edits falls back to starting one fresh).
     pub fn prewarm(&self) {
-        let slot = self.lsp.clone();
+        let slot = self.engine.clone();
         let root = self.root.clone();
-        // A source file (with imports) to open so tsserver loads the project.
+        // A real source file to open: LSP needs it to load the tsconfig project (an empty
+        // diagnostics short-circuits); ts-morph loads at startup, so the round-trip just
+        // confirms it's ready.
         let warm_file = self
             .scip
             .import_graph()
@@ -94,13 +112,16 @@ impl TsProvider {
             if guard.is_some() {
                 return; // already warm
             }
-            if let Ok(mut client) = ci_lsp::LspClient::start(&root, Self::ts_lsp_command()) {
-                if let Some(f) = warm_file {
-                    if let Ok(content) = std::fs::read_to_string(root.join(&f)) {
-                        let _ = client.diagnostics(&[(f, content)]); // forces project load
+            if let Ok(mut engine) = start_engine(&root) {
+                match warm_file.and_then(|f| std::fs::read_to_string(root.join(&f)).ok().map(|c| (f, c))) {
+                    Some(file) => {
+                        let _ = engine.diagnostics(&[file]); // forces the project to load
+                    }
+                    None => {
+                        let _ = engine.diagnostics(&[]);
                     }
                 }
-                *guard = Some(client);
+                *guard = Some(engine);
             }
         });
     }
@@ -149,19 +170,19 @@ impl LanguageProvider for TsProvider {
     }
 
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        // Read structure from the loaded SCIP index; gate via the PERSISTENT TS language
-        // server (VFS overlay + baseline-diff diagnostics). Reuse the warm server from
-        // `prewarm` — locking blocks until an in-flight warm finishes, so we never start a
-        // second cold server. Only spawn fresh if prewarm never ran or failed.
+        // Read structure from the loaded SCIP index; gate via the PERSISTENT write engine
+        // (VFS overlay + baseline-diff diagnostics over the blast radius). Reuse the warm
+        // engine from `prewarm` — locking blocks until an in-flight warm finishes, so we
+        // never start a second cold engine. Only start fresh if prewarm never ran or failed.
         let timing = std::env::var("CI_TIMING").is_ok();
         let t0 = std::time::Instant::now();
-        let mut guard = self.lsp.lock().map_err(|_| Error::Driver("LSP lock poisoned".into()))?;
+        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
         if guard.is_none() {
-            *guard = Some(ci_lsp::LspClient::start(&self.root, Self::ts_lsp_command())?);
+            *guard = Some(start_engine(&self.root)?);
         }
-        let lsp = guard.as_mut().unwrap();
+        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
         if timing {
-            eprintln!("[timing] LSP ready (warm or fresh) {:?}", t0.elapsed());
+            eprintln!("[timing] engine ready (warm or fresh) {:?}", t0.elapsed());
         }
         let t1 = std::time::Instant::now();
         let structure_of = |f: &str| self.scip.structure(f).unwrap_or_default();
@@ -176,7 +197,7 @@ impl LanguageProvider for TsProvider {
         }
         let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
 
-        let r = ci_edit::commit_edits(&self.root, ops, &structure_of, lsp, opts, &reverse_imports);
+        let r = ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
         if timing {
             eprintln!("[timing] commit_edits (warmup+rename+gate) {:?}", t1.elapsed());
         }

@@ -498,6 +498,7 @@ dependencies = [
  "ci-edit",
  "ci-lsp",
  "ci-scip",
+ "serde_json",
  "tempfile",
  "tree-sitter",
  "tree-sitter-typescript",
