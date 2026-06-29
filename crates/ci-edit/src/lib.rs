@@ -168,6 +168,11 @@ fn apply_rename(
     let nodes = structure_of(file);
     let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.to_string()))?;
     let nr = node.name_range.as_ref().unwrap_or(&node.range);
+    // Warm the server: opening the file loads the tsconfig project, so rename sees
+    // every reference. A cold server returns an EMPTY edit (silent no-op rename).
+    if let Ok(content) = std::fs::read_to_string(root.join(file)) {
+        let _ = lsp.diagnostics(&[(file.to_string(), content)]);
+    }
     let uri = format!("file://{}", root.join(file).to_string_lossy());
     let params = json!({
         "textDocument": {"uri": uri},
