@@ -65,8 +65,8 @@ on a non-TS repo. Closing that is the next structural step.
 - [x] **Skeletal context (done).** `detailLevel` (`pointers`/`outline`/`full`) on
       `retrieve_context` inlines the top files with fn/method bodies folded to `{ /* … */ }`
       (`ci-core::elide_bodies` + tree-sitter `outline` in each provider). TS + Rust.
-      - [ ] `read_node` drill-down tool — fetch the precise full text + metadata of ONE anchor
-            (the elided body, on demand).
+      - [x] `read_node` drill-down tool (done) — full source + metadata of ONE anchor by `id`
+            or `name`, incl. `:body`/`:param`/`:return` sub-nodes.
       - [ ] secondary import-graph files auto-default to `outline` even when the call asks for
             `full` on the primaries.
 - [ ] **Surgical sub-node edits** — map `insert_in_body`/`replace_in_body`/`delete_in_body`/
