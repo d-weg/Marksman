@@ -47,8 +47,20 @@ def reset(repo, base):
     sh(["git", "clean", "-fdq", "-e", ".codeindex", "-e", ".codeindex-rs"], cwd=repo)
 
 
+# Nudge the codeindex arms to actually USE the tools — otherwise the benchmark
+# measures the agent's whim (it often defaults to grep + manual edits) instead of the
+# tool. The baseline gets no such nudge; it uses its standard tools.
+PREAMBLE = (
+    "You have codeindex MCP tools: retrieve_context (find relevant code for a task), "
+    "list_anchors (a file's symbols/anchors), apply_edits (structural edits — rename / "
+    "replace_node / move_file — type-checked before they land). Prefer them over grepping "
+    "and hand-editing.\n\nTask: "
+)
+
+
 def run_agent(repo, prompt, mcp_config, model):
-    cmd = [CLAUDE, "-p", prompt, "--output-format", "json", "--model", model,
+    full = (PREAMBLE + prompt) if mcp_config else prompt
+    cmd = [CLAUDE, "-p", full, "--output-format", "json", "--model", model,
            "--max-turns", "40", "--dangerously-skip-permissions"]
     tools = BASE_TOOLS + ("," + CI_TOOLS if mcp_config else "")
     if mcp_config:
