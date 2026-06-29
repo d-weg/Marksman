@@ -11,11 +11,73 @@ use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
+use lang_rust::RustProvider;
 use lang_ts::TsProvider;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// The active provider for this repo. Both variants are cheap to clone (Arc-shared / a
+/// PathBuf), so the server hands one out of its lock per call.
+#[derive(Clone)]
+enum AnyProvider {
+    Ts(TsProvider),
+    Rust(RustProvider),
+}
+
+impl AnyProvider {
+    /// Warm the write engine — TS only (Rust has no edit gate yet).
+    fn prewarm(&self) {
+        if let AnyProvider::Ts(t) = self {
+            t.prewarm();
+        }
+    }
+}
+
+impl LanguageProvider for AnyProvider {
+    fn granularity(&self) -> ci_core::Granularity {
+        match self {
+            AnyProvider::Ts(t) => t.granularity(),
+            AnyProvider::Rust(r) => r.granularity(),
+        }
+    }
+    fn structure(&self, file: &Path) -> ci_core::Result<Vec<Node>> {
+        match self {
+            AnyProvider::Ts(t) => t.structure(file),
+            AnyProvider::Rust(r) => r.structure(file),
+        }
+    }
+    fn import_graph(&self) -> ci_core::Result<ci_core::ImportGraph> {
+        match self {
+            AnyProvider::Ts(t) => t.import_graph(),
+            AnyProvider::Rust(r) => r.import_graph(),
+        }
+    }
+    fn apply_edits(&self, ops: &[ci_core::EditOp], opts: &EditOpts) -> ci_core::Result<ci_core::CommitResult> {
+        match self {
+            AnyProvider::Ts(t) => t.apply_edits(ops, opts),
+            AnyProvider::Rust(r) => r.apply_edits(ops, opts),
+        }
+    }
+}
+
+/// Build the provider for `root`: Rust (in-process tree-sitter, no Node) when it looks like a
+/// Rust repo, else TypeScript (scip-typescript). `CI_LANG=rust|ts` overrides.
+fn build_provider(root: &Path) -> Result<AnyProvider, String> {
+    let forced = std::env::var("CI_LANG").ok();
+    let rust = match forced.as_deref() {
+        Some("rust") => true,
+        Some("ts") | Some("typescript") => false,
+        _ => root.join("Cargo.toml").exists() && !root.join("package.json").exists(),
+    };
+    if rust {
+        eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
+        Ok(AnyProvider::Rust(RustProvider::new(root)))
+    } else {
+        Ok(AnyProvider::Ts(TsProvider::index(root).map_err(|e| e.to_string())?))
+    }
+}
 
 fn resolve_root() -> PathBuf {
     let argv: Vec<String> = std::env::args().collect();
@@ -44,7 +106,7 @@ struct Server {
     config: Config,
     // Behind Arc<Mutex> so it can be built + warmed on a background thread at startup
     // (see `start_prewarm`) and cheaply cloned out for each tool call.
-    provider: Arc<Mutex<Option<TsProvider>>>,
+    provider: Arc<Mutex<Option<AnyProvider>>>,
     embedder: Option<StaticEmbedder>,
 }
 
@@ -56,11 +118,11 @@ impl Server {
         Server { root, config, provider: Arc::new(Mutex::new(None)), embedder: None }
     }
 
-    /// Kick off building the TS provider (scip-typescript) AND warming the TS language
-    /// server on a background thread, at startup — so by the time the agent calls
-    /// `apply_edits` (after retrieving + thinking) the server is already warm, instead of
-    /// paying the ~30s cold project load inline. Holding the provider lock across the
-    /// build means a tool that needs the provider mid-build waits for it, not races it.
+    /// Build the provider for the repo AND warm the write engine on a background thread at
+    /// startup — so the first output-tool call finds it ready. For a TS repo this runs
+    /// scip-typescript + warms the language server; for a Rust repo it's instant (in-process
+    /// tree-sitter, no Node). Holding the provider lock across the build means a tool that
+    /// needs it mid-build waits, not races.
     fn start_prewarm(&self) {
         let slot = self.provider.clone();
         let root = self.root.clone();
@@ -69,20 +131,19 @@ impl Server {
             if g.is_some() {
                 return;
             }
-            if let Ok(p) = TsProvider::index(&root) {
-                p.prewarm(); // warms the LSP on its own background thread
+            if let Ok(p) = build_provider(&root) {
+                p.prewarm();
                 *g = Some(p);
             }
         });
     }
 
-    /// Get the TS provider, building it (scip-typescript + tree-sitter) if `start_prewarm`
-    /// hasn't finished. Returns a cheap clone (Arc-shared SCIP + warm LSP) so the caller
-    /// doesn't hold the lock. Needed by the output tools only.
-    fn provider(&self) -> Result<TsProvider, String> {
+    /// Get the provider, building it if `start_prewarm` hasn't finished. Returns a cheap
+    /// clone so the caller doesn't hold the lock. Needed by the output tools only.
+    fn provider(&self) -> Result<AnyProvider, String> {
         let mut g = self.provider.lock().map_err(|_| "provider lock poisoned".to_string())?;
         if g.is_none() {
-            let p = TsProvider::index(&self.root).map_err(|e| e.to_string())?;
+            let p = build_provider(&self.root)?;
             p.prewarm();
             *g = Some(p);
         }

@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node as TsNode, Parser};
 
+#[derive(Clone)]
 pub struct RustProvider {
     root: PathBuf,
 }
