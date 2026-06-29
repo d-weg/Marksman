@@ -75,7 +75,32 @@ impl GateEngine for LspClient {
         let old_uri = format!("file://{}", self.root().join(from).to_string_lossy());
         let new_uri = format!("file://{}", self.root().join(to).to_string_lossy());
         let params = json!({ "files": [{ "oldUri": old_uri, "newUri": new_uri }] });
-        self.request("workspace/willRenameFiles", params)
+        // A cold server (rust-analyzer mid-index) returns EMPTY until analyzed; retry until it
+        // produces the importer rewrites (mod-decl / use-path edits). An unimported file
+        // legitimately yields empty — that rare case just pays the retries once, then proceeds.
+        let mut last = json!({});
+        for attempt in 0..8 {
+            match self.request("workspace/willRenameFiles", params.clone()) {
+                Ok(we) if !workspace_edit_is_empty(&we) => return Ok(we),
+                Ok(we) => last = we,
+                Err(e) => {
+                    let m = e.to_string().to_lowercase();
+                    let transient = m.contains("-32602")
+                        || m.contains("-32801")
+                        || m.contains("content modified")
+                        || m.contains("loading")
+                        || m.contains("waiting")
+                        || m.contains("not ready");
+                    if !transient {
+                        return Err(e);
+                    }
+                }
+            }
+            if attempt < 7 {
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+            }
+        }
+        Ok(last)
     }
 }
 

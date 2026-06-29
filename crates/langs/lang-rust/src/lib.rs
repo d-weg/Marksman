@@ -371,6 +371,72 @@ mod tests {
         assert!(kinds.contains(&"body") && kinds.contains(&"returnType"), "sub-nodes: {kinds:?}");
     }
 
+    fn tiny_crate() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        dir
+    }
+
+    #[test]
+    #[ignore]
+    fn rust_gates_replace_node() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+        let p = RustProvider::new(root);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        // clean replace -> commits
+        let ok = p
+            .apply_edits(
+                &[EditOp::ReplaceNode {
+                    node_id: "src/lib.rs#add".into(),
+                    code: "pub fn add(a: i32, b: i32) -> i32 {\n    let s = a + b;\n    s\n}".into(),
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "clean replace must commit: {ok:?}");
+        assert!(fs::read_to_string(root.join("src/lib.rs")).unwrap().contains("let s = a + b"));
+
+        // type-error replace -> rejected, disk unchanged
+        let before = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let bad = p
+            .apply_edits(
+                &[EditOp::ReplaceNode {
+                    node_id: "src/lib.rs#add".into(),
+                    code: "pub fn add(a: i32, b: i32) -> i32 {\n    \"nope\"\n}".into(),
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(bad, CommitResult::Rejected { .. }), "type error must be rejected: {bad:?}");
+        assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), before, "disk untouched on reject");
+    }
+
+    #[test]
+    #[ignore]
+    fn rust_move_file() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(root.join("src/lib.rs"), "mod foo;\npub fn run() -> i32 {\n    foo::f()\n}\n").unwrap();
+        fs::write(root.join("src/foo.rs"), "pub fn f() -> i32 {\n    1\n}\n").unwrap();
+        let p = RustProvider::new(root);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        let res = p
+            .apply_edits(&[EditOp::MoveFile { from: "src/foo.rs".into(), to: "src/bar.rs".into() }], &opts)
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "move should commit: {res:?}");
+        assert!(root.join("src/bar.rs").exists(), "file moved to new path");
+        assert!(!root.join("src/foo.rs").exists(), "old path gone");
+        // rust-analyzer's willRename should rewrite the module decl so it still compiles
+        let lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("mod bar"), "mod decl rewritten to bar: {lib}");
+    }
+
     // Real gate end-to-end: spawns rust-analyzer (rustup component). #[ignore]; run with
     // `cargo test -p lang-rust -- --ignored`.
     #[test]
