@@ -33,15 +33,19 @@ on a non-TS repo. Closing that is the next structural step.
 
 ## Backlog (actionable, in dependency order)
 
-- [ ] **Rust provider (in progress)** — new `lang-rust` crate implementing `LanguageProvider`
-      via `tree-sitter-rust`: `structure()` (fns/structs/impls/methods + `#sym:body`/`:param`/
-      `:return`), `import_graph()` (`use` / `mod` resolution), `granularity()→Ast`. Read path
-      first (index + retrieve); edits behind a Rust `GateEngine` (rust-analyzer) later. Enables
-      dogfooding.
-- [ ] **Provider selection / registry** — replace the hardcoded `TsProvider` in
-      `ci-cli/src/main.rs` + `ci-mcp/src/main.rs` with `select_provider(root)` keyed on files
-      present (Cargo.toml/`.rs` → Rust; package.json/`.ts` → TS). v0 = dominant-language pick;
-      full multi-provider dispatch + lazy per-language tooling after.
+- [x] **Rust provider — read path (done).** `lang-rust` crate: `structure()` (fns/structs/
+      impls/methods + `#sym:body`/`:param.N`/`:return`), `import_graph()` (`mod` resolution),
+      `granularity()→Ast`, all in-process `tree-sitter-rust` (no Node). Indexes + retrieves Rust
+      (incl. CodeGraph itself) via CLI and MCP.
+      - [ ] **Rust write path** — edits behind a `GateEngine` over rust-analyzer (rename/refs/
+            diagnostics). `apply_edits` currently returns a read-only refusal for Rust.
+      - [ ] **Better Rust graph** — `use`-resolution (not just `mod` edges) + optional
+            `rust-analyzer scip` for compiler-accurate references.
+- [x] **Provider selection (done, v0).** `build_provider`/`select_provider` keyed on manifests
+      (Cargo.toml vs package.json; `CI_LANG` override) in `ci-cli` + `ci-mcp` — **Node only for a
+      TS repo now.**
+      - [ ] **Full registry** — multi-language repos (per-file dispatch), lazy per-language
+            tooling fetch, a provider manifest (enable/disable, pin versions).
 - [ ] **Skeletal context** — `detail_level` (`full`/`outline`/`signatures`) on
       `retrieve_context`; reuse `lang-ts/src/ast.rs` body location to elide `statement_block`s;
       secondary import-graph files default to `outline`; add a `read_node` drill-down tool.
