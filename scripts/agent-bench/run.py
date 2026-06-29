@@ -12,7 +12,7 @@ from Claude Code's own JSON; every task is reported.
 Requires a working `claude` CLI (set $CLAUDE_BIN if PATH `claude` is a broken stub) and, for
 headless runs, an $ANTHROPIC_API_KEY (org policy disables subscription headless).
 """
-import argparse, json, os, pathlib, statistics, subprocess, sys, time
+import argparse, json, os, pathlib, shutil, statistics, subprocess, sys, tempfile, time
 
 HERE = pathlib.Path(__file__).parent
 TASKS = json.loads((HERE / "tasks.json").read_text())
@@ -42,9 +42,37 @@ def sh(cmd, cwd=None, env=None):
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
 
 
+# Index dirs are NOT plain build artifacts: apply_edits reindexes-on-commit, so a run that
+# edits the repo mutates its index. If we merely preserved them across resets, run N+1 would
+# search an index that reflects run N's edits (e.g. a symbol already renamed) while the SOURCE
+# was reset — a stale, source-inconsistent index that silently penalizes the codeindex arms.
+# So we snapshot the freshly-built, base-consistent indexes ONCE and RESTORE them on every
+# reset (a file copy, not a reindex — no API cost). Every run starts from an identical index
+# that matches the reset source.
+INDEX_DIRS = [".codeindex", ".codeindex-rs"]
+SNAP = None  # set by snapshot_indexes()
+
+
+def snapshot_indexes(repo):
+    global SNAP
+    SNAP = tempfile.mkdtemp(prefix="bench-index-snap-")
+    for d in INDEX_DIRS:
+        src = os.path.join(repo, d)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(SNAP, d))
+
+
 def reset(repo, base):
     sh(["git", "reset", "--hard", base], cwd=repo)
-    sh(["git", "clean", "-fdq", "-e", ".codeindex", "-e", ".codeindex-rs"], cwd=repo)
+    sh(["git", "clean", "-fdq"] + sum([["-e", d] for d in INDEX_DIRS], []), cwd=repo)
+    # Restore each index from the pristine, base-consistent snapshot.
+    if SNAP:
+        for d in INDEX_DIRS:
+            snap = os.path.join(SNAP, d)
+            if os.path.isdir(snap):
+                dst = os.path.join(repo, d)
+                shutil.rmtree(dst, ignore_errors=True)
+                shutil.copytree(snap, dst)
 
 
 # Nudge the codeindex arms to actually USE the tools — otherwise the benchmark
@@ -123,6 +151,7 @@ def main():
     base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
     print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model}\nrepo: {repo} @ {base[:8]}\n")
     build_indexes(repo, arms)
+    snapshot_indexes(repo)  # pristine, base-consistent indexes restored on every reset
 
     rows = []
     for task in TASKS:

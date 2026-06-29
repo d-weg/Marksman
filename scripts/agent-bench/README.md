@@ -15,7 +15,10 @@ metric. It's built to be trustworthy, not to look good.
    rename is "no old name left + new name present + still type-checks", not a vibe. No human
    grades the output.
 3. **Clean slate every run.** `git reset --hard` + `git clean` before each agent run, so no
-   run contaminates the next.
+   run contaminates the next. Crucially this includes the **index**: `apply_edits` reindexes
+   on commit, so a freshly built, base-consistent index is *snapshotted once and restored
+   before every run* — otherwise an earlier run's edits would leave the next run searching a
+   stale index that no longer matches the reset source.
 4. **Tokens from the source of truth.** Counts come straight from Claude Code's own
    `--output-format json` (`usage`), so the baseline's grep/read/round-trips are counted in
    full — nothing is hand-waved or modeled.
