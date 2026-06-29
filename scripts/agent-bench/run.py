@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""Agent A/B benchmark — same agent, same tasks, same repo, WITH vs WITHOUT the
-codeindex MCP server. Trustworthy by construction (see README.md): the only
-difference between the two arms is whether the codeindex tools are available; the
-model, prompt, and repo start-state are identical, every run starts from a clean
-`git reset --hard`, success is an objective check command, tokens come straight from
-Claude Code's own JSON, and every task is reported (no cherry-picking).
+"""Agent A/B/C benchmark — same agent, same tasks, same repo, across arms:
+  baseline  (no codeindex)   ·   rust (codeindex-rs MCP)   ·   ts (codeindex Node MCP)
 
-  python3 run.py --repo /path/to/ts/repo [--task T1-rename] [--runs 1]
+Trustworthy by construction (see README.md): the only thing that varies between arms is
+which MCP server is loaded; model, prompt, and repo start-state are identical; every run
+starts from `git reset --hard`; success is an objective `check` command; tokens come straight
+from Claude Code's own JSON; every task is reported.
 
-Requires: the `claude` CLI on PATH, a release build of codeindex-rs, and the target
-repo being a clean git working tree.
+  python3 run.py --repo /path/to/ts/repo [--task T1-rename] [--runs 3] [--arms baseline,rust,ts]
+
+Requires a working `claude` CLI (set $CLAUDE_BIN if PATH `claude` is a broken stub) and, for
+headless runs, an $ANTHROPIC_API_KEY (org policy disables subscription headless).
 """
 import argparse, json, os, pathlib, statistics, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).parent
 TASKS = json.loads((HERE / "tasks.json").read_text())
-MCP_CONFIG = str(HERE / "codeindex.mcp.json")
 ROOT = HERE.parent.parent
 RUST = str(ROOT / "target/release/codeindex-rs")
-
-# The claude CLI. Override via $CLAUDE_BIN if `claude` on PATH is a broken stub.
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
+TS_DIR = os.environ.get("CODEINDEX_TS_DIR", "/Users/davi.vasconcelos/codeindex")
+
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
     "mcp__codeindex__retrieve_context",
@@ -29,6 +29,14 @@ CI_TOOLS = ",".join([
     "mcp__codeindex__apply_edits",
 ])
 
+# arm name -> mcp config path (None = no codeindex). Both servers are named "codeindex"
+# so the same mcp__codeindex__* tool allow-list works for either.
+ARMS = {
+    "baseline": None,
+    "rust": str(HERE / "codeindex-rust.mcp.json"),
+    "ts": str(HERE / "codeindex-ts.mcp.json"),
+}
+
 
 def sh(cmd, cwd=None, env=None):
     return subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True)
@@ -36,16 +44,15 @@ def sh(cmd, cwd=None, env=None):
 
 def reset(repo, base):
     sh(["git", "reset", "--hard", base], cwd=repo)
-    # keep the prebuilt .codeindex-rs index across resets
-    sh(["git", "clean", "-fdq", "-e", ".codeindex-rs"], cwd=repo)
+    sh(["git", "clean", "-fdq", "-e", ".codeindex", "-e", ".codeindex-rs"], cwd=repo)
 
 
-def run_agent(repo, prompt, with_codeindex):
+def run_agent(repo, prompt, mcp_config):
     cmd = [CLAUDE, "-p", prompt, "--output-format", "json",
            "--max-turns", "40", "--dangerously-skip-permissions"]
-    tools = BASE_TOOLS + ("," + CI_TOOLS if with_codeindex else "")
-    if with_codeindex:
-        cmd += ["--mcp-config", MCP_CONFIG]
+    tools = BASE_TOOLS + ("," + CI_TOOLS if mcp_config else "")
+    if mcp_config:
+        cmd += ["--mcp-config", mcp_config]
     cmd += ["--allowedTools", tools]
 
     t = time.time()
@@ -59,7 +66,7 @@ def run_agent(repo, prompt, with_codeindex):
         return {"in": intok, "out": u.get("output_tokens", 0),
                 "turns": out.get("num_turns", 0), "cost": out.get("total_cost_usd", 0.0), "dur": dur}
     except Exception:
-        return {"in": 0, "out": 0, "turns": 0, "cost": 0.0, "dur": dur, "err": r.stderr[:200]}
+        return {"in": 0, "out": 0, "turns": 0, "cost": 0.0, "dur": dur, "err": (r.stderr or r.stdout)[:200]}
 
 
 def check(repo, cmd):
@@ -67,16 +74,24 @@ def check(repo, cmd):
 
 
 def preflight():
-    """Fail loudly if the `claude` CLI can't actually run — never report silent 0s."""
     r = sh([CLAUDE, "-p", "reply with exactly: ok", "--output-format", "json"])
     try:
         json.loads(r.stdout)
         return True
     except Exception:
-        print("ERROR: `claude` did not return valid JSON — is Claude Code installed and working?")
+        print("ERROR: `claude` did not return valid JSON. Need a working CLI + $ANTHROPIC_API_KEY.")
         print("  stdout:", (r.stdout or "")[:200])
         print("  stderr:", (r.stderr or "")[:300])
         return False
+
+
+def build_indexes(repo, arms):
+    if "rust" in arms and os.path.exists(RUST):
+        print("  building Rust index (.codeindex-rs) …")
+        sh([RUST, "index", repo], env={**os.environ, "CI_NPM_CACHE": "/tmp/ci-npm-cache"})
+    if "ts" in arms and os.path.isdir(TS_DIR):
+        print("  building TS index (.codeindex) …")
+        sh(["npm", "run", "index", "--", "--root", repo], cwd=TS_DIR)
 
 
 def main():
@@ -84,57 +99,52 @@ def main():
     ap.add_argument("--repo", required=True)
     ap.add_argument("--task")
     ap.add_argument("--runs", type=int, default=1)
+    ap.add_argument("--arms", default="baseline,rust,ts")
     args = ap.parse_args()
     repo = os.path.abspath(args.repo)
+    arms = [a for a in args.arms.split(",") if a in ARMS]
+
     if not preflight():
         sys.exit(1)
     base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-
-    print(f"# Agent A/B — codeindex MCP on/off\nrepo: {repo} @ {base[:8]}\n")
-    print("Building the codeindex index for the WITH arm …")
-    sh([RUST, "index", repo],
-       env={**os.environ, "CI_NPM_CACHE": "/tmp/ci-npm-cache"})
+    print(f"# Agent benchmark — arms: {', '.join(arms)}\nrepo: {repo} @ {base[:8]}\n")
+    build_indexes(repo, arms)
 
     rows = []
     for task in TASKS:
         if args.task and task["id"] != args.task:
             continue
-        agg = {"without": [], "with": []}
+        agg = {a: [] for a in arms}
         for _ in range(args.runs):
-            for cond, withci in (("without", False), ("with", True)):
+            for arm in arms:
                 reset(repo, base)
-                m = run_agent(repo, task["prompt"], withci)
+                m = run_agent(repo, task["prompt"], ARMS[arm])
                 m["ok"] = check(repo, task["check"])
-                agg[cond].append(m)
+                agg[arm].append(m)
         reset(repo, base)
         rows.append((task["id"], agg))
 
-    # ── report ──────────────────────────────────────────────────────────────
-    def med(xs, k):
-        return statistics.median(x[k] for x in xs) if xs else 0
-
+    med = lambda xs, k: statistics.median(x[k] for x in xs) if xs else 0
     print("\n| task | arm | in_tok | out_tok | turns | ok |")
     print("|---|---|--:|--:|--:|:--:|")
-    tot = {"without": {"in": 0, "out": 0}, "with": {"in": 0, "out": 0}}
-    passes = {"without": 0, "with": 0}
-    n = 0
+    tot = {a: {"in": 0, "out": 0, "pass": 0, "n": 0} for a in arms}
     for tid, agg in rows:
-        n += 1
-        for cond in ("without", "with"):
-            xs = agg[cond]
+        for arm in arms:
+            xs = agg[arm]
             ok = sum(1 for x in xs if x["ok"])
-            print(f"| {tid} | {cond} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {ok}/{len(xs)} |")
-            tot[cond]["in"] += med(xs, "in")
-            tot[cond]["out"] += med(xs, "out")
-            passes[cond] += ok
+            print(f"| {tid} | {arm} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {ok}/{len(xs)} |")
+            tot[arm]["in"] += med(xs, "in"); tot[arm]["out"] += med(xs, "out")
+            tot[arm]["pass"] += ok; tot[arm]["n"] += len(xs)
 
-    def pct(a, b):
-        return f"{(b - a) / a * 100:+.0f}%" if a else "n/a"
-
+    pct = lambda a, b: f"{(b-a)/a*100:+.0f}%" if a else "n/a"
+    bl = tot.get("baseline")
     print("\n## Totals (median per task, summed)\n")
-    print(f"- input tokens:  without **{tot['without']['in']:.0f}** · with **{tot['with']['in']:.0f}** ({pct(tot['without']['in'], tot['with']['in'])})")
-    print(f"- output tokens: without **{tot['without']['out']:.0f}** · with **{tot['with']['out']:.0f}** ({pct(tot['without']['out'], tot['with']['out'])})")
-    print(f"- success: without {passes['without']} · with {passes['with']} (of {n*args.runs} each)")
+    print("| arm | input tok | output tok | vs baseline (in/out) | success |")
+    print("|---|--:|--:|---|--:|")
+    for arm in arms:
+        t = tot[arm]
+        vs = "—" if (arm == "baseline" or not bl) else f"{pct(bl['in'],t['in'])} / {pct(bl['out'],t['out'])}"
+        print(f"| {arm} | {t['in']:.0f} | {t['out']:.0f} | {vs} | {t['pass']}/{t['n']} |")
 
 
 if __name__ == "__main__":

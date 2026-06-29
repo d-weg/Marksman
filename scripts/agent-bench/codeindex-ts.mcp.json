@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "codeindex": {
+      "command": "/Users/davi.vasconcelos/codeindex/node_modules/.bin/tsx",
+      "args": ["/Users/davi.vasconcelos/codeindex/src/mcp.ts"]
+    }
+  }
+}

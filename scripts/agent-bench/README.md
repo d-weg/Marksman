@@ -23,21 +23,35 @@ metric. It's built to be trustworthy, not to look good.
    Run with `--runs N` to median over N repetitions and damp model nondeterminism.
 6. **One command, reproducible.** Anyone can re-run it and get the same shape of result.
 
-## Run it
+## Run it (step by step)
+
+Three arms: **baseline** (no codeindex) · **rust** (codeindex-rs MCP) · **ts** (Node codeindex MCP).
 
 ```bash
-cargo build --release                       # build codeindex-rs + the MCP server
-python3 scripts/agent-bench/run.py \
-    --repo /path/to/a/typescript/repo \
-    --runs 3
+# 1. Auth — headless Claude Code needs an API key (org policy disables subscription headless).
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# 2. A working claude CLI. If `claude` on PATH is a broken stub, point at the real binary:
+export CLAUDE_BIN="/Users/<you>/Library/Application Support/Claude/claude-code/<ver>/claude.app/Contents/MacOS/claude"
+#    (an API key makes the bundled binary work headless; or install the standalone CLI.)
+
+# 3. Build the Rust tool.
+cargo build --release
+
+# 4. A DISPOSABLE clone of a TS repo with a clean git tree (the harness does git reset --hard).
+git clone /path/to/some-ts-repo /tmp/bench-target
+ln -s /path/to/some-ts-repo/node_modules /tmp/bench-target/node_modules   # so tsc/checks resolve
+
+# 5. Run. The harness builds both indexes, then runs every task in every arm.
+python3 scripts/agent-bench/run.py --repo /tmp/bench-target --runs 3
+#    options: --arms baseline,rust   (drop the TS arm) · --task T1-rename · --runs N
 ```
 
-Requires a working `claude` CLI. If `claude` on your PATH is a broken stub (e.g. the
-desktop app's wrapper that errors with "native binary not installed"), point the harness at the
-real one: `CLAUDE_BIN=/path/to/claude python3 run.py ...`. A preflight check aborts loudly if
-`claude` can't return JSON, so the run never silently reports zeros.
+Env knobs: `CODEINDEX_TS_DIR` (default `/Users/davi.vasconcelos/codeindex`) points at the Node
+codeindex checkout used for the `ts` arm. A preflight aborts loudly if `claude` can't return
+JSON — the run never silently reports zeros.
 
-The script builds the index once, then for each task runs
+The script builds each arm's index once, then for each task runs
 the agent twice (with / without codeindex), checks success, and prints a markdown table +
 totals (input/output token deltas, success counts).
 
