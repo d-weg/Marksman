@@ -49,6 +49,19 @@ on a non-TS repo. Closing that is the next structural step.
       TS repo now.**
       - [ ] **Full registry** — multi-language repos (per-file dispatch), lazy per-language
             tooling fetch, a provider manifest (enable/disable, pin versions).
+- [ ] **Dynamically-fetched modular providers (sidecar processes).** Today the provider glue
+      crates (`langs/lang-ts`, `langs/lang-rust`) are compiled into the core binary, even though
+      their *tooling* (scip-typescript, ts-morph, rust-analyzer) is already fetched on demand. To
+      make a provider itself downloadable: ship each as its own small executable, fetch it on
+      demand (release/registry), and have the core spawn it and talk over a **stdio JSON protocol**
+      (serialize `LanguageProvider`: structure / import_graph / apply_edits). Core stays tiny +
+      language-agnostic; providers can be third-party / any language. NOT dlopen — Rust has no
+      stable ABI, so in-process plugins are unsafe/undistributable; separate processes (the model
+      rust-analyzer / the ts-morph sidecar already use) are the correct seam.
+      - [ ] Define the provider protocol (a serde-serializable mirror of the trait + a tiny RPC).
+      - [ ] A host-side `ProcessProvider` impl of `LanguageProvider` that spawns + talks to a
+            provider binary (mirrors `TsMorphClient`).
+      - [ ] Provider fetch/install + version pinning + a manifest.
 - [ ] **Skeletal context** — `detail_level` (`full`/`outline`/`signatures`) on
       `retrieve_context`; reuse `lang-ts/src/ast.rs` body location to elide `statement_block`s;
       secondary import-graph files default to `outline`; add a `read_node` drill-down tool.
