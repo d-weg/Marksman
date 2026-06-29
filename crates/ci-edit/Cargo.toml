@@ -1,0 +1,15 @@
+[package]
+name = "ci-edit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Atomic gated edits: SCIP node ranges + VFS overlay + LSP baseline-diff gate."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+ci-vfs = { path = "../ci-vfs" }
+ci-lsp = { path = "../ci-lsp" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

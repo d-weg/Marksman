@@ -1,0 +1,14 @@
+[package]
+name = "ci-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Index storage: BM25 + flat vector store + import graph + persistence."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

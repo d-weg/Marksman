@@ -1,0 +1,11 @@
+[package]
+name = "ci-scip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read a SCIP index (index.scip) into the language-blind Node tree + import graph."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+scip = "0.8.1"
+protobuf = "3.7"

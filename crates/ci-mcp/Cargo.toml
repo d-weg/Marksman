@@ -1,0 +1,20 @@
+[package]
+name = "ci-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codeindex-rs MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits."
+
+[[bin]]
+name = "codeindex-rs-mcp"
+path = "src/main.rs"
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+ci-index = { path = "../ci-index" }
+ci-embed = { path = "../ci-embed" }
+ci-retrieve = { path = "../ci-retrieve" }
+ci-arch = { path = "../ci-arch" }
+ci-edit = { path = "../ci-edit" }
+lang-ts = { path = "../lang-ts" }
+serde_json.workspace = true

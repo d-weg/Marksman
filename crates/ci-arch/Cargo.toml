@@ -1,0 +1,13 @@
+[package]
+name = "ci-arch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-API folder/architecture map: per-dir file-kind patterns + module templates."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+ignore.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

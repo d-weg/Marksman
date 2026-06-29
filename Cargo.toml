@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ci-core",
+    "crates/ci-walk",
+    "crates/ci-embed",
+    "crates/ci-index",
+    "crates/ci-retrieve",
+    "crates/ci-scip",
+    "crates/ci-build",
+    "crates/lang-ts",
+    "crates/ci-cli",
+    "crates/ci-vfs",
+    "crates/ci-lsp",
+    "crates/ci-edit",
+    "crates/ci-arch",
+    "crates/ci-mcp",
+]
+
+# Member crates are added here as each phase lands, so `cargo build` stays green.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ignore = "0.4"
+globset = "0.4"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

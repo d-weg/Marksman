@@ -1,0 +1,13 @@
+[package]
+name = "ci-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Minimal LSP client: drive a language server over stdio for the type-check gate."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

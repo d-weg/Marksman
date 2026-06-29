@@ -1,0 +1,19 @@
+[package]
+name = "ci-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "codeindex-rs CLI: index + retrieve (TS via SCIP + native Model2Vec)."
+
+[[bin]]
+name = "codeindex-rs"
+path = "src/main.rs"
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+ci-embed = { path = "../ci-embed" }
+ci-index = { path = "../ci-index" }
+ci-retrieve = { path = "../ci-retrieve" }
+ci-build = { path = "../ci-build" }
+lang-ts = { path = "../lang-ts" }
+serde_json.workspace = true

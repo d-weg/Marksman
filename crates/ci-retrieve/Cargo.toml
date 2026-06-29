@@ -1,0 +1,10 @@
+[package]
+name = "ci-retrieve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Retrieval: RRF fusion + import-graph expansion + package weighting -> manifest."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+ci-index = { path = "../ci-index" }

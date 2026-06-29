@@ -1,0 +1,12 @@
+[package]
+name = "ci-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-memory file overlay: stage edits as a transaction, gate, then commit or drop."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
