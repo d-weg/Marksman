@@ -15,6 +15,6 @@ ci-embed = { path = "../ci-embed" }
 ci-index = { path = "../ci-index" }
 ci-retrieve = { path = "../ci-retrieve" }
 ci-build = { path = "../ci-build" }
-lang-ts = { path = "../lang-ts" }
-lang-rust = { path = "../lang-rust" }
+lang-ts = { path = "../langs/lang-ts" }
+lang-rust = { path = "../langs/lang-rust" }
 serde_json.workspace = true
