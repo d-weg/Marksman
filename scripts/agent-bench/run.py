@@ -168,26 +168,31 @@ def main():
         rows.append((task["id"], agg))
 
     med = lambda xs, k: statistics.median(x[k] for x in xs) if xs else 0
-    print("\n| task | arm | in_tok | out_tok | turns | ok |")
-    print("|---|---|--:|--:|--:|:--:|")
-    tot = {a: {"in": 0, "out": 0, "pass": 0, "n": 0} for a in arms}
+    # `sec` = median wall-clock for the whole agent run (turns x model+tool latency). It's the
+    # time a user actually waits, and rewards a fast tool (e.g. ts-morph ~1s vs a cold LSP);
+    # noisier than tokens since it rides on live API latency, so read it alongside turns.
+    print("\n| task | arm | in_tok | out_tok | turns | sec | ok |")
+    print("|---|---|--:|--:|--:|--:|:--:|")
+    tot = {a: {"in": 0, "out": 0, "sec": 0, "pass": 0, "n": 0} for a in arms}
     for tid, agg in rows:
         for arm in arms:
             xs = agg[arm]
             ok = sum(1 for x in xs if x["ok"])
-            print(f"| {tid} | {arm} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {ok}/{len(xs)} |")
+            print(f"| {tid} | {arm} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {med(xs,'dur'):.0f} | {ok}/{len(xs)} |")
             tot[arm]["in"] += med(xs, "in"); tot[arm]["out"] += med(xs, "out")
+            tot[arm]["sec"] += med(xs, "dur")
             tot[arm]["pass"] += ok; tot[arm]["n"] += len(xs)
 
     pct = lambda a, b: f"{(b-a)/a*100:+.0f}%" if a else "n/a"
     bl = tot.get("baseline")
     print("\n## Totals (median per task, summed)\n")
-    print("| arm | input tok | output tok | vs baseline (in/out) | success |")
-    print("|---|--:|--:|---|--:|")
+    print("| arm | input tok | output tok | sec | vs baseline (in/out/sec) | success |")
+    print("|---|--:|--:|--:|---|--:|")
     for arm in arms:
         t = tot[arm]
-        vs = "—" if (arm == "baseline" or not bl) else f"{pct(bl['in'],t['in'])} / {pct(bl['out'],t['out'])}"
-        print(f"| {arm} | {t['in']:.0f} | {t['out']:.0f} | {vs} | {t['pass']}/{t['n']} |")
+        vs = "—" if (arm == "baseline" or not bl) else \
+            f"{pct(bl['in'],t['in'])} / {pct(bl['out'],t['out'])} / {pct(bl['sec'],t['sec'])}"
+        print(f"| {arm} | {t['in']:.0f} | {t['out']:.0f} | {t['sec']:.0f} | {vs} | {t['pass']}/{t['n']} |")
 
     spent = sum(x["cost"] for _, agg in rows for arm in arms for x in agg[arm])
     print(f"\n_actual spend this run: ${spent:.2f} ({args.model})_")
