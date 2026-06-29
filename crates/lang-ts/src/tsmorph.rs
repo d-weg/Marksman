@@ -9,7 +9,10 @@ use ci_edit::GateEngine;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SIDECAR_SRC: &str = include_str!("sidecar.cjs");
 
@@ -50,11 +53,14 @@ fn ensure_sidecar(home: &Path) -> Result<PathBuf> {
     Ok(sidecar)
 }
 
-/// A live ts-morph sidecar for one repo.
+/// A live ts-morph sidecar for one repo. stdout is pumped by a reader thread into a channel so
+/// `call` can wait with a DEADLINE (a wedged sidecar must not hang the write path forever);
+/// stderr is captured so a sidecar failure isn't invisible.
 pub struct TsMorphClient {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    rx: Receiver<String>,
+    stderr: Arc<Mutex<String>>,
     next_id: i64,
 }
 
@@ -70,12 +76,66 @@ impl TsMorphClient {
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::Driver(format!("launching ts-morph sidecar (node) failed: {e}")))?;
         let stdin = child.stdin.take().ok_or_else(|| Error::Driver("sidecar stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Driver("sidecar stdout".into()))?;
-        Ok(Self { child, stdin, reader: BufReader::new(stdout), next_id: 1 })
+        let stderr = child.stderr.take().ok_or_else(|| Error::Driver("sidecar stderr".into()))?;
+
+        // Pump stdout lines into a channel so call() can use recv_timeout.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut r = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match r.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        if tx.send(std::mem::take(&mut line)).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        // Capture stderr (bounded) so a sidecar crash/throw is reportable, not silent.
+        let errbuf = Arc::new(Mutex::new(String::new()));
+        {
+            let errbuf = errbuf.clone();
+            std::thread::spawn(move || {
+                let mut r = BufReader::new(stderr);
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match r.read_line(&mut line) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if let Ok(mut s) = errbuf.lock() {
+                                s.push_str(&line);
+                                if s.len() > 8192 {
+                                    let cut = s.len() - 8192;
+                                    s.drain(..cut);
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        Ok(Self { child, stdin, rx, stderr: errbuf, next_id: 1 })
+    }
+
+    fn stderr_tail(&self) -> String {
+        self.stderr
+            .lock()
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!(" — sidecar stderr: {}", s.trim()))
+            .unwrap_or_default()
     }
 
     fn call(&mut self, op: Value) -> Result<Value> {
@@ -85,21 +145,30 @@ impl TsMorphClient {
         req["id"] = id.into();
         writeln!(self.stdin, "{req}").map_err(|e| Error::Driver(format!("sidecar write: {e}")))?;
         self.stdin.flush().ok();
+
+        // The first call pays the project load (a few seconds); later ops are sub-second. A
+        // generous deadline keeps a wedged sidecar from hanging the engine (and its Mutex)
+        // forever — recoverable as an error instead of a permanent hang.
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| Error::Driver(format!("sidecar read: {e}")))?;
-            if n == 0 {
-                return Err(Error::Driver("ts-morph sidecar closed".into()));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Driver(format!("ts-morph sidecar timed out{}", self.stderr_tail())));
             }
-            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
-            if v.get("id").and_then(Value::as_i64) == Some(id) {
-                if let Some(err) = v.get("error").and_then(Value::as_str) {
-                    return Err(Error::Driver(format!("ts-morph: {err}")));
+            match self.rx.recv_timeout(remaining.min(Duration::from_secs(5))) {
+                Ok(line) => {
+                    let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { continue };
+                    if v.get("id").and_then(Value::as_i64) == Some(id) {
+                        if let Some(err) = v.get("error").and_then(Value::as_str) {
+                            return Err(Error::Driver(format!("ts-morph: {err}")));
+                        }
+                        return Ok(v);
+                    }
                 }
-                return Ok(v);
+                Err(RecvTimeoutError::Timeout) => continue, // re-check deadline
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Driver(format!("ts-morph sidecar closed{}", self.stderr_tail())));
+                }
             }
         }
     }

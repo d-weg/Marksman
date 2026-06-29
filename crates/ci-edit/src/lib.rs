@@ -214,7 +214,28 @@ fn apply_rename(
     let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.to_string()))?;
     let nr = node.name_range.as_ref().unwrap_or(&node.range);
     let we = engine.rename(file, nr.start_line.saturating_sub(1), nr.start_char, new_name)?;
+    // A rename always rewrites at least its own definition. Zero edits means the position
+    // didn't resolve to a renameable symbol — fail loudly instead of silently reporting "no
+    // changes," which (with apply_edits' "this is complete, don't verify" message) would let
+    // the agent ship a rename that did nothing.
+    if workspace_edit_is_empty(&we) {
+        return Err(Error::Driver(format!(
+            "rename produced no edits — '{node_id}' did not resolve to a renameable symbol; nothing was changed"
+        )));
+    }
     apply_workspace_edit(vfs, root, &we)
+}
+
+/// True when a WorkspaceEdit carries no actual text edits (empty `documentChanges`/`changes`).
+fn workspace_edit_is_empty(we: &Value) -> bool {
+    let nonempty = |edits: Option<&Vec<Value>>| edits.is_some_and(|e| !e.is_empty());
+    if let Some(dc) = we.get("documentChanges").and_then(Value::as_array) {
+        return !dc.iter().any(|d| nonempty(d.get("edits").and_then(Value::as_array)));
+    }
+    if let Some(ch) = we.get("changes").and_then(Value::as_object) {
+        return !ch.values().any(|e| nonempty(e.as_array()));
+    }
+    true
 }
 
 /// Move a file: ask the engine to compute importer rewrites (`willRename`), apply them to

@@ -55,7 +55,9 @@ fn contains_word(hay: &str, needle: &str) -> bool {
         if before_ok && after_ok {
             return true;
         }
-        from = i + 1;
+        // Advance by one whole char (i is a char boundary; i+1 may split a multibyte
+        // codepoint and panic the next slice on non-ASCII identifiers).
+        from = i + hay[i..].chars().next().map_or(1, |c| c.len_utf8());
     }
     false
 }
@@ -91,7 +93,9 @@ fn symbol_name_search(
         }
         let e = best.entry(s.file.clone()).or_insert((0, false));
         if score > e.0 {
-            *e = (score, exact);
+            // Keep a prior exact hit even when a higher-scoring NON-exact symbol in the same
+            // file arrives later — otherwise the exact definition loses its bonus/forced-seed.
+            *e = (score, exact || e.1);
         } else if exact {
             e.1 = true;
         }
@@ -387,6 +391,35 @@ mod tests {
         assert!(contains_word("rename the reciprocalrankfusion function", "reciprocalrankfusion"));
         assert!(contains_word("the name field", "name")); // standalone -> matches
         assert!(!contains_word("my_name helper", "name")); // snake_case part is not a whole word
+        // multibyte: a non-ASCII identifier must not panic the byte-advance, and the
+        // standalone occurrence still matches (the first, inside "xóy", does not).
+        assert!(contains_word("xóy ó", "ó"));
+        assert!(!contains_word("xóy", "ó"));
+    }
+
+    fn sym(file: &str, name: &str) -> SymbolEntry {
+        SymbolEntry {
+            id: format!("{file}#{name}"),
+            name: name.into(),
+            kind: SymbolKind::Function,
+            file: file.into(),
+            pkg: "root".into(),
+            start_line: 1,
+            end_line: 2,
+            signature: None,
+        }
+    }
+
+    #[test]
+    fn exact_flag_survives_higher_scoring_nonexact_symbol() {
+        // F defines an exact-named symbol (Foo, score 3) AND a higher-scoring non-exact one
+        // (barBazQuxLib, 4 token hits) listed AFTER it. The exact bit must not be overwritten.
+        let raw = "rename Foo bar baz qux lib";
+        let q = tokenize(raw);
+        let syms = vec![sym("F", "Foo"), sym("F", "barBazQuxLib")];
+        let res = symbol_name_search(&syms, &q, raw);
+        let f = res.iter().find(|(file, _, _)| file == "F").expect("F present");
+        assert!(f.2, "exact flag must survive a later higher-scoring non-exact symbol");
     }
 
     #[test]

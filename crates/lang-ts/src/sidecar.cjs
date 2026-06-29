@@ -12,6 +12,7 @@
 // Why ts-morph over an LSP server: synchronous, in-process diagnostics (no publish/settle
 // race), and the raw TS LanguageService for precise rename/move edits. The project loads once
 // at startup (the prewarm cost), then every op is cheap.
+const fs = require("fs");
 const path = require("path");
 const readline = require("readline");
 const { Project, ts } = require("ts-morph");
@@ -48,8 +49,32 @@ function setContent(absPath, content) {
   else project.createSourceFile(absPath, content, { overwrite: true });
 }
 
+// Files whose in-memory content has been overlaid and may differ from disk. Before each
+// diagnostics request we restore any overlaid file NOT in the new request back to its on-disk
+// content, so a REJECTED/aborted prior edit can't leave phantom source that corrupts a later
+// gate pass. (A committed edit already wrote disk, so restoring == the new truth; a rejected
+// edit restores the original.)
+const dirtied = new Set();
+
+function restoreDirtyExcept(keep) {
+  for (const ap of [...dirtied]) {
+    if (keep.has(ap)) continue;
+    try {
+      setContent(ap, fs.readFileSync(ap, "utf8"));
+    } catch {
+      const sf = project.getSourceFile(ap);
+      if (sf) sf.delete(); // gone on disk
+    }
+    dirtied.delete(ap);
+  }
+}
+
 function diagnostics(files) {
-  for (const f of files) setContent(abs(f.path), f.content);
+  restoreDirtyExcept(new Set(files.map((f) => abs(f.path))));
+  for (const f of files) {
+    setContent(abs(f.path), f.content);
+    dirtied.add(abs(f.path));
+  }
   const out = [];
   for (const f of files) {
     const sf = project.getSourceFile(abs(f.path));
@@ -113,4 +138,6 @@ rl.on("line", (line) => {
   res.id = req.id;
   process.stdout.write(JSON.stringify(res) + "\n");
 });
+// Exit when the parent closes our stdin (process gone) so we don't orphan.
+rl.on("close", () => process.exit(0));
 process.stderr.write("[ts-morph-sidecar] ready for " + root + "\n");
