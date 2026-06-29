@@ -37,10 +37,13 @@ on a non-TS repo. Closing that is the next structural step.
       impls/methods + `#sym:body`/`:param.N`/`:return`), `import_graph()` (`mod` resolution),
       `granularity()→Ast`, all in-process `tree-sitter-rust` (no Node). Indexes + retrieves Rust
       (incl. CodeGraph itself) via CLI and MCP.
-      - [ ] **Rust write path** — edits behind a `GateEngine` over rust-analyzer (rename/refs/
-            diagnostics). `apply_edits` currently returns a read-only refusal for Rust.
+      - [x] **Rust write path (done).** Type-checked edits via rust-analyzer reusing the
+            `GateEngine`/`LspClient`/`commit_edits` blast-radius gate (rename verified
+            end-to-end). Needs `rustup component add rust-analyzer` (`CI_RUST_ANALYZER`
+            overrides). Next: `replace_node` / move coverage + faster cold-start than the
+            rename retry.
       - [ ] **Better Rust graph** — `use`-resolution (not just `mod` edges) + optional
-            `rust-analyzer scip` for compiler-accurate references.
+            `rust-analyzer scip` for compiler-accurate references in retrieval.
 - [x] **Provider selection (done, v0).** `build_provider`/`select_provider` keyed on manifests
       (Cargo.toml vs package.json; `CI_LANG` override) in `ci-cli` + `ci-mcp` — **Node only for a
       TS repo now.**
