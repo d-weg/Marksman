@@ -47,8 +47,8 @@ def reset(repo, base):
     sh(["git", "clean", "-fdq", "-e", ".codeindex", "-e", ".codeindex-rs"], cwd=repo)
 
 
-def run_agent(repo, prompt, mcp_config):
-    cmd = [CLAUDE, "-p", prompt, "--output-format", "json",
+def run_agent(repo, prompt, mcp_config, model):
+    cmd = [CLAUDE, "-p", prompt, "--output-format", "json", "--model", model,
            "--max-turns", "40", "--dangerously-skip-permissions"]
     tools = BASE_TOOLS + ("," + CI_TOOLS if mcp_config else "")
     if mcp_config:
@@ -100,6 +100,8 @@ def main():
     ap.add_argument("--task")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--arms", default="baseline,rust,ts")
+    ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+                    help="cost lever: claude-haiku-4-5 (cheapest) · claude-sonnet-4-6 (default) · claude-opus-4-8")
     args = ap.parse_args()
     repo = os.path.abspath(args.repo)
     arms = [a for a in args.arms.split(",") if a in ARMS]
@@ -107,7 +109,7 @@ def main():
     if not preflight():
         sys.exit(1)
     base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-    print(f"# Agent benchmark — arms: {', '.join(arms)}\nrepo: {repo} @ {base[:8]}\n")
+    print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model}\nrepo: {repo} @ {base[:8]}\n")
     build_indexes(repo, arms)
 
     rows = []
@@ -118,7 +120,7 @@ def main():
         for _ in range(args.runs):
             for arm in arms:
                 reset(repo, base)
-                m = run_agent(repo, task["prompt"], ARMS[arm])
+                m = run_agent(repo, task["prompt"], ARMS[arm], args.model)
                 m["ok"] = check(repo, task["check"])
                 agg[arm].append(m)
         reset(repo, base)
@@ -145,6 +147,9 @@ def main():
         t = tot[arm]
         vs = "—" if (arm == "baseline" or not bl) else f"{pct(bl['in'],t['in'])} / {pct(bl['out'],t['out'])}"
         print(f"| {arm} | {t['in']:.0f} | {t['out']:.0f} | {vs} | {t['pass']}/{t['n']} |")
+
+    spent = sum(x["cost"] for _, agg in rows for arm in arms for x in agg[arm])
+    print(f"\n_actual spend this run: ${spent:.2f} ({args.model})_")
 
 
 if __name__ == "__main__":
