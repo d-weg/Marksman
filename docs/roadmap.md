@@ -84,3 +84,55 @@ agent A/B benchmark (with vs without, vs the TS tool) lives in [benchmarks.md](b
 - **TS-tool ranking parity** — port the retrieval fixes (path-role, symbol-match, the
   `name`-in-`rename` word-boundary fix) into the original Node `codeindex` so the A/B isolates
   read-vs-write mechanics.
+
+## Capabilities (planned)
+
+### Skeletal context — signature-level retrieval (`detail_level`)
+An agent rarely needs a 200-line function body just to know how to *call* it. Add a
+`detail_level` to `retrieve_context` — **`full` | `outline` | `signatures`** — and use the
+in-process tree-sitter we already have (`lang-ts/src/ast.rs` already locates each symbol's
+`#sym:body`) to **elide bodies**: replace a `statement_block` with `{ /* … elided */ }`, keeping
+the signature, params, and return type. A 200-line file collapses to ~15 lines of pure signal,
+with compiler-accurate types intact.
+- **Secondary files default to `outline`.** Files pulled in via the import graph are context,
+  not the target — you need their *signatures* to call them, not their bodies. The primary
+  matches can stay `full`.
+- **Node drill-down.** When the elided body *is* what's needed, a tool to fetch the precise full
+  text + metadata (kind, signature, exact range, refs) of a single anchor — reusing the existing
+  `#sym:body` / `:param.N` / `:return` anchors. Skeleton by default, expand on demand.
+- Pure tree-sitter, no SCIP/compiler needed for the fold → cheap, and works for any language
+  with a tree-sitter grammar.
+
+### Surgical sub-node edits (deeper `apply_edits` verbs)
+`replace_node` is sometimes too blunt — re-drafting a whole function to tweak one statement.
+Expand the edit suite to map directly onto AST anchors (the `#sym:body` / `:param.N` / `:return`
+targets already exist from the SCIP+tree-sitter merge):
+- **Body-level:** `insert_in_body` / `replace_in_body` / `delete_in_body` — inject or remove a
+  single statement inside a block/loop/conditional without reconstructing the parent.
+- **Targeted modifiers:** add/remove a **parameter**, set a **return type**, edit a call's
+  **arguments** — without re-emitting surrounding syntax.
+- **Comments / docstrings:** `edit_leading_comment` / docstring control — touch documentation
+  without touching executable code.
+- Remaining work: mapping these verbs in `action_to_op` + statement-level targeting within a
+  body + byte-vs-char column handling. **CodeGraph's edge over a pure-AST editor: these stay
+  type-checked** (the blast-radius gate) — surgical *and* safe.
+
+### Config files as first-class citizens (JSON / YAML / TOML)
+Agents constantly need to edit `package.json`, `docker-compose.yml`, `*.toml` alongside code
+(e.g. add a dependency when adding an import). Add tree-sitter providers for json/yaml/toml so a
+single **key** can be modified surgically — no reformatting, no clobbered comments. These need no
+compiler gate (config has no type-check), so they're pure tree-sitter and slot straight into the
+modular-provider model. High synergy: update `package.json` deps **in the same atomic batch** as
+the TS import that needs them.
+
+### Breadth vs. depth — a pure-tree-sitter fallback edit provider
+The real axis: **breadth** (tree-sitter — 11+ languages, no type safety) vs **depth**
+(SCIP/LSP — type-checked, few languages). CodeGraph can do *both* through the existing
+`Granularity` + `GateEngine` seams:
+- A **tree-sitter structural-edit provider with no blast-radius gate** is the *fallback* for any
+  language we don't yet have SCIP/LSP for (Python, Go, Ruby, …) — structural edits work
+  immediately, best-effort.
+- Per language, upgrade to the **gated** path as the SCIP/LSP integration lands (Rust first).
+- So a multi-language repo is *useful on day one*, and the type-checked guarantee is layered in
+  where the toolchain exists. **Honest tradeoff:** tree-sitter edits aren't type-checked — the
+  result must say so (e.g. `gated: false`) so the agent knows it's structural, not verified.
