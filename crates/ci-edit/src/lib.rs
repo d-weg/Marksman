@@ -11,6 +11,51 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::Path;
 
+/// The type-check engine behind the gate. Abstracts over *how* a language computes
+/// diagnostics and cross-file rename/move edits, so the provider can pick the lightest
+/// available option (a TS provider drives ts-morph in-process; the generic fallback is an
+/// LSP server). All edits flow through the same VFS / baseline-diff / blast-radius logic
+/// in `commit_edits` regardless of engine. `rename`/`will_rename` return an LSP-shaped
+/// WorkspaceEdit JSON (`changes`/`documentChanges`), consumed by `apply_workspace_edit`.
+pub trait GateEngine {
+    /// Type-check `files` (repo-relative path + buffer content) → ERROR diagnostics.
+    fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>>;
+    /// Cross-file edits to rename the symbol whose name starts at (0-based) `line`/`character`.
+    fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value>;
+    /// Importer rewrites for moving `from` → `to` (does not move the file). Empty if unsupported.
+    fn will_rename(&mut self, from: &str, to: &str) -> Result<Value>;
+}
+
+/// The generic LSP engine: any language with a language server.
+impl GateEngine for LspClient {
+    fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
+        LspClient::diagnostics(self, files)
+    }
+    fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
+        // Warm: opening the file loads the project, so rename sees every reference (a cold
+        // server returns an EMPTY edit — a silent no-op rename).
+        if let Ok(content) = std::fs::read_to_string(self.root().join(file)) {
+            let _ = LspClient::diagnostics(self, &[(file.to_string(), content)]);
+        }
+        let uri = format!("file://{}", self.root().join(file).to_string_lossy());
+        let params = json!({
+            "textDocument": {"uri": uri},
+            "position": {"line": line, "character": character},
+            "newName": new_name,
+        });
+        self.request("textDocument/rename", params)
+    }
+    fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
+        if let Ok(content) = std::fs::read_to_string(self.root().join(from)) {
+            let _ = LspClient::diagnostics(self, &[(from.to_string(), content)]);
+        }
+        let old_uri = format!("file://{}", self.root().join(from).to_string_lossy());
+        let new_uri = format!("file://{}", self.root().join(to).to_string_lossy());
+        let params = json!({ "files": [{ "oldUri": old_uri, "newUri": new_uri }] });
+        self.request("workspace/willRenameFiles", params)
+    }
+}
+
 /// Structured rich action payload (the MCP/wrapper input shape): `{action, target, name, value}`.
 #[derive(Debug, Clone)]
 pub struct Action {
@@ -154,51 +199,33 @@ pub fn apply_structural(
     }
 }
 
-/// Apply a rename via LSP: request `textDocument/rename` at the symbol's name
-/// position, then apply the returned WorkspaceEdit to the VFS (all references).
+/// Apply a rename through the gate engine at the symbol's name position, then apply the
+/// returned WorkspaceEdit to the VFS (all references). Engine handles its own warmup.
 fn apply_rename(
     vfs: &mut Vfs,
     node_id: &str,
     new_name: &str,
     root: &Path,
     structure_of: &impl Fn(&str) -> Vec<Node>,
-    lsp: &mut LspClient,
+    engine: &mut dyn GateEngine,
 ) -> Result<()> {
     let file = file_of(node_id);
     let nodes = structure_of(file);
     let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.to_string()))?;
     let nr = node.name_range.as_ref().unwrap_or(&node.range);
-    // Warm the server: opening the file loads the tsconfig project, so rename sees
-    // every reference. A cold server returns an EMPTY edit (silent no-op rename).
-    if let Ok(content) = std::fs::read_to_string(root.join(file)) {
-        let _ = lsp.diagnostics(&[(file.to_string(), content)]);
-    }
-    let uri = format!("file://{}", root.join(file).to_string_lossy());
-    let params = json!({
-        "textDocument": {"uri": uri},
-        "position": {"line": nr.start_line.saturating_sub(1), "character": nr.start_char},
-        "newName": new_name,
-    });
-    let we = lsp.request("textDocument/rename", params)?;
+    let we = engine.rename(file, nr.start_line.saturating_sub(1), nr.start_char, new_name)?;
     apply_workspace_edit(vfs, root, &we)
 }
 
-/// Move a file: ask the LSP to compute importer rewrites (`willRenameFiles`), apply
-/// them to the VFS, then move the file. The gate validates the result. If the server
-/// doesn't support willRenameFiles, the move still proceeds (gate catches breakage).
-fn apply_move(vfs: &mut Vfs, from: &Path, to: &Path, root: &Path, lsp: &mut LspClient) -> Result<()> {
-    // Warm the server: opening the file loads the tsconfig project, so
-    // willRenameFiles can actually see the importers.
+/// Move a file: ask the engine to compute importer rewrites (`willRename`), apply them to
+/// the VFS, then move the file. If the engine can't compute them, the move still proceeds
+/// (the blast-radius gate catches any breakage).
+fn apply_move(vfs: &mut Vfs, from: &Path, to: &Path, root: &Path, engine: &mut dyn GateEngine) -> Result<()> {
     let from_rel = from.to_string_lossy().replace('\\', "/");
-    if let Ok(content) = std::fs::read_to_string(root.join(from)) {
-        let _ = lsp.diagnostics(&[(from_rel, content)]);
-    }
-    let old_uri = format!("file://{}", root.join(from).to_string_lossy());
-    let new_uri = format!("file://{}", root.join(to).to_string_lossy());
-    let params = json!({ "files": [{ "oldUri": old_uri, "newUri": new_uri }] });
-    if let Ok(we) = lsp.request("workspace/willRenameFiles", params) {
+    let to_rel = to.to_string_lossy().replace('\\', "/");
+    if let Ok(we) = engine.will_rename(&from_rel, &to_rel) {
         if std::env::var("CI_LSP_DEBUG").is_ok() {
-            eprintln!("willRenameFiles -> {we}");
+            eprintln!("willRename -> {we}");
         }
         let _ = apply_workspace_edit(vfs, root, &we);
     }
@@ -287,7 +314,7 @@ pub fn commit_edits(
     root: &Path,
     ops: &[EditOp],
     structure_of: &impl Fn(&str) -> Vec<Node>,
-    lsp: &mut LspClient,
+    engine: &mut dyn GateEngine,
     opts: &EditOpts,
     reverse_imports: &impl Fn(&str) -> Vec<String>,
 ) -> Result<CommitResult> {
@@ -296,9 +323,9 @@ pub fn commit_edits(
     for (i, op) in ops.iter().enumerate() {
         let res = match op {
             EditOp::Rename { node_id, new_name } => {
-                apply_rename(&mut vfs, node_id, new_name, root, structure_of, lsp)
+                apply_rename(&mut vfs, node_id, new_name, root, structure_of, engine)
             }
-            EditOp::MoveFile { from, to } => apply_move(&mut vfs, from, to, root, lsp),
+            EditOp::MoveFile { from, to } => apply_move(&mut vfs, from, to, root, engine),
             EditOp::DeleteFile { path } => apply_delete(&mut vfs, path, reverse_imports),
             other => apply_structural(&mut vfs, other, structure_of),
         };
@@ -337,7 +364,7 @@ pub fn commit_edits(
         .iter()
         .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
         .collect();
-    let baseline = lsp.diagnostics(&baseline_files)?;
+    let baseline = engine.diagnostics(&baseline_files)?;
     let baseline_keys: HashSet<String> = baseline.iter().map(diag_key).collect();
 
     // After = overlay (edited) content for the changed files; disk content for the dependents
@@ -354,7 +381,7 @@ pub fn commit_edits(
             .map(|c| (rel.clone(), c))
         })
         .collect();
-    let after = lsp.diagnostics(&after_files)?;
+    let after = engine.diagnostics(&after_files)?;
     let new: Vec<&Diag> = after.iter().filter(|d| !baseline_keys.contains(&diag_key(d))).collect();
 
     if !new.is_empty() {

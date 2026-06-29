@@ -65,6 +65,11 @@ impl LspClient {
         Ok(client)
     }
 
+    /// Repo root this server was started for (used to build `file://` URIs).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Type-check the given files (repo-relative path + buffer content) and return
     /// the ERROR diagnostics. Buffers are in-memory overlays — disk is not read.
     pub fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
