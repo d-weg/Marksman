@@ -27,10 +27,12 @@ enum AnyProvider {
 }
 
 impl AnyProvider {
-    /// Warm the write engine — TS only (Rust has no edit gate yet).
+    /// Warm the write engine on a background thread (tsserver/ts-morph for TS, rust-analyzer
+    /// for Rust), so the first `apply_edits` is fast.
     fn prewarm(&self) {
-        if let AnyProvider::Ts(t) = self {
-            t.prewarm();
+        match self {
+            AnyProvider::Ts(t) => t.prewarm(),
+            AnyProvider::Rust(r) => r.prewarm(),
         }
     }
 }

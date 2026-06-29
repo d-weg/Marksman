@@ -7,18 +7,63 @@ use ci_core::{
     CommitResult, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node,
     NodeKind, Range, Result, SymbolKind,
 };
-use std::collections::BTreeMap;
+use ci_edit::GateEngine;
+use ci_lsp::LspClient;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
 use tree_sitter::{Node as TsNode, Parser};
+
+/// The rust-analyzer LSP server, loaded once and reused as the edit/gate engine — the same
+/// `GateEngine`/`LspClient` path TypeScript uses, just rust-analyzer instead of tsserver.
+type WarmEngine = Arc<Mutex<Option<LspClient>>>;
 
 #[derive(Clone)]
 pub struct RustProvider {
     root: PathBuf,
+    engine: WarmEngine,
+}
+
+/// The rust-analyzer binary: `$CI_RUST_ANALYZER`, else `~/.cargo/bin/rust-analyzer`, else PATH.
+fn rust_analyzer_command() -> Command {
+    let bin = std::env::var("CI_RUST_ANALYZER").map(std::ffi::OsString::from).unwrap_or_else(|_| {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| Path::new(&h).join(".cargo/bin/rust-analyzer"))
+            .filter(|p| p.is_file())
+            .map(|p| p.into_os_string())
+            .unwrap_or_else(|| "rust-analyzer".into())
+    });
+    Command::new(bin)
 }
 
 impl RustProvider {
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf() }
+        Self { root: root.to_path_buf(), engine: Arc::new(Mutex::new(None)) }
+    }
+
+    /// Start rust-analyzer and load the cargo workspace NOW, on a background thread, so the
+    /// first `apply_edits` finds it warm instead of paying the cold `cargo metadata` + analysis
+    /// inline. No-op-safe if rust-analyzer can't start (apply_edits then surfaces the error).
+    pub fn prewarm(&self) {
+        let slot = self.engine.clone();
+        let root = self.root.clone();
+        let warm = rust_files(&root)
+            .into_iter()
+            .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
+        std::thread::spawn(move || {
+            let Ok(mut guard) = slot.lock() else { return };
+            if guard.is_some() {
+                return;
+            }
+            if let Ok(mut client) = LspClient::start(&root, rust_analyzer_command()) {
+                if let Some((f, content)) = warm {
+                    let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
+                }
+                *guard = Some(client);
+            }
+        });
     }
 
     /// Normalize a (possibly absolute) path to the repo-relative posix form.
@@ -73,11 +118,30 @@ impl LanguageProvider for RustProvider {
         Ok(graph)
     }
 
-    fn apply_edits(&self, _ops: &[EditOp], _opts: &EditOpts) -> Result<CommitResult> {
-        // v0 is read-only. Type-checked Rust edits (rust-analyzer GateEngine) are on the roadmap.
-        Err(Error::Driver(
-            "Rust edits are not supported yet (read-only provider); the rust-analyzer edit gate is on the roadmap".into(),
-        ))
+    fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
+        // Gate via the PERSISTENT rust-analyzer LSP (reuse from prewarm; lock blocks until an
+        // in-flight warm finishes, so we never start a second cold server). Same VFS +
+        // baseline-diff + blast-radius path as TypeScript, through the GateEngine seam.
+        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(LspClient::start(&self.root, rust_analyzer_command())?);
+        }
+        let engine: &mut dyn GateEngine = guard.as_mut().unwrap();
+
+        let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
+
+        // Reverse import map (file -> who `mod`-includes it) for the blast-radius gate + delete
+        // safety, derived from the tree-sitter mod graph.
+        let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+        for (from, tos) in self.import_graph().unwrap_or_default() {
+            let f = from.to_string_lossy().replace('\\', "/");
+            for to in tos {
+                reverse.entry(to.to_string_lossy().replace('\\', "/")).or_default().push(f.clone());
+            }
+        }
+        let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
+
+        ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
     }
 }
 
@@ -280,6 +344,34 @@ mod tests {
             })
             .collect();
         assert!(kinds.contains(&"body") && kinds.contains(&"returnType"), "sub-nodes: {kinds:?}");
+    }
+
+    // Real gate end-to-end: spawns rust-analyzer (rustup component). #[ignore]; run with
+    // `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn rust_analyzer_gates_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\npub fn run() -> i32 {\n    add(1, 2)\n}\n",
+        )
+        .unwrap();
+
+        let p = RustProvider::new(root);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let res = p
+            .apply_edits(&[EditOp::Rename { node_id: "src/lib.rs#add".into(), new_name: "sum".into() }], &opts)
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename should commit: {res:?}");
+
+        let after = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(after.contains("pub fn sum"), "definition renamed: {after}");
+        assert!(after.contains("sum(1, 2)"), "call site renamed by rust-analyzer: {after}");
+        assert!(!after.contains("add"), "no 'add' should remain: {after}");
     }
 
     #[test]

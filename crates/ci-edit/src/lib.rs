@@ -43,6 +43,29 @@ impl GateEngine for LspClient {
             "position": {"line": line, "character": character},
             "newName": new_name,
         });
+        // A server still loading the project (notably rust-analyzer mid-index) returns a
+        // transient error ("no references found", "content modified", -32602/-32801) until it's
+        // analyzed. Retry with backoff rather than fail a rename that will work in a second.
+        for attempt in 0..8 {
+            match self.request("textDocument/rename", params.clone()) {
+                Ok(we) => return Ok(we),
+                Err(e) => {
+                    let m = e.to_string().to_lowercase();
+                    let transient = attempt < 7
+                        && (m.contains("-32602")
+                            || m.contains("-32801")
+                            || m.contains("references")
+                            || m.contains("content modified")
+                            || m.contains("not ready")
+                            || m.contains("loading")
+                            || m.contains("waiting"));
+                    if !transient {
+                        return Err(e);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                }
+            }
+        }
         self.request("textDocument/rename", params)
     }
     fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
