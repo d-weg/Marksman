@@ -11,7 +11,7 @@ Claude Code's own JSON, and every task is reported (no cherry-picking).
 Requires: the `claude` CLI on PATH, a release build of codeindex-rs, and the target
 repo being a clean git working tree.
 """
-import argparse, json, os, pathlib, statistics, subprocess, time
+import argparse, json, os, pathlib, statistics, subprocess, sys, time
 
 HERE = pathlib.Path(__file__).parent
 TASKS = json.loads((HERE / "tasks.json").read_text())
@@ -64,6 +64,19 @@ def check(repo, cmd):
     return sh(["bash", "-c", cmd], cwd=repo).returncode == 0
 
 
+def preflight():
+    """Fail loudly if the `claude` CLI can't actually run — never report silent 0s."""
+    r = sh(["claude", "-p", "reply with exactly: ok", "--output-format", "json"])
+    try:
+        json.loads(r.stdout)
+        return True
+    except Exception:
+        print("ERROR: `claude` did not return valid JSON — is Claude Code installed and working?")
+        print("  stdout:", (r.stdout or "")[:200])
+        print("  stderr:", (r.stderr or "")[:300])
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", required=True)
@@ -71,6 +84,8 @@ def main():
     ap.add_argument("--runs", type=int, default=1)
     args = ap.parse_args()
     repo = os.path.abspath(args.repo)
+    if not preflight():
+        sys.exit(1)
     base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
 
     print(f"# Agent A/B — codeindex MCP on/off\nrepo: {repo} @ {base[:8]}\n")
