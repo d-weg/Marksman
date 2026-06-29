@@ -172,7 +172,28 @@ impl Server {
             ..Default::default()
         };
         let manifest = retrieve(&self.root, &task, &index, &qvec, &self.config, &opts);
-        Ok(render_summary(&manifest))
+        let detail = args["detailLevel"]
+            .as_str()
+            .or_else(|| args["detail_level"].as_str())
+            .unwrap_or("pointers");
+        let mut out = render_summary(&manifest);
+        // Skeletal context: inline code for the top entries so the agent gets signatures (and,
+        // with `outline`, NOT the bodies) without a separate read. `pointers` keeps it lean.
+        if detail != "pointers" {
+            out.push_str("\n## code\n");
+            let mut shown = 0;
+            for e in &manifest.entries {
+                if shown >= 8 || e.reason == "doc" || e.file.ends_with(".md") {
+                    continue;
+                }
+                let Ok(content) = std::fs::read_to_string(self.root.join(&e.file)) else { continue };
+                let body = if detail == "full" { content } else { outline_for(&e.file, &content) };
+                let body: String = body.lines().take(250).collect::<Vec<_>>().join("\n");
+                out.push_str(&format!("\n### {}\n```\n{}\n```\n", e.file, body));
+                shown += 1;
+            }
+        }
+        Ok(out)
     }
 
     fn describe_architecture(&self, args: &Value) -> Result<String, String> {
@@ -265,6 +286,17 @@ fn render_summary(m: &Manifest) -> String {
     out
 }
 
+/// Skeletal outline for a file, dispatched by extension (tree-sitter, in-process).
+fn outline_for(file: &str, content: &str) -> String {
+    if file.ends_with(".rs") {
+        lang_rust::outline(content)
+    } else if file.ends_with(".ts") || file.ends_with(".tsx") || file.ends_with(".mts") || file.ends_with(".cts") {
+        lang_ts::outline(content)
+    } else {
+        content.to_string()
+    }
+}
+
 fn kind_str(k: SymbolKind) -> &'static str {
     use SymbolKind::*;
     match k {
@@ -285,8 +317,8 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "retrieve_context",
-            "description": "Find the files and line-ranges relevant to a task. Hybrid index (BM25 + Model2Vec + symbol match) fused with RRF, expanded along the import graph. No API calls.",
-            "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"}},"required":["task"]}
+            "description": "Find the files and line-ranges relevant to a task. Hybrid index (BM25 + Model2Vec + symbol match) fused with RRF, expanded along the import graph. No API calls. `detailLevel` controls how much code is inlined so you may not need a separate read: `pointers` (default — just file + line-range pointers), `outline` (inline the relevant files with function/method BODIES elided — you get exact signatures, arguments, and return types but not the bodies; a 200-line file becomes ~15 lines), or `full` (inline whole files).",
+            "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"},"detailLevel":{"type":"string","enum":["pointers","outline","full"]}},"required":["task"]}
         },
         {
             "name": "describe_architecture",

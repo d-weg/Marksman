@@ -8,10 +8,12 @@
 pub mod config;
 pub mod driver;
 pub mod error;
+pub mod outline;
 pub mod types;
 pub mod weight;
 
 pub use config::Config;
 pub use driver::LanguageProvider;
 pub use error::{Error, Result};
+pub use outline::elide_bodies;
 pub use types::*;

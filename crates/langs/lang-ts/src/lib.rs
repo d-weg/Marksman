@@ -12,7 +12,10 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 mod ast;
+mod outline;
 mod tsmorph;
+
+pub use outline::outline;
 
 /// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`.
 fn npm_cache() -> PathBuf {

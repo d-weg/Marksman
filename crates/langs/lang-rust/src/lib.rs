@@ -313,6 +313,31 @@ fn rust_files(root: &Path) -> Vec<String> {
     out
 }
 
+// ── skeletal context ─────────────────────────────────────────────────────────
+
+/// Return `content` with Rust function/method bodies (`block`) elided, keeping signatures.
+/// Best-effort: returns the original on a parse failure.
+pub fn outline(content: &str) -> String {
+    let Some(tree) = RustProvider::parse(content) else { return content.to_string() };
+    let mut bodies = Vec::new();
+    collect_rust_bodies(tree.root_node(), &mut bodies);
+    ci_core::elide_bodies(content, bodies)
+}
+
+fn collect_rust_bodies(node: TsNode, out: &mut Vec<(usize, usize)>) {
+    if node.kind() == "function_item" {
+        if let Some(body) = node.child_by_field_name("body") {
+            if body.kind() == "block" {
+                out.push((body.start_byte(), body.end_byte()));
+            }
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.named_children(&mut c) {
+        collect_rust_bodies(ch, out);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
