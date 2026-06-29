@@ -26,5 +26,14 @@ export CI_NPM_CACHE="/tmp/ci-npm-cache"
 export CODEINDEX_TS_DIR="${CODEINDEX_TS_DIR:-/Users/davi.vasconcelos/codeindex}"
 export CI_MODEL_DIR="${CI_MODEL_DIR:-/Users/davi.vasconcelos/codeindex/.models/potion-code-16M}"
 
+# Prepare the disposable clone if missing (e.g. after a reboot clears /tmp).
+TARGET=/tmp/bench-target
+if [ ! -d "$TARGET/.git" ]; then
+  echo "preparing disposable clone at $TARGET …"
+  rm -rf "$TARGET"
+  git clone -q "$CODEINDEX_TS_DIR" "$TARGET"
+  ln -sfn "$CODEINDEX_TS_DIR/node_modules" "$TARGET/node_modules"
+fi
+
 cd "$HERE/../.."
-exec python3 scripts/agent-bench/run.py --repo /tmp/bench-target "$@"
+exec python3 scripts/agent-bench/run.py --repo "$TARGET" "$@"
