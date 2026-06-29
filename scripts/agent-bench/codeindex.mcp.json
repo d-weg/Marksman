@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codeindex": {
+      "command": "/Users/davi.vasconcelos/codeindex-rs/target/release/codeindex-rs-mcp",
+      "env": {
+        "CI_NPM_CACHE": "/tmp/ci-npm-cache",
+        "CI_MODEL_DIR": "/Users/davi.vasconcelos/codeindex/.models/potion-code-16M"
+      }
+    }
+  }
+}

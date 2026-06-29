@@ -1,0 +1,20 @@
+[
+  {
+    "id": "T1-rename",
+    "prompt": "Rename the function reciprocalRankFusion to fuseRanks everywhere in this codebase (definition and all call sites). Keep everything compiling.",
+    "check": "! grep -rq 'reciprocalRankFusion' src && grep -rq 'fuseRanks' src/rrf.ts && npm run -s typecheck",
+    "why": "Cross-file rename — codeindex's strongest case (one apply_edits vs N str_replace)."
+  },
+  {
+    "id": "T2-move",
+    "prompt": "Move the file src/rrf.ts to src/fusion/rrf.ts and update every import that references it. Keep everything compiling.",
+    "check": "test -f src/fusion/rrf.ts && ! test -f src/rrf.ts && npm run -s typecheck",
+    "why": "File move + importer rewrite — exercises move_file / willRenameFiles."
+  },
+  {
+    "id": "T3-locate-edit",
+    "prompt": "In the BM25 class, change the default value of the k1 field from 1.5 to 1.2. Change nothing else.",
+    "check": "grep -Eq 'k1\\s*=\\s*1\\.2' src/bm25.ts && npm run -s typecheck",
+    "why": "Locate-then-edit a small change — measures the find cost (retrieval vs grep)."
+  }
+]
