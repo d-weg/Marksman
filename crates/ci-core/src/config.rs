@@ -18,6 +18,10 @@ impl Default for QueryLayerWeighting {
     }
 }
 
+fn default_symbol_match_bonus() -> f32 {
+    3.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -32,6 +36,12 @@ pub struct Config {
     pub doc_globs: Vec<String>,
     pub adjacency_bonus: f32,
     pub rrf_k: f32,
+    /// Additive final-score bonus for a file whose symbol name the query matches, scaled by
+    /// match strength (1.0 = the query contains the symbol's full name). Strong enough to lift
+    /// a leaf *definition* above well-connected hub files that only win on adjacency — the
+    /// definition of the thing you name is the answer for rename/locate tasks.
+    #[serde(default = "default_symbol_match_bonus")]
+    pub symbol_match_bonus: f32,
     pub index_dir: String,
     pub query_embed_prefix: String,
     #[serde(default)]
@@ -60,6 +70,7 @@ impl Default for Config {
             doc_globs: vec!["**/*.md".into(), "**/*.mdx".into()],
             adjacency_bonus: 0.4,
             rrf_k: 60.0,
+            symbol_match_bonus: default_symbol_match_bonus(),
             index_dir: ".codeindex".into(),
             query_embed_prefix: "Represent this sentence for searching relevant code: ".into(),
             query_layer_weighting: QueryLayerWeighting::default(),

@@ -125,6 +125,44 @@ pub fn infer_role(s: &RoleSignals) -> PackageRole {
     infer_role_from_name_dir(&s.name, &s.dir)
 }
 
+/// Map a single (lowercased) path segment to a role, or None if it carries no layer signal.
+/// Conservative on purpose — only directory names that almost always denote a layer. Ambiguous
+/// ones (`app`, `ui`, `components`, `src`) are deliberately omitted to avoid false boosts.
+fn segment_role(seg: &str) -> Option<PackageRole> {
+    Some(match seg {
+        "server" | "backend" | "api" | "apis" | "routes" | "route" | "controllers"
+        | "controller" | "services" | "service" | "db" | "database" | "migrations"
+        | "migration" | "prisma" | "drizzle" | "worker" | "workers" | "jobs" | "queue"
+        | "lambda" | "functions" | "handlers" | "middleware" => PackageRole::Backend,
+        "web" | "www" | "frontend" | "client" | "pages" | "dashboard" | "admin" | "site" => {
+            PackageRole::Frontend
+        }
+        "mobile" | "native" | "screens" | "navigation" => PackageRole::Mobile,
+        "docs" | "documentation" => PackageRole::Docs,
+        "shared" | "common" | "core" | "types" | "util" | "utils" | "helpers" | "lib"
+        | "libs" | "dto" | "constants" => PackageRole::Shared,
+        _ => return None,
+    })
+}
+
+/// Infer a file's role from its **path segments**, so layer weighting works BELOW the package
+/// boundary — a `backend/` (or `server/`, `db/`, …) directory anywhere, including inside a
+/// single-package repo with no per-dir manifest, is treated like a declared backend package.
+/// The **deepest** (closest-to-file) decisive directory wins (handles `apps/web/server/x.ts`);
+/// `Unknown` when no directory segment is decisive, so the caller can fall back to the package.
+pub fn infer_role_from_path(rel_path: &str) -> PackageRole {
+    let parts: Vec<&str> = rel_path.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 2 {
+        return PackageRole::Unknown; // no directory component, just a filename
+    }
+    for seg in parts[..parts.len() - 1].iter().rev() {
+        if let Some(r) = segment_role(&seg.to_lowercase()) {
+            return r;
+        }
+    }
+    PackageRole::Unknown
+}
+
 fn default_layer_terms(role: PackageRole) -> &'static [&'static str] {
     match role {
         PackageRole::Backend => &[
@@ -176,7 +214,7 @@ pub struct WeightDebug {
     pub fired_layers: Vec<PackageRole>,
 }
 
-fn resolve_role(p: &WeightedPackage) -> PackageRole {
+pub fn resolve_role(p: &WeightedPackage) -> PackageRole {
     if let Some(r) = p.role.as_deref().and_then(PackageRole::parse) {
         if r != PackageRole::Unknown {
             return r;
@@ -189,6 +227,44 @@ fn resolve_role(p: &WeightedPackage) -> PackageRole {
         ts_lib: p.ts_lib.clone(),
         ts_types: p.ts_types.clone(),
     })
+}
+
+/// The query-conditioned layer multiplier **per role** (decoupled from any package), so the
+/// caller can apply it against a file's *path*-derived role rather than only its package's role.
+/// Each value is `1.0` (no boost) or `1 + boost·(roleHits/maxHits)` when the query fires that
+/// layer. `"unknown"` is always `1.0`.
+pub fn layer_multipliers(query_tokens: &[String], config: &Config) -> HashMap<&'static str, f64> {
+    let qset: HashSet<&str> = query_tokens.iter().map(String::as_str).collect();
+    let enabled = config.query_layer_weighting.enabled;
+    let boost = config.query_layer_weighting.boost as f64;
+
+    let mut layer_scores: HashMap<&'static str, usize> = HashMap::new();
+    let mut max_layer = 0usize;
+    if enabled {
+        for role in KNOWN_ROLES {
+            let mut hits = 0;
+            for &t in default_layer_terms(role) {
+                if term_hits(&qset, t) {
+                    hits += 1;
+                }
+            }
+            layer_scores.insert(role.as_str(), hits);
+            max_layer = max_layer.max(hits);
+        }
+    }
+
+    let mut mult: HashMap<&'static str, f64> = HashMap::new();
+    for role in KNOWN_ROLES {
+        let ls = *layer_scores.get(role.as_str()).unwrap_or(&0);
+        let m = if enabled && max_layer > 0 && ls > 0 {
+            1.0 + boost * (ls as f64 / max_layer as f64)
+        } else {
+            1.0
+        };
+        mult.insert(role.as_str(), m);
+    }
+    mult.insert("unknown", 1.0);
+    mult
 }
 
 /// Compute the per-package fused-score multiplier (static × query-conditioned).
@@ -267,6 +343,29 @@ mod tests {
         let (w, dbg) = compute_package_weights(&packages, &q, &Config::default());
         assert!(w["backend"] > w["mobile"], "backend should outweigh mobile: {w:?}");
         assert!(dbg.fired_layers.contains(&PackageRole::Backend));
+    }
+
+    #[test]
+    fn infers_role_from_path_segments() {
+        // a `backend/` dir signals backend even with no manifest there.
+        assert_eq!(infer_role_from_path("apps/backend/test.js"), PackageRole::Backend);
+        assert_eq!(infer_role_from_path("src/db/migrate.ts"), PackageRole::Backend);
+        assert_eq!(infer_role_from_path("packages/mobile/screens/Home.tsx"), PackageRole::Mobile);
+        // deepest decisive segment wins: web (frontend) is shallower than server (backend).
+        assert_eq!(infer_role_from_path("apps/web/server/handler.ts"), PackageRole::Backend);
+        // no decisive segment -> Unknown (caller falls back to the package role).
+        assert_eq!(infer_role_from_path("src/rrf.ts"), PackageRole::Unknown);
+        // a bare filename has no directory component.
+        assert_eq!(infer_role_from_path("index.ts"), PackageRole::Unknown);
+    }
+
+    #[test]
+    fn layer_multiplier_boosts_fired_role_only() {
+        let q: Vec<String> =
+            "add a database migration".split_whitespace().map(str::to_string).collect();
+        let m = layer_multipliers(&q, &Config::default());
+        assert!(m["backend"] > 1.0, "backend should be boosted: {m:?}");
+        assert_eq!(m["mobile"], 1.0, "mobile untouched by a backend query");
     }
 
     #[test]

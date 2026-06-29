@@ -2,7 +2,9 @@
 //! (`query_vec`) so this crate stays free of the embedder and unit-testable; the
 //! CLI/MCP layer embeds via ci-embed.
 use crate::rrf::{reciprocal_rank_fusion, sorted_by_score};
-use ci_core::weight::{compute_package_weights, WeightedPackage};
+use ci_core::weight::{
+    infer_role_from_path, layer_multipliers, resolve_role, PackageRole, WeightedPackage,
+};
 use ci_core::{Config, Manifest, ManifestEntry, MatchedSym, SeedRank, SymbolKind};
 use ci_index::{rank_matrix, tokenize, ChunkMeta, GraphData, IndexData, SymbolEntry};
 use std::collections::{HashMap, HashSet};
@@ -32,11 +34,44 @@ fn files_from_rows(rows: &[(usize, f64)], chunks: &[ChunkMeta]) -> Vec<String> {
     out
 }
 
-/// Direct symbol-name match -> ranked file list (best-scoring symbol per file wins).
-fn symbol_name_search(symbols: &[SymbolEntry], q_tokens: &[String], q_raw: &str) -> Vec<String> {
+fn is_ident_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// Does `needle` occur in `hay` as a whole identifier — flanked by non-identifier chars (or
+/// string edges)? Prevents a short symbol like `name` from "exactly" matching inside `rename`,
+/// which is what made common field names hijack the symbol-match bonus. Both args lowercased.
+fn contains_word(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let hb = hay.as_bytes();
+    let mut from = 0;
+    while let Some(off) = hay[from..].find(needle) {
+        let i = from + off;
+        let end = i + needle.len();
+        let before_ok = i == 0 || !is_ident_char(hb[i - 1]);
+        let after_ok = end >= hb.len() || !is_ident_char(hb[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = i + 1;
+    }
+    false
+}
+
+/// Per-file direct symbol-name match. Returns the best-scoring file first, each tagged with its
+/// match `score` and whether it was an `exact` full-name hit (the query literally contains the
+/// symbol's whole name — a near-certain "this is the symbol I mean"). The caller uses `score` to
+/// size a relevance bonus and `exact` to force the defining file in as a seed.
+fn symbol_name_search(
+    symbols: &[SymbolEntry],
+    q_tokens: &[String],
+    q_raw: &str,
+) -> Vec<(String, i32, bool)> {
     let q: HashSet<&str> = q_tokens.iter().map(String::as_str).collect();
     let ql = q_raw.to_lowercase();
-    let mut best: HashMap<String, i32> = HashMap::new();
+    let mut best: HashMap<String, (i32, bool)> = HashMap::new();
     for s in symbols {
         if matches!(s.kind, SymbolKind::Doc) {
             continue;
@@ -47,20 +82,24 @@ fn symbol_name_search(symbols: &[SymbolEntry], q_tokens: &[String], q_raw: &str)
                 score += 1;
             }
         }
-        if ql.contains(&s.name.to_lowercase()) && s.name.chars().count() >= 3 {
+        let exact = s.name.chars().count() >= 3 && contains_word(&ql, &s.name.to_lowercase());
+        if exact {
             score += 2;
         }
         if score <= 0 {
             continue;
         }
-        let e = best.entry(s.file.clone()).or_insert(0);
-        if score > *e {
-            *e = score;
+        let e = best.entry(s.file.clone()).or_insert((0, false));
+        if score > e.0 {
+            *e = (score, exact);
+        } else if exact {
+            e.1 = true;
         }
     }
-    let mut v: Vec<(String, i32)> = best.into_iter().collect();
+    let mut v: Vec<(String, i32, bool)> =
+        best.into_iter().map(|(f, (sc, ex))| (f, sc, ex)).collect();
     v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    v.into_iter().map(|(f, _)| f).collect()
+    v
 }
 
 #[derive(Clone)]
@@ -159,12 +198,27 @@ pub fn retrieve(
         }
     }
 
-    let sym_files = symbol_name_search(&index.symbols, &q_tokens, task);
+    let sym_scored = symbol_name_search(&index.symbols, &q_tokens, task);
+    let sym_files: Vec<String> = sym_scored.iter().map(|(f, _, _)| f.clone()).collect();
+    // The bonus is reserved for the "you named it exactly" case (query contains the symbol's full
+    // name) — that file is almost certainly the target. Partial-token matches already get their
+    // due through RRF's `sym_files` list; spreading the bonus to them just floats every loosely
+    // related file and re-buries the definition. So strength is binary: 1.0 for an exact hit.
+    let sym_strength: HashMap<String, f64> = sym_scored
+        .iter()
+        .filter(|(_, _, ex)| *ex)
+        .map(|(f, _, _)| (f.clone(), 1.0))
+        .collect();
+    let exact_sym_files: Vec<String> =
+        sym_scored.iter().filter(|(_, _, ex)| *ex).map(|(f, _, _)| f.clone()).take(5).collect();
 
     // 2. RRF.
     let fused = reciprocal_rank_fusion(&[vec_files, bm_files, sym_files], config.rrf_k as f64);
 
-    // 3. Package-aware weighting (post-RRF multiply on the fused score).
+    // 3. Package- AND path-aware weighting (post-RRF multiply on the fused score).
+    // Static multiplier stays at package granularity; the query-conditioned LAYER boost keys off
+    // the file's *path*-derived role (falling back to the package's role), so a `backend/`/`db/`
+    // directory is boosted on a backend query even inside a single-package repo. See weight.rs.
     let packages: Vec<WeightedPackage> = index
         .meta
         .packages
@@ -175,11 +229,28 @@ pub fn retrieve(
             ..Default::default()
         })
         .collect();
-    let (weight, _dbg) = compute_package_weights(&packages, &q_tokens, config);
+    let pkg_role: HashMap<String, PackageRole> =
+        packages.iter().map(|p| (p.name.clone(), resolve_role(p))).collect();
+    let layer_mult = layer_multipliers(&q_tokens, config);
     let pkg_of = |file: &str| -> String {
         index.meta.files.get(file).map(|f| f.pkg.clone()).unwrap_or_default()
     };
-    let weight_for = |file: &str| -> f64 { *weight.get(&pkg_of(file)).unwrap_or(&1.0) };
+    let weight_for = |file: &str| -> f64 {
+        let pkg = pkg_of(file);
+        let prole = *pkg_role.get(&pkg).unwrap_or(&PackageRole::Unknown);
+        // path role wins when decisive; otherwise the package's role.
+        let frole = match infer_role_from_path(file) {
+            PackageRole::Unknown => prole,
+            r => r,
+        };
+        let static_w = config
+            .package_weights
+            .get(&pkg)
+            .or_else(|| config.package_weights.get(prole.as_str()))
+            .map(|w| *w as f64)
+            .unwrap_or(1.0);
+        static_w * layer_mult.get(frole.as_str()).copied().unwrap_or(1.0)
+    };
 
     let mut weighted_fused: HashMap<String, f64> = HashMap::new();
     for (file, s) in &fused {
@@ -187,8 +258,14 @@ pub fn retrieve(
     }
     let fused_sorted = sorted_by_score(&weighted_fused);
 
-    // 4. Seeds + graph expansion.
-    let seeds: Vec<String> = fused_sorted.iter().take(top_n).map(|(f, _)| f.clone()).collect();
+    // 4. Seeds + graph expansion. Files the query names exactly are forced in as seeds even if
+    // RRF consensus + adjacency would otherwise bury the (small, leaf) definition site.
+    let mut seeds: Vec<String> = fused_sorted.iter().take(top_n).map(|(f, _)| f.clone()).collect();
+    for f in &exact_sym_files {
+        if !seeds.contains(f) {
+            seeds.push(f.clone());
+        }
+    }
     let seed_set: HashSet<String> = seeds.iter().cloned().collect();
     let expanded = expand_graph(&seeds, &index.graph, hops);
 
@@ -226,7 +303,10 @@ pub fn retrieve(
         }
         let base = *weighted_fused.get(file).unwrap_or(&0.0);
         let adj = adjacency_to_seeds(file, &seed_set, &index.graph);
-        let score = base + config.adjacency_bonus as f64 * adj as f64;
+        // Symbol-match bonus: lifts the file that *defines* the named symbol above hub files that
+        // only score via adjacency. Scaled by match strength (1.0 = the query named it in full).
+        let sym_b = config.symbol_match_bonus as f64 * sym_strength.get(file).copied().unwrap_or(0.0);
+        let score = base + config.adjacency_bonus as f64 * adj as f64 + sym_b;
         let reason: String = if is_seed {
             if is_doc_file(file) { "doc".into() } else { "query-match".into() }
         } else {
@@ -298,6 +378,68 @@ mod tests {
             start_line: sl,
             end_line: el,
         }
+    }
+
+    #[test]
+    fn contains_word_respects_identifier_boundaries() {
+        // the bug: `name` must NOT match inside `rename`.
+        assert!(!contains_word("rename the function", "name"));
+        assert!(contains_word("rename the reciprocalrankfusion function", "reciprocalrankfusion"));
+        assert!(contains_word("the name field", "name")); // standalone -> matches
+        assert!(!contains_word("my_name helper", "name")); // snake_case part is not a whole word
+    }
+
+    #[test]
+    fn exact_symbol_match_outranks_adjacency_hub() {
+        // leaf.ts DEFINES reciprocalRankFusion; hub.ts is imported by many seeds (pure adjacency).
+        let chunks = vec![
+            chunk("leaf.ts#rrf@1", "reciprocalRankFusion", "leaf.ts", 1, 10),
+            chunk("hub.ts#types@1", "Types", "hub.ts", 1, 5),
+            chunk("a.ts#a@1", "a", "a.ts", 1, 5),
+            chunk("b.ts#b@1", "b", "b.ts", 1, 5),
+        ];
+        let vectors = vec![0.0, 1.0, 1.0, 0.0, 0.9, 0.1, 0.1, 0.9];
+        let mut bm = Bm25::new();
+        bm.add_doc("a.ts#a@1", "a.ts", &tokenize("alpha helper"));
+        bm.add_doc("b.ts#b@1", "b.ts", &tokenize("beta helper"));
+        let symbols = vec![SymbolEntry {
+            id: "leaf.ts#rrf@1".into(),
+            name: "reciprocalRankFusion".into(),
+            kind: SymbolKind::Function,
+            file: "leaf.ts".into(),
+            pkg: "root".into(),
+            start_line: 1,
+            end_line: 10,
+            signature: None,
+        }];
+        // a.ts and b.ts (seeds) both import hub.ts -> hub.ts is a 2-adjacency hub.
+        let mut forward = Adjacency::new();
+        forward.insert("a.ts".into(), vec!["hub.ts".into()]);
+        forward.insert("b.ts".into(), vec!["hub.ts".into()]);
+        let mut files = BTreeMap::new();
+        for f in ["leaf.ts", "hub.ts", "a.ts", "b.ts"] {
+            files.insert(f.to_string(), FileRecord { mtime_ms: 0.0, pkg: "root".into() });
+        }
+        let index = IndexData {
+            meta: IndexMeta {
+                version: 1, created_at: "0".into(), updated_at: "0".into(), model: "m".into(),
+                dims: 2, root: "/tmp".into(), is_monorepo: false, packages: vec![],
+                package_names: vec![], files,
+            },
+            symbols, chunks, vectors,
+            forward: forward.clone(), graph: build_graph(forward), bm25: bm,
+        };
+        let manifest = retrieve(
+            Path::new("/nonexistent"),
+            "rename the reciprocalRankFusion function",
+            &index,
+            &[0.0, 1.0],
+            &Config::default(),
+            &RetrieveOptions { top_n: Some(2), ..Default::default() },
+        );
+        // the exact-named definition must be the #1 entry, ahead of the adjacency hub.
+        assert_eq!(manifest.entries[0].file, "leaf.ts", "definition should rank first: {:?}",
+            manifest.entries.iter().map(|e| (&e.file, e.score)).collect::<Vec<_>>());
     }
 
     #[test]
