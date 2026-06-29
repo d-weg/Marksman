@@ -94,16 +94,28 @@ impl LspClient {
         let targets: HashSet<String> = uri_to_rel.keys().cloned().collect();
         let mut store: HashMap<String, Vec<Value>> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
-        let settle = Duration::from_millis(600);
+        // Poll cadence. Two ways to settle: every target re-published (fast), OR the server
+        // has gone fully silent for `idle_quiet` — which is the ONLY signal for an all-clean
+        // edit, because tsserver does NOT re-publish diagnostics for files that stay clean
+        // (so `seen` would never reach `targets` and we'd burn the whole deadline). During a
+        // cold project load tsserver streams progress/log messages, so a sustained silence
+        // can't be mistaken for "still loading".
+        let tick = Duration::from_millis(300);
+        let idle_quiet = Duration::from_millis(1500);
         let deadline = Instant::now() + Duration::from_secs(30);
+        let mut quiet_since = Instant::now();
+        let timing = std::env::var("CI_TIMING").is_ok();
+        let t_diag = Instant::now();
+        let mut exit = "deadline";
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            match self.rx.recv_timeout(remaining.min(settle)) {
+            match self.rx.recv_timeout(remaining.min(tick)) {
                 Ok(msg) => {
+                    quiet_since = Instant::now(); // any server activity resets the silence timer
                     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     if method == "textDocument/publishDiagnostics" {
                         if let Some(p) = msg.get("params") {
@@ -120,13 +132,26 @@ impl LspClient {
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // A quiet period after all targets reported -> diagnostics settled.
+                    // All targets re-published then a brief lull (one tick) -> settled fast.
                     if seen.len() >= targets.len() {
+                        exit = "settled-all";
+                        break;
+                    }
+                    // Sustained silence after activity (or from a warm start) -> the unreported
+                    // files are simply clean. This is what rescues the all-clean case.
+                    if quiet_since.elapsed() >= idle_quiet {
+                        exit = "settled-quiet";
                         break;
                     }
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+        }
+        if timing {
+            eprintln!(
+                "[timing]   diagnostics() {:?} via {exit} (seen {}/{} files)",
+                t_diag.elapsed(), seen.len(), targets.len()
+            );
         }
 
         let mut out = Vec::new();

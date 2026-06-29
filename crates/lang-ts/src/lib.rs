@@ -8,6 +8,7 @@ use ci_core::{
 use ci_scip::ScipIndex;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 mod ast;
 
@@ -16,9 +17,19 @@ fn npm_cache() -> PathBuf {
     std::env::var("CI_NPM_CACHE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
 }
 
+/// A persistent TS language server, loaded once and reused across edits. The whole
+/// reason rust `apply_edits` was 68s was a COLD tsserver per call (project typecheck
+/// from scratch); keeping one warm here is the fix. Behind a Mutex so [`prewarm`] can
+/// load the project on a background thread while the agent is still searching/thinking.
+type WarmLsp = Arc<Mutex<Option<ci_lsp::LspClient>>>;
+
+#[derive(Clone)]
 pub struct TsProvider {
     root: PathBuf,
-    scip: ScipIndex,
+    // Arc so the provider is cheap to clone out of the MCP server's lock; the SCIP
+    // index and the warm LSP are shared, not copied.
+    scip: Arc<ScipIndex>,
+    lsp: WarmLsp,
 }
 
 impl TsProvider {
@@ -52,7 +63,46 @@ impl TsProvider {
 
     /// Load a provider from an existing `index.scip` (skip running the indexer).
     pub fn from_index(root: &Path, index_scip: &Path) -> Result<Self> {
-        Ok(Self { root: root.to_path_buf(), scip: ScipIndex::load(index_scip)? })
+        Ok(Self {
+            root: root.to_path_buf(),
+            scip: Arc::new(ScipIndex::load(index_scip)?),
+            lsp: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Start the TS language server and load the project NOW, on a background thread,
+    /// so the first `apply_edits` finds a warm server instead of paying the ~30s cold
+    /// project typecheck inline. Opening any source file makes tsserver load the whole
+    /// tsconfig project. The thread holds the LSP lock for the duration, so an
+    /// `apply_edits` that arrives mid-warm simply waits for it rather than racing in a
+    /// second cold server. Safe no-op if the server can't start (apply_edits falls back).
+    pub fn prewarm(&self) {
+        let slot = self.lsp.clone();
+        let root = self.root.clone();
+        // A source file (with imports) to open so tsserver loads the project.
+        let warm_file = self
+            .scip
+            .import_graph()
+            .ok()
+            .and_then(|g| g.into_keys().next())
+            .map(|p| p.to_string_lossy().replace('\\', "/"));
+        std::thread::spawn(move || {
+            let mut guard = match slot.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if guard.is_some() {
+                return; // already warm
+            }
+            if let Ok(mut client) = ci_lsp::LspClient::start(&root, Self::ts_lsp_command()) {
+                if let Some(f) = warm_file {
+                    if let Ok(content) = std::fs::read_to_string(root.join(&f)) {
+                        let _ = client.diagnostics(&[(f, content)]); // forces project load
+                    }
+                }
+                *guard = Some(client);
+            }
+        });
     }
 
     /// The TS language-server command (npx tsls). All external/Node tooling lives
@@ -99,9 +149,21 @@ impl LanguageProvider for TsProvider {
     }
 
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        // Read structure from the loaded SCIP index; gate via a fresh TS language
-        // server (VFS overlay + baseline-diff diagnostics).
-        let mut lsp = ci_lsp::LspClient::start(&self.root, Self::ts_lsp_command())?;
+        // Read structure from the loaded SCIP index; gate via the PERSISTENT TS language
+        // server (VFS overlay + baseline-diff diagnostics). Reuse the warm server from
+        // `prewarm` — locking blocks until an in-flight warm finishes, so we never start a
+        // second cold server. Only spawn fresh if prewarm never ran or failed.
+        let timing = std::env::var("CI_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+        let mut guard = self.lsp.lock().map_err(|_| Error::Driver("LSP lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(ci_lsp::LspClient::start(&self.root, Self::ts_lsp_command())?);
+        }
+        let lsp = guard.as_mut().unwrap();
+        if timing {
+            eprintln!("[timing] LSP ready (warm or fresh) {:?}", t0.elapsed());
+        }
+        let t1 = std::time::Instant::now();
         let structure_of = |f: &str| self.scip.structure(f).unwrap_or_default();
 
         // Reverse import map (file -> who imports it) for the delete-safety check.
@@ -114,7 +176,11 @@ impl LanguageProvider for TsProvider {
         }
         let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
 
-        ci_edit::commit_edits(&self.root, ops, &structure_of, &mut lsp, opts, &reverse_imports)
+        let r = ci_edit::commit_edits(&self.root, ops, &structure_of, lsp, opts, &reverse_imports);
+        if timing {
+            eprintln!("[timing] commit_edits (warmup+rename+gate) {:?}", t1.elapsed());
+        }
+        r
     }
 }
 

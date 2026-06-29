@@ -15,6 +15,7 @@ use lang_ts::TsProvider;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 fn resolve_root() -> PathBuf {
     let argv: Vec<String> = std::env::args().collect();
@@ -37,7 +38,9 @@ fn model_dir() -> PathBuf {
 struct Server {
     root: PathBuf,
     config: Config,
-    provider: Option<TsProvider>,
+    // Behind Arc<Mutex> so it can be built + warmed on a background thread at startup
+    // (see `start_prewarm`) and cheaply cloned out for each tool call.
+    provider: Arc<Mutex<Option<TsProvider>>>,
     embedder: Option<StaticEmbedder>,
 }
 
@@ -46,16 +49,40 @@ impl Server {
         let mut config = Config::load(&root).unwrap_or_default();
         config.embedding_model = "minishlab/potion-code-16M".into();
         config.index_dir = ".codeindex-rs".into();
-        Server { root, config, provider: None, embedder: None }
+        Server { root, config, provider: Arc::new(Mutex::new(None)), embedder: None }
     }
 
-    /// Lazily build the TS provider (runs scip-typescript + tree-sitter) — needed by
-    /// the output tools only.
-    fn provider(&mut self) -> Result<&TsProvider, String> {
-        if self.provider.is_none() {
-            self.provider = Some(TsProvider::index(&self.root).map_err(|e| e.to_string())?);
+    /// Kick off building the TS provider (scip-typescript) AND warming the TS language
+    /// server on a background thread, at startup — so by the time the agent calls
+    /// `apply_edits` (after retrieving + thinking) the server is already warm, instead of
+    /// paying the ~30s cold project load inline. Holding the provider lock across the
+    /// build means a tool that needs the provider mid-build waits for it, not races it.
+    fn start_prewarm(&self) {
+        let slot = self.provider.clone();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let Ok(mut g) = slot.lock() else { return };
+            if g.is_some() {
+                return;
+            }
+            if let Ok(p) = TsProvider::index(&root) {
+                p.prewarm(); // warms the LSP on its own background thread
+                *g = Some(p);
+            }
+        });
+    }
+
+    /// Get the TS provider, building it (scip-typescript + tree-sitter) if `start_prewarm`
+    /// hasn't finished. Returns a cheap clone (Arc-shared SCIP + warm LSP) so the caller
+    /// doesn't hold the lock. Needed by the output tools only.
+    fn provider(&self) -> Result<TsProvider, String> {
+        let mut g = self.provider.lock().map_err(|_| "provider lock poisoned".to_string())?;
+        if g.is_none() {
+            let p = TsProvider::index(&self.root).map_err(|e| e.to_string())?;
+            p.prewarm();
+            *g = Some(p);
         }
-        Ok(self.provider.as_ref().unwrap())
+        Ok(g.as_ref().unwrap().clone())
     }
 
     fn embedder(&mut self) -> Result<&StaticEmbedder, String> {
@@ -213,6 +240,9 @@ fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     eprintln!("[codeindex-rs-mcp] ready for {}", server.root.display());
+    // Build the provider + warm the TS language server in the background now, so the
+    // first apply_edits is fast instead of paying a cold project load inline.
+    server.start_prewarm();
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
