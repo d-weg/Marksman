@@ -31,6 +31,29 @@ on a non-TS repo. Closing that is the next structural step.
 3. **Provider manifest** so the set is discoverable and configurable — enable/disable a
    language, pin a tool version, point at a vendored binary for offline/air-gapped use.
 
+## Backlog (actionable, in dependency order)
+
+- [ ] **Rust provider (in progress)** — new `lang-rust` crate implementing `LanguageProvider`
+      via `tree-sitter-rust`: `structure()` (fns/structs/impls/methods + `#sym:body`/`:param`/
+      `:return`), `import_graph()` (`use` / `mod` resolution), `granularity()→Ast`. Read path
+      first (index + retrieve); edits behind a Rust `GateEngine` (rust-analyzer) later. Enables
+      dogfooding.
+- [ ] **Provider selection / registry** — replace the hardcoded `TsProvider` in
+      `ci-cli/src/main.rs` + `ci-mcp/src/main.rs` with `select_provider(root)` keyed on files
+      present (Cargo.toml/`.rs` → Rust; package.json/`.ts` → TS). v0 = dominant-language pick;
+      full multi-provider dispatch + lazy per-language tooling after.
+- [ ] **Skeletal context** — `detail_level` (`full`/`outline`/`signatures`) on
+      `retrieve_context`; reuse `lang-ts/src/ast.rs` body location to elide `statement_block`s;
+      secondary import-graph files default to `outline`; add a `read_node` drill-down tool.
+- [ ] **Surgical sub-node edits** — map `insert_in_body`/`replace_in_body`/`delete_in_body`/
+      param/return/comment verbs in `ci-edit::action_to_op` over the existing
+      `#sym:body`/`:param.N`/`:return` anchors; keep them gated.
+- [ ] **Config providers (JSON/YAML/TOML)** — tree-sitter providers for surgical key edits
+      (package.json, compose, *.toml); no gate needed. Rides on the provider registry.
+- [ ] **Tree-sitter fallback edit provider** — ungated structural edits for languages without
+      SCIP/LSP (Python/Go/…); result flags `gated: false`. Rides on the registry; upgraded
+      per-language to the gated path over time.
+
 ## Languages
 
 ### 1. Rust — next, and the reason it's first
