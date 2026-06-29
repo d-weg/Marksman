@@ -6,7 +6,7 @@
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
-use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, SymbolKind};
+use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind, SymbolKind};
 use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index};
@@ -211,6 +211,33 @@ impl Server {
         Ok(if out.is_empty() { "(no symbols)".into() } else { out })
     }
 
+    /// Drill-down: the full source + metadata of ONE anchor (a symbol or its `:body`/`:param`/
+    /// `:return` sub-node) — what you call after `retrieve_context` outline elided a body.
+    fn read_node(&mut self, args: &Value) -> Result<String, String> {
+        let file = args["file"].as_str().ok_or("`file` is required")?.to_string();
+        let nodes = self.provider()?.structure(Path::new(&file)).map_err(|e| e.to_string())?;
+        let id = if let Some(id) = args["id"].as_str() {
+            id.to_string()
+        } else if let Some(name) = args["name"].as_str() {
+            resolve_in(&nodes, name).ok_or_else(|| format!("symbol '{name}' not found in {file}"))?
+        } else {
+            return Err("provide `id` (an anchor id from list_anchors) or `name`".into());
+        };
+        let node = find_node(&nodes, &id).ok_or_else(|| format!("anchor '{id}' not found in {file}"))?;
+        let content = std::fs::read_to_string(self.root.join(&file)).map_err(|e| e.to_string())?;
+        let text = slice_lines(&content, node.range.start_line, node.range.end_line);
+        let kind = match &node.kind {
+            NodeKind::Symbol(k) => kind_str(*k).to_string(),
+            NodeKind::Syntax(s) => s.clone(),
+        };
+        Ok(format!(
+            "{kind} {}  ({file}:L{}-{})\n```\n{text}\n```",
+            node.name.as_deref().unwrap_or(&id),
+            node.range.start_line,
+            node.range.end_line,
+        ))
+    }
+
     fn apply_edits(&mut self, args: &Value) -> Result<String, String> {
         let dry_run = args["dryRun"].as_bool().unwrap_or(false);
         let actions = args["actions"].as_array().ok_or("`actions` array is required")?.clone();
@@ -286,6 +313,26 @@ fn render_summary(m: &Manifest) -> String {
     out
 }
 
+/// Depth-first find of a node by its anchor id (symbol or sub-node).
+fn find_node<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
+    for n in nodes {
+        if n.id == id {
+            return Some(n);
+        }
+        if let Some(f) = find_node(&n.children, id) {
+            return Some(f);
+        }
+    }
+    None
+}
+
+/// Lines `start_1..=end_1` (1-based inclusive) of `content`.
+fn slice_lines(content: &str, start_1: u32, end_1: u32) -> String {
+    let skip = start_1.saturating_sub(1) as usize;
+    let take = (end_1.saturating_sub(start_1) + 1) as usize;
+    content.lines().skip(skip).take(take).collect::<Vec<_>>().join("\n")
+}
+
 /// Skeletal outline for a file, dispatched by extension (tree-sitter, in-process).
 fn outline_for(file: &str, content: &str) -> String {
     if file.ends_with(".rs") {
@@ -327,8 +374,13 @@ fn tools_list() -> Value {
         },
         {
             "name": "list_anchors",
-            "description": "List AST anchors (node ids + line ranges) in a TS file — symbols and their sub-nodes (params/return/body) — to target with apply_edits.",
+            "description": "List AST anchors (node ids + line ranges) in a file — symbols and their sub-nodes (params/return/body) — to target with apply_edits or read_node.",
             "inputSchema": {"type":"object","properties":{"file":{"type":"string"}},"required":["file"]}
+        },
+        {
+            "name": "read_node",
+            "description": "Get the full source + metadata of ONE anchor (a symbol, or its :body / :param.N / :return sub-node) — the precise drill-down after retrieve_context `outline` elided a body. Provide `file` and either `id` (an anchor id from list_anchors, e.g. 'src/bm25.rs#Bm25.add_doc' or '…#add_doc:body') or `name` (the symbol's name).",
+            "inputSchema": {"type":"object","properties":{"file":{"type":"string"},"id":{"type":"string"},"name":{"type":"string"}},"required":["file"]}
         },
         {
             "name": "apply_edits",
@@ -378,6 +430,7 @@ fn main() {
                     "retrieve_context" => server.retrieve_context(args),
                     "describe_architecture" => server.describe_architecture(args),
                     "list_anchors" => server.list_anchors(args),
+                    "read_node" => server.read_node(args),
                     "apply_edits" => server.apply_edits(args),
                     other => Err(format!("unknown tool: {other}")),
                 };
