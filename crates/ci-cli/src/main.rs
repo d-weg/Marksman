@@ -16,9 +16,13 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 fn model_dir() -> PathBuf {
-    std::env::var("CI_MODEL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/Users/davi.vasconcelos/codeindex/.models/potion-code-16M"))
+    std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
+        // Default to the path the README's download step uses, so the documented
+        // `git clone … ~/.codegraph/models/potion-code-16M` works without setting CI_MODEL_DIR.
+        std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".codegraph/models/potion-code-16M"))
+            .unwrap_or_else(|_| PathBuf::from(".codegraph/models/potion-code-16M"))
+    })
 }
 
 /// Config tuned for the Rust tool: native potion embedder, separate index dir so we
