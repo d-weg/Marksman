@@ -37,11 +37,11 @@ on a non-TS repo. Closing that is the next structural step.
       impls/methods + `#sym:body`/`:param.N`/`:return`), `import_graph()` (`mod` resolution),
       `granularity()→Ast`, all in-process `tree-sitter-rust` (no Node). Indexes + retrieves Rust
       (incl. CodeGraph itself) via CLI and MCP.
-      - [x] **Rust write path (done).** Type-checked edits via rust-analyzer reusing the
-            `GateEngine`/`LspClient`/`commit_edits` blast-radius gate (rename verified
-            end-to-end). Needs `rustup component add rust-analyzer` (`CI_RUST_ANALYZER`
-            overrides). Next: `replace_node` / move coverage + faster cold-start than the
-            rename retry.
+      - [x] **Rust write path (done).** Full structural-edit coverage — **rename, replace_node,
+            move_file** — type-checked via rust-analyzer, reusing the `GateEngine`/`LspClient`/
+            `commit_edits` blast-radius gate (all three verified end-to-end). Needs
+            `rustup component add rust-analyzer` (`CI_RUST_ANALYZER` overrides). Next: faster
+            cold-start than the ~10s rename/move retry (a "rust-analyzer ready" signal).
       - [ ] **Better Rust graph** — `use`-resolution (not just `mod` edges) + optional
             `rust-analyzer scip` for compiler-accurate references in retrieval.
 - [x] **Provider selection (done, v0).** `build_provider`/`select_provider` keyed on manifests
@@ -77,6 +77,11 @@ on a non-TS repo. Closing that is the next structural step.
 - [ ] **Tree-sitter fallback edit provider** — ungated structural edits for languages without
       SCIP/LSP (Python/Go/…); result flags `gated: false`. Rides on the registry; upgraded
       per-language to the gated path over time.
+- [ ] **Capability parity across languages.** Every new provider should reach the bar TS and
+      Rust now meet: `structure` + `import_graph` + skeletal `outline` + gated structural edits
+      (rename / replace_node / move). The seams (`LanguageProvider`, `GateEngine`, the per-crate
+      `outline`) make each language *wiring*, not core work — pick the language's LSP/indexer and
+      implement the trait. Don't ship a read-only language without a path to its edit gate.
 
 ## Languages
 
