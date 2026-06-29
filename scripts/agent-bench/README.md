@@ -32,7 +32,12 @@ python3 scripts/agent-bench/run.py \
     --runs 3
 ```
 
-Requires the `claude` CLI on PATH. The script builds the index once, then for each task runs
+Requires a working `claude` CLI. If `claude` on your PATH is a broken stub (e.g. the
+desktop app's wrapper that errors with "native binary not installed"), point the harness at the
+real one: `CLAUDE_BIN=/path/to/claude python3 run.py ...`. A preflight check aborts loudly if
+`claude` can't return JSON, so the run never silently reports zeros.
+
+The script builds the index once, then for each task runs
 the agent twice (with / without codeindex), checks success, and prints a markdown table +
 totals (input/output token deltas, success counts).
 

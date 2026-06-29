@@ -19,6 +19,8 @@ MCP_CONFIG = str(HERE / "codeindex.mcp.json")
 ROOT = HERE.parent.parent
 RUST = str(ROOT / "target/release/codeindex-rs")
 
+# The claude CLI. Override via $CLAUDE_BIN if `claude` on PATH is a broken stub.
+CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
     "mcp__codeindex__retrieve_context",
@@ -39,7 +41,7 @@ def reset(repo, base):
 
 
 def run_agent(repo, prompt, with_codeindex):
-    cmd = ["claude", "-p", prompt, "--output-format", "json",
+    cmd = [CLAUDE, "-p", prompt, "--output-format", "json",
            "--max-turns", "40", "--dangerously-skip-permissions"]
     tools = BASE_TOOLS + ("," + CI_TOOLS if with_codeindex else "")
     if with_codeindex:
@@ -66,7 +68,7 @@ def check(repo, cmd):
 
 def preflight():
     """Fail loudly if the `claude` CLI can't actually run — never report silent 0s."""
-    r = sh(["claude", "-p", "reply with exactly: ok", "--output-format", "json"])
+    r = sh([CLAUDE, "-p", "reply with exactly: ok", "--output-format", "json"])
     try:
         json.loads(r.stdout)
         return True
