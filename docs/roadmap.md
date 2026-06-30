@@ -53,14 +53,14 @@ and **reading** context it doesn't need. Two principles fix this:
          propagates directly (today the agent reconstructs `file#name` or uses bare-name resolution).
    - [ ] `read just the sub-node`: encourage `read_node id=…:body`/`:doc` so a body edit loads only
          the body, not the whole symbol.
-   - [ ] **Resolve-by-query (`retrieve_and_edit`) — close the T3 floor.** T3 stays at parity because
-         the agent spends a turn to *discover* which symbol to edit (a cheap `pointers` retrieve),
-         then edits. Extend the addressing spectrum with a fourth, fuzziest mode: an `apply_edits`
-         target given as a **search query** instead of a name/id. The server runs retrieval; if the
-         top hit is unambiguous/high-confidence it applies the edit (gated, so a wrong guess is
-         caught), else it returns candidates — collapsing locate+edit into ONE call. Risk: editing a
-         retrieval guess; mitigated by the gate + a confidence threshold + candidate fallback. This
-         is the only remaining lever on grep-trivial "find-and-change" tasks.
+   - [x] **Resolve-by-query (`retrieve_and_edit`) — done.** A fourth, fuzziest addressing mode: an
+         `apply_edits` action with `query` (free text) instead of `name`/`id`. The server resolves
+         it — an exact symbol-name token in the query when unique, else the retrieval top hit —
+         and applies the edit (gated) when unambiguous, else returns candidate ids. Fuses
+         locate+edit into ONE call, closing the T3 discovery turn. Safe by construction: the gate +
+         `replace_text` uniqueness reject a wrong/ill-fitting target rather than silently editing
+         it. (Honest limit: a descriptive query rides retrieval ranking; a mismatched edit is
+         rejected, not misapplied.)
 
 ## Backlog (actionable, in dependency order)
 

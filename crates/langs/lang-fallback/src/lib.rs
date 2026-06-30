@@ -276,8 +276,14 @@ fn emit_fn(def: &TsNode, bytes: &[u8], prefix: &str, fn_kind: SymbolKind, out: &
 }
 
 fn emit_class(def: &TsNode, bytes: &[u8], prefix: &str, out: &mut Vec<Node>) {
-    if let Some(n) = named_node(def, bytes, prefix, SymbolKind::Class) {
+    if let Some(mut n) = named_node(def, bytes, prefix, SymbolKind::Class) {
         let inner = format!("{prefix}{}.", n.name.as_deref().unwrap_or_default());
+        if let Some(body) = def.child_by_field_name("body") {
+            // class docstring → `:doc` anchor (parity with functions/methods).
+            if let Some(ds) = python_docstring(&body) {
+                n.children.push(syntax(&format!("{}:doc", n.id), None, "doc", &ds));
+            }
+        }
         out.push(n);
         if let Some(body) = def.child_by_field_name("body") {
             collect_items(body, bytes, &inner, SymbolKind::Method, out);

@@ -322,6 +322,53 @@ impl Server {
         }
     }
 
+    /// Resolve a free-text `query` to a single node_id (the fuzziest addressing mode — fuse
+    /// locate+edit into one call). Conservative + gated: an exact symbol-NAME token in the query
+    /// resolves directly when unique; otherwise it falls back to retrieval and **only** auto-
+    /// resolves when the top result is unambiguous — any ambiguity returns candidate ids for the
+    /// agent to pick, so we never silently edit a vague guess.
+    fn resolve_query(&mut self, provider: &AnyProvider, query: &str) -> Result<String, String> {
+        let id_in = |f: &str, n: &str| resolve_in(&provider.structure(Path::new(f)).unwrap_or_default(), n);
+        if !index_exists(&self.root, &self.config) {
+            return Err("no index — run `codeindex-rs index` first, or address by name/id".into());
+        }
+        // 1) an exact symbol name that appears as a token in the query.
+        let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
+        let toks: std::collections::HashSet<String> =
+            query.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '_').filter(|t| t.len() > 2).map(str::to_string).collect();
+        let mut named: Vec<(String, String)> = index
+            .symbols
+            .iter()
+            .filter(|s| toks.contains(&s.name.to_lowercase()))
+            .map(|s| (s.file.clone(), s.name.clone()))
+            .collect();
+        named.sort();
+        named.dedup();
+        if !named.is_empty() {
+            let ids: Vec<String> = named.iter().filter_map(|(f, n)| id_in(f, n)).collect();
+            return match ids.len() {
+                1 => Ok(ids.into_iter().next().unwrap()),
+                _ => Err(candidate_msg(query, &ids)),
+            };
+        }
+        // 2) retrieval fallback — only auto-resolve when unambiguous.
+        let qvec = self.embedder()?.embed(query).map_err(|e| e.to_string())?;
+        let manifest = retrieve(&self.root, query, &index, &qvec, &self.config, &RetrieveOptions { top_n: Some(3), ..Default::default() });
+        let mut ids: Vec<String> = manifest
+            .entries
+            .iter()
+            .take(2)
+            .flat_map(|e| e.matched_symbols.iter().filter_map(|s| id_in(&e.file, &s.name)))
+            .collect();
+        ids.sort();
+        ids.dedup();
+        match ids.len() {
+            0 => Err(format!("query {query:?} resolved to no symbol — use retrieve_context to find it, then edit by name/id")),
+            1 => Ok(ids.into_iter().next().unwrap()),
+            _ => Err(candidate_msg(query, &ids)),
+        }
+    }
+
     /// Repo-relative files that define a symbol with this exact (bare) name, from the index.
     fn files_defining(&self, name: &str) -> Result<Vec<String>, String> {
         if !index_exists(&self.root, &self.config) {
@@ -373,6 +420,13 @@ impl Server {
             let act = a["action"].as_str().unwrap_or("");
             let path = a["path"].as_str().unwrap_or("").to_string();
             let mut name = a["name"].as_str().map(str::to_string);
+            // `query` — the fuzziest target: resolve a free-text description to a node_id via the
+            // index/retrieval (fuse locate+edit). Only when no explicit name/id was given.
+            if name.is_none() {
+                if let Some(q) = a["query"].as_str() {
+                    name = Some(self.resolve_query(&provider, q)?);
+                }
+            }
             // For a symbol-targeting action, resolve the reference to a node_id UP FRONT through
             // the addressing model (id ≫ name-in-file ≫ name-in-index). This is what lets the
             // agent edit by name with no prior retrieve — the index supplies the file — and turns
@@ -476,6 +530,16 @@ fn file_of(id: &str) -> &str {
     id.split('#').next().unwrap_or(id)
 }
 
+/// Ask the agent to re-issue with one of the candidate node ids (the disambiguation reply shared
+/// by name-collision and query resolution).
+fn candidate_msg(reference: &str, ids: &[String]) -> String {
+    format!(
+        "{reference:?} is ambiguous ({} matches) — re-issue with `name` set to one of these ids:\n{}",
+        ids.len(),
+        ids.join("\n")
+    )
+}
+
 /// Depth-first find of a node by its anchor id (symbol or sub-node).
 fn find_node<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
     for n in nodes {
@@ -549,8 +613,8 @@ fn tools_list() -> Value {
         },
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land (nothing commits if it introduces a new type error, including in files that import what changed). TS + Rust are gated; Python is structural-only (`gated:false` — verify it yourself). PREFER over grep + hand-editing: `rename` and `move_file` rewrite every reference / importer across the whole codebase in ONE call — don't edit call sites yourself or grep to verify. ADDRESSING — if the task already NAMES the symbol (e.g. \"rename X to Y\", \"change the body of Z\"), go STRAIGHT to apply_edits with name=X. Do NOT call retrieve_context or list_anchors first to find it: the index resolves a bare `name` to its defining file (omit `path`), and the type-check gate verifies the blast radius — so edit by name and trust it, don't pre-read callers. A node id from list_anchors (e.g. `src/x.ts#Foo.bar`) also works and is self-locating. An ambiguous name returns candidate ids to re-issue with. Only retrieve_context when you must DISCOVER which symbol to edit. Each action: {path?, action, name, value, target?, oldText?, newText?}. Pick the SMALLEST edit: • `replace_text` (name=symbol, oldText=exact substring unique within it, newText) — cheapest; use it when you already know the text, with NO Read/list_anchors first. • `replace_node` + `target` for ONE sub-node: target = `body` | `return` (return-type text) | `param.N` (0-based) | `doc` (leading comment / docstring); value = the new code. • `set_body` (name=fn/method, value=new `{ … }` block) — only when rewriting most of a body. • `rename` (path=defining file, name=current, value=new); `move_file` (path=current, value=new path); also `insert_before` / `create_file` / `delete_file`. Actions: rename, replace_node, replace_text, set_body, insert_before, create_file, move_file, delete_file.",
-            "inputSchema": {"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"action":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"oldText":{"type":"string","description":"replace_text: exact substring to replace (unique within the symbol)"},"newText":{"type":"string","description":"replace_text: its replacement"},"target":{"type":"string","description":"sub-node selector: body | return | param.N | doc"}},"required":["path","action"]}},"dryRun":{"type":"boolean"}},"required":["actions"]}
+            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land (nothing commits if it introduces a new type error, including in files that import what changed). TS + Rust are gated; Python is structural-only (`gated:false` — verify it yourself). PREFER over grep + hand-editing: `rename` and `move_file` rewrite every reference / importer across the whole codebase in ONE call — don't edit call sites yourself or grep to verify. ADDRESSING — if the task already NAMES the symbol (e.g. \"rename X to Y\", \"change the body of Z\"), go STRAIGHT to apply_edits with name=X. Do NOT call retrieve_context or list_anchors first to find it: the index resolves a bare `name` to its defining file (omit `path`), and the type-check gate verifies the blast radius — so edit by name and trust it, don't pre-read callers. A node id from list_anchors (e.g. `src/x.ts#Foo.bar`) also works and is self-locating. If you DON'T know the name, give `query` (a free-text description) instead of `name`: the server resolves it to the symbol via the index (fusing find+edit into ONE call) and applies the edit when unambiguous, else returns candidate ids. An ambiguous name/query returns candidate ids to re-issue with. So you almost never need a separate retrieve_context before editing. Each action: {path?, action, name, value, target?, oldText?, newText?}. Pick the SMALLEST edit: • `replace_text` (name=symbol, oldText=exact substring unique within it, newText) — cheapest; use it when you already know the text, with NO Read/list_anchors first. • `replace_node` + `target` for ONE sub-node: target = `body` | `return` (return-type text) | `param.N` (0-based) | `doc` (leading comment / docstring); value = the new code. • `set_body` (name=fn/method, value=new `{ … }` block) — only when rewriting most of a body. • `rename` (path=defining file, name=current, value=new); `move_file` (path=current, value=new path); also `insert_before` / `create_file` / `delete_file`. Actions: rename, replace_node, replace_text, set_body, insert_before, create_file, move_file, delete_file.",
+            "inputSchema": {"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"action":{"type":"string"},"name":{"type":"string","description":"symbol name or a node id (file#Scope.name); the index resolves the file"},"query":{"type":"string","description":"free-text target when you don't know the name; resolved via the index, applied if unambiguous"},"value":{"type":"string"},"oldText":{"type":"string","description":"replace_text: exact substring to replace (unique within the symbol)"},"newText":{"type":"string","description":"replace_text: its replacement"},"target":{"type":"string","description":"sub-node selector: body | return | param.N | doc"}},"required":["path","action"]}},"dryRun":{"type":"boolean"}},"required":["actions"]}
         }
     ])
 }
