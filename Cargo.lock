@@ -72,6 +72,7 @@ name = "ci-arch"
 version = "0.1.0"
 dependencies = [
  "ci-core",
+ "ci-walk",
  "ignore",
  "tempfile",
 ]

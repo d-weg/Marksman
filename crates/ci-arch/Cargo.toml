@@ -7,6 +7,7 @@ description = "Zero-API folder/architecture map: per-dir file-kind patterns + mo
 
 [dependencies]
 ci-core = { path = "../ci-core" }
+ci-walk = { path = "../ci-walk" }
 ignore.workspace = true
 
 [dev-dependencies]

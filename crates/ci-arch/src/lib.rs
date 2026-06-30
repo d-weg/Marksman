@@ -1,8 +1,10 @@
-//! ci-arch — zero-API folder/architecture map (port of folders.ts). Pure Rust,
-//! language-blind: per-directory file-kind histograms, co-located docs, and detected
-//! "module templates" (sibling dirs that repeat a file shape). Tells an agent where
+//! ci-arch — zero-API folder/architecture map. Pure Rust, language-blind: it dispatches
+//! on the same `ci_walk::Lang` extension tag the indexer uses (TS/TSX/Rust/Python/…), so any
+//! language a provider handles is mapped — per-directory file-kind histograms, co-located docs,
+//! and detected "module templates" (sibling dirs that repeat a file shape). Tells an agent where
 //! a new module goes before a create.
 use ci_core::{Error, Result};
+use ci_walk::Lang;
 use ignore::WalkBuilder;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -23,10 +25,13 @@ pub struct ArchNode {
     pub module_count: usize,
 }
 
-/// `foo.service.ts` → ".service.ts" · `index.ts` → "index" · `Bar.tsx` → ".tsx".
+/// `foo.service.ts` → ".service.ts" · entry files (`index.ts`/`mod.rs`/`lib.rs`/`main.rs`) →
+/// their stem ("index"/"mod"/…) · `Bar.tsx` → ".tsx" · `x.rs` → ".rs". Entry stems name a module
+/// rather than describe a kind, so they're histogrammed apart from leaf files (language-blind).
 fn file_suffix(name: &str) -> String {
-    if name == "index.ts" || name == "index.tsx" {
-        return "index".to_string();
+    let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+    if matches!(stem, "index" | "mod" | "lib" | "main") {
+        return stem.to_string();
     }
     let ext = if name.ends_with(".tsx") {
         Some("tsx")
@@ -56,7 +61,7 @@ pub fn build_architecture(root: &Path) -> Result<Vec<ArchNode>> {
     let mut count = 0usize;
     for result in WalkBuilder::new(root).build() {
         let entry = result.map_err(|e| Error::Other(e.to_string()))?;
-        if !entry.file_type().map_or(false, |t| t.is_file()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let abs = entry.path();
@@ -69,8 +74,9 @@ pub fn build_architecture(root: &Path) -> Result<Vec<ArchNode>> {
             Some(n) => n,
             None => continue,
         };
-        let is_ts = (name.ends_with(".ts") || name.ends_with(".tsx")) && !name.ends_with(".d.ts");
-        if !is_ts {
+        // Language-blind: keep any file a provider indexes as code (TS/TSX/Rust/Python/…);
+        // `Lang::of` already drops `.d.ts` declaration files. Drives the same dispatch as indexing.
+        if !Lang::of(rel).is_code() {
             continue;
         }
         if rel_s.contains("node_modules/")
@@ -211,6 +217,41 @@ mod tests {
         assert_eq!(file_suffix("index.ts"), "index");
         assert_eq!(file_suffix("Bar.tsx"), ".tsx");
         assert_eq!(file_suffix("plain.ts"), ".ts");
+        // language-blind: Rust entry files name a module; leaf files keep their extension.
+        assert_eq!(file_suffix("mod.rs"), "mod");
+        assert_eq!(file_suffix("lib.rs"), "lib");
+        assert_eq!(file_suffix("retrieve.rs"), ".rs");
+    }
+
+    #[test]
+    fn maps_a_rust_module_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // src/features/{auth,bids,users}/ each a Rust submodule: mod.rs + a leaf .rs.
+        for m in ["auth", "bids", "users"] {
+            let md = root.join("src/features").join(m);
+            fs::create_dir_all(&md).unwrap();
+            fs::write(md.join("mod.rs"), "pub mod handlers;").unwrap();
+            fs::write(md.join("handlers.rs"), "pub fn run() {}").unwrap();
+        }
+        // non-source files must not appear in the map.
+        fs::write(root.join("Cargo.toml"), "[workspace]").unwrap();
+        fs::write(root.join("README.md"), "# hi").unwrap();
+
+        let nodes = build_architecture(root).unwrap();
+        let auth = nodes
+            .iter()
+            .find(|n| n.dir == "src/features/auth")
+            .expect("rust module dir mapped");
+        assert_eq!(auth.files, 2);
+        assert_eq!(auth.suffixes.get("mod"), Some(&1)); // mod.rs histogrammed as an entry file
+        assert_eq!(auth.suffixes.get(".rs"), Some(&1)); // leaf file keeps its extension
+
+        let feat = nodes.iter().find(|n| n.dir == "src/features").expect("features node");
+        let t = feat.template.as_ref().expect("module template detected");
+        assert!(t.contains(&"mod".to_string()));
+        assert!(t.contains(&".rs".to_string()));
+        assert_eq!(feat.module_count, 3);
     }
 
     #[test]
