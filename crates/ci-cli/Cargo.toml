@@ -17,4 +17,5 @@ ci-retrieve = { path = "../ci-retrieve" }
 ci-build = { path = "../ci-build" }
 lang-ts = { path = "../langs/lang-ts" }
 lang-rust = { path = "../langs/lang-rust" }
+lang-fallback = { path = "../langs/lang-fallback" }
 serde_json.workspace = true

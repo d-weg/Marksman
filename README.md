@@ -1,19 +1,19 @@
-# CodeGraph
+# MarksmanAI
 
 **Precise code retrieval and type-checked edits for coding agents — over MCP.**
 
-CodeGraph is a local-first [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI coding agent two things grep-and-guess can't:
+MarksmanAI is a local-first [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI coding agent two things grep-and-guess can't:
 
 - **Find** the exact code for a task — compiler-accurate symbols + an import graph, fused with semantic and keyword search, returned as a **line-ranged manifest** (not a pile of whole files to read).
 - **Change** it safely — structured edits (rename / move / replace) applied atomically and **type-checked over the blast radius before they land**. A cross-file rename is *one* call, not N hand-edits, and nothing commits if it would break the build.
 
-Written in Rust: a language-blind core plus per-language providers. **v1 targets TypeScript.**
+Written in Rust: a language-blind core plus per-language providers. **TypeScript and Rust are fully type-checked; Python is supported via an in-process tree-sitter fallback (ungated edits).**
 
 ## Why
 
-Agents burn tokens grepping for context and break builds with blind string edits. CodeGraph hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
+Agents burn tokens grepping for context and break builds with blind string edits. MarksmanAI hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
 
-On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** CodeGraph used **~39% fewer tokens and finished ~38% faster** than without — and edged out the mature TypeScript tool it's a rewrite of. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
+On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** MarksmanAI used **~39% fewer tokens and finished ~38% faster** than without — and edged out the mature TypeScript tool it's a rewrite of. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Capabilities (MCP tools)
 
@@ -38,42 +38,42 @@ On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** Code
 
 ### 1. Build
 ```bash
-git clone https://github.com/d-weg/CodeGraph.git
-cd CodeGraph
+git clone https://github.com/d-weg/Marksman.git
+cd Marksman
 cargo build --release
 # produces: target/release/codeindex-rs (CLI) and target/release/codeindex-rs-mcp (MCP server)
 ```
 
 ### 2. Get the embedding model
-CodeGraph uses a small static Model2Vec embedder. Download the model and point `CI_MODEL_DIR` at the directory:
+MarksmanAI uses a small static Model2Vec embedder. Download the model and point `CI_MODEL_DIR` at the directory:
 ```bash
 # Option A — git-lfs
 git lfs install
-git clone https://huggingface.co/minishlab/potion-code-16M ~/.codegraph/models/potion-code-16M
+git clone https://huggingface.co/minishlab/potion-code-16M ~/.marksmanai/models/potion-code-16M
 
 # Option B — Hugging Face CLI
-# huggingface-cli download minishlab/potion-code-16M --local-dir ~/.codegraph/models/potion-code-16M
+# huggingface-cli download minishlab/potion-code-16M --local-dir ~/.marksmanai/models/potion-code-16M
 
-export CI_MODEL_DIR="$HOME/.codegraph/models/potion-code-16M"
+export CI_MODEL_DIR="$HOME/.marksmanai/models/potion-code-16M"
 ```
 The directory must contain `model.safetensors`, `tokenizer.json`, and `config.json`.
 
 ### 3. Index a repo
 ```bash
-export CI_MODEL_DIR="$HOME/.codegraph/models/potion-code-16M"
+export CI_MODEL_DIR="$HOME/.marksmanai/models/potion-code-16M"
 target/release/codeindex-rs index /path/to/your/ts-repo            # writes .codeindex-rs/ into the repo
 target/release/codeindex-rs retrieve /path/to/your/ts-repo "where is the rate limiter"   # sanity check
 ```
 
 ### 4. Register the MCP server with your agent
-Add CodeGraph to your MCP client's config (Claude Code, Cursor, or any MCP client). Generic form:
+Add MarksmanAI to your MCP client's config (Claude Code, Cursor, or any MCP client). Generic form:
 ```json
 {
   "mcpServers": {
-    "codegraph": {
-      "command": "/absolute/path/to/CodeGraph/target/release/codeindex-rs-mcp",
+    "marksmanai": {
+      "command": "/absolute/path/to/Marksman/target/release/codeindex-rs-mcp",
       "env": {
-        "CI_MODEL_DIR": "/home/you/.codegraph/models/potion-code-16M",
+        "CI_MODEL_DIR": "/home/you/.marksmanai/models/potion-code-16M",
         "CI_NPM_CACHE": "/tmp/ci-npm-cache"
       }
     }
@@ -84,9 +84,9 @@ The server indexes the repo it is launched in (its working directory); or pass `
 
 For **Claude Code**:
 ```bash
-claude mcp add codegraph \
-  --env CI_MODEL_DIR="$HOME/.codegraph/models/potion-code-16M" \
-  -- /absolute/path/to/CodeGraph/target/release/codeindex-rs-mcp
+claude mcp add marksmanai \
+  --env CI_MODEL_DIR="$HOME/.marksmanai/models/potion-code-16M" \
+  -- /absolute/path/to/Marksman/target/release/codeindex-rs-mcp
 ```
 
 ## CLI
@@ -112,8 +112,8 @@ An optional `codeindex.config.json` in the repo root overrides retrieval / index
 
 ## Status
 
-- **v1: TypeScript** (`scip-typescript` + `ts-morph`). The core (`ci-*` crates) is language-blind; a new language is a new provider implementing the same `LanguageProvider` trait.
-- 14-crate Rust workspace, ~40 unit tests plus real-tool integration tests. See [docs/](docs/) for architecture, roadmap, and benchmarks.
+- **Languages:** **TypeScript** (`scip-typescript` + `ts-morph`) and **Rust** (in-process tree-sitter + rust-analyzer) — both with type-checked, blast-radius-gated edits. **Python** rides an in-process tree-sitter fallback: full retrieval + skeletal outline + structural edits, but *ungated* (`gated: false`) until its LSP/indexer lands. The core (`ci-*` crates) is language-blind; a new language is a new provider implementing the same `LanguageProvider` trait.
+- 16-crate Rust workspace, ~50 unit tests plus real-tool integration tests. See [docs/](docs/) for architecture, roadmap, and benchmarks.
 
 ## License
 

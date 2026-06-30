@@ -2,10 +2,17 @@
 //! Language-agnostic — each provider finds the function/method body ranges with its own
 //! tree-sitter grammar and calls this to fold them.
 
-/// Replace the given byte `ranges` in `content` with a placeholder, keeping only the
+/// Replace the given byte `ranges` in `content` with a brace-language placeholder
+/// (`{ /* … */ }`). For languages whose bodies aren't brace-delimited (Python, …), use
+/// [`elide_bodies_with`] to supply a fitting placeholder (e.g. `...`).
+pub fn elide_bodies(content: &str, ranges: Vec<(usize, usize)>) -> String {
+    elide_bodies_with(content, ranges, "{ /* … */ }")
+}
+
+/// Replace the given byte `ranges` in `content` with `placeholder`, keeping only the
 /// OUTERMOST of any nested/overlapping ranges (so an outer body subsumes inner closures).
 /// Ranges that aren't on char boundaries or overlap an already-emitted one are skipped.
-pub fn elide_bodies(content: &str, mut ranges: Vec<(usize, usize)>) -> String {
+pub fn elide_bodies_with(content: &str, mut ranges: Vec<(usize, usize)>, placeholder: &str) -> String {
     ranges.sort_by_key(|&(s, e)| (s, std::cmp::Reverse(e)));
     let mut pos = 0usize;
     let mut out = String::with_capacity(content.len());
@@ -17,7 +24,7 @@ pub fn elide_bodies(content: &str, mut ranges: Vec<(usize, usize)>) -> String {
             continue;
         }
         out.push_str(&content[pos..s]);
-        out.push_str("{ /* … */ }");
+        out.push_str(placeholder);
         pos = e;
     }
     out.push_str(&content[pos..]);

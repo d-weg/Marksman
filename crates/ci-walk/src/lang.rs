@@ -7,6 +7,7 @@ pub enum Lang {
     Ts,
     Tsx,
     Rust,
+    Python,
     Markdown,
     Other,
 }
@@ -21,6 +22,7 @@ impl Lang {
             Some("ts") | Some("mts") | Some("cts") => Lang::Ts,
             Some("tsx") => Lang::Tsx,
             Some("rs") => Lang::Rust,
+            Some("py") | Some("pyi") => Lang::Python,
             Some("md") | Some("mdx") => Lang::Markdown,
             _ => Lang::Other,
         }
@@ -28,7 +30,7 @@ impl Lang {
 
     /// True for languages a provider handles (indexed as code, editable).
     pub fn is_code(self) -> bool {
-        matches!(self, Lang::Ts | Lang::Tsx | Lang::Rust)
+        matches!(self, Lang::Ts | Lang::Tsx | Lang::Rust | Lang::Python)
     }
 }
 

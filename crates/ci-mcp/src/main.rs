@@ -11,6 +11,7 @@ use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
+use lang_fallback::{FallbackProvider, FbLang};
 use lang_rust::RustProvider;
 use lang_ts::TsProvider;
 use serde_json::{json, Value};
@@ -24,16 +25,25 @@ use std::sync::{Arc, Mutex};
 enum AnyProvider {
     Ts(TsProvider),
     Rust(RustProvider),
+    Fallback(FallbackProvider),
 }
 
 impl AnyProvider {
     /// Warm the write engine on a background thread (tsserver/ts-morph for TS, rust-analyzer
-    /// for Rust), so the first `apply_edits` is fast.
+    /// for Rust), so the first `apply_edits` is fast. The tree-sitter fallback has no engine
+    /// to warm.
     fn prewarm(&self) {
         match self {
             AnyProvider::Ts(t) => t.prewarm(),
             AnyProvider::Rust(r) => r.prewarm(),
+            AnyProvider::Fallback(_) => {}
         }
+    }
+
+    /// Whether this provider type-checks its edits over the blast radius. The tree-sitter
+    /// fallback does not (no compiler/LSP) — its edits are structural-only.
+    fn gated(&self) -> bool {
+        !matches!(self, AnyProvider::Fallback(_))
     }
 }
 
@@ -42,24 +52,28 @@ impl LanguageProvider for AnyProvider {
         match self {
             AnyProvider::Ts(t) => t.granularity(),
             AnyProvider::Rust(r) => r.granularity(),
+            AnyProvider::Fallback(f) => f.granularity(),
         }
     }
     fn structure(&self, file: &Path) -> ci_core::Result<Vec<Node>> {
         match self {
             AnyProvider::Ts(t) => t.structure(file),
             AnyProvider::Rust(r) => r.structure(file),
+            AnyProvider::Fallback(f) => f.structure(file),
         }
     }
     fn import_graph(&self) -> ci_core::Result<ci_core::ImportGraph> {
         match self {
             AnyProvider::Ts(t) => t.import_graph(),
             AnyProvider::Rust(r) => r.import_graph(),
+            AnyProvider::Fallback(f) => f.import_graph(),
         }
     }
     fn apply_edits(&self, ops: &[ci_core::EditOp], opts: &EditOpts) -> ci_core::Result<ci_core::CommitResult> {
         match self {
             AnyProvider::Ts(t) => t.apply_edits(ops, opts),
             AnyProvider::Rust(r) => r.apply_edits(ops, opts),
+            AnyProvider::Fallback(f) => f.apply_edits(ops, opts),
         }
     }
 }
@@ -68,17 +82,47 @@ impl LanguageProvider for AnyProvider {
 /// Rust repo, else TypeScript (scip-typescript). `CI_LANG=rust|ts` overrides.
 fn build_provider(root: &Path) -> Result<AnyProvider, String> {
     let forced = std::env::var("CI_LANG").ok();
-    let rust = match forced.as_deref() {
-        Some("rust") => true,
-        Some("ts") | Some("typescript") => false,
-        _ => root.join("Cargo.toml").exists() && !root.join("package.json").exists(),
-    };
-    if rust {
-        eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
-        Ok(AnyProvider::Rust(RustProvider::new(root)))
-    } else {
-        Ok(AnyProvider::Ts(TsProvider::index(root).map_err(|e| e.to_string())?))
+    let has_cargo = root.join("Cargo.toml").exists();
+    let has_pkg = root.join("package.json").exists();
+
+    // Explicit override (incl. fallback languages by name, e.g. CI_LANG=python).
+    match forced.as_deref() {
+        Some("rust") => return Ok(rust(root)),
+        Some("ts") | Some("typescript") => return ts(root),
+        Some(other) => {
+            if let Some(lang) = FbLang::from_name(other) {
+                return Ok(fallback(root, lang));
+            }
+        }
+        None => {}
     }
+
+    if has_cargo && !has_pkg {
+        Ok(rust(root))
+    } else if has_pkg || root.join("tsconfig.json").exists() {
+        ts(root)
+    } else if let Some(lang) = FbLang::detect(root) {
+        Ok(fallback(root, lang))
+    } else {
+        ts(root)
+    }
+}
+
+fn rust(root: &Path) -> AnyProvider {
+    eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
+    AnyProvider::Rust(RustProvider::new(root))
+}
+
+fn ts(root: &Path) -> Result<AnyProvider, String> {
+    Ok(AnyProvider::Ts(TsProvider::index(root).map_err(|e| e.to_string())?))
+}
+
+fn fallback(root: &Path, lang: FbLang) -> AnyProvider {
+    eprintln!(
+        "[codeindex-rs-mcp] language: {} (tree-sitter fallback, in-process — edits are ungated)",
+        lang.label()
+    );
+    AnyProvider::Fallback(FallbackProvider::new(root, lang))
 }
 
 fn resolve_root() -> PathBuf {
@@ -96,10 +140,10 @@ fn resolve_root() -> PathBuf {
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         // Default to the path the README's download step uses, so the documented
-        // `git clone … ~/.codegraph/models/potion-code-16M` works without setting CI_MODEL_DIR.
+        // `git clone … ~/.marksmanai/models/potion-code-16M` works without setting CI_MODEL_DIR.
         std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".codegraph/models/potion-code-16M"))
-            .unwrap_or_else(|_| PathBuf::from(".codegraph/models/potion-code-16M"))
+            .map(|h| PathBuf::from(h).join(".marksmanai/models/potion-code-16M"))
+            .unwrap_or_else(|_| PathBuf::from(".marksmanai/models/potion-code-16M"))
     })
 }
 
@@ -268,10 +312,20 @@ impl Server {
                     if dry_run { " (dry run)" } else { "" }
                 ))
             }
-            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => Ok(format!(
+            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if provider.gated() => Ok(format!(
                 "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
                  including files that import what changed. rename/move already updated every reference/import across the \
                  whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.\nFiles changed:\n{}",
+                if dry_run { " (dry run — nothing written yet)" } else { "" },
+                changed_files.len(),
+                changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
+            )),
+            // Ungated (tree-sitter fallback): structural edit, NOT type-checked. Be honest so the
+            // agent knows to verify — and that rename was best-effort within the edited file only.
+            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => Ok(format!(
+                "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — this language has no \
+                 type-checker wired up, so the edit was NOT verified to compile, and `rename` rewrote matching identifiers \
+                 within the edited file only (not cross-file references). Review or run the project's own checks to confirm.\nFiles changed:\n{}",
                 if dry_run { " (dry run — nothing written yet)" } else { "" },
                 changed_files.len(),
                 changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
@@ -339,6 +393,8 @@ fn outline_for(file: &str, content: &str) -> String {
         lang_rust::outline(content)
     } else if file.ends_with(".ts") || file.ends_with(".tsx") || file.ends_with(".mts") || file.ends_with(".cts") {
         lang_ts::outline(content)
+    } else if file.ends_with(".py") || file.ends_with(".pyi") {
+        lang_fallback::outline(FbLang::Python, content)
     } else {
         content.to_string()
     }

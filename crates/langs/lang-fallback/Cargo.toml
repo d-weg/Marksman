@@ -1,0 +1,17 @@
+[package]
+name = "lang-fallback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Tree-sitter fallback LanguageProvider for languages without a SCIP/LSP integration yet (Python today). Read path + UNGATED structural edits (gated: false)."
+
+[dependencies]
+ci-core = { path = "../../ci-core" }
+ci-edit = { path = "../../ci-edit" }
+serde_json = { workspace = true }
+tree-sitter = "0.26.10"
+tree-sitter-python = "0.23"
+ignore = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

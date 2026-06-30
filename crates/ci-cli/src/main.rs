@@ -11,6 +11,7 @@ use ci_core::{Config, LanguageProvider, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
+use lang_fallback::{FallbackProvider, FbLang};
 use lang_rust::RustProvider;
 use lang_ts::TsProvider;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,10 @@ use std::process::exit;
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         // Default to the path the README's download step uses, so the documented
-        // `git clone … ~/.codegraph/models/potion-code-16M` works without setting CI_MODEL_DIR.
+        // `git clone … ~/.marksmanai/models/potion-code-16M` works without setting CI_MODEL_DIR.
         std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".codegraph/models/potion-code-16M"))
-            .unwrap_or_else(|_| PathBuf::from(".codegraph/models/potion-code-16M"))
+            .map(|h| PathBuf::from(h).join(".marksmanai/models/potion-code-16M"))
+            .unwrap_or_else(|_| PathBuf::from(".marksmanai/models/potion-code-16M"))
     })
 }
 
@@ -47,20 +48,54 @@ fn select_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider
     let forced = std::env::var("CI_LANG").ok();
     let has_cargo = root.join("Cargo.toml").exists();
     let has_pkg = root.join("package.json").exists();
-    let rust = match forced.as_deref() {
-        Some("rust") => true,
-        Some("ts") | Some("typescript") => false,
-        _ => has_cargo && !has_pkg,
-    };
-    if rust {
-        config.include = vec!["**/*.rs".into()];
-        config.languages = vec!["rust".into()];
-        config.exclude.push("**/target/**".into());
-        eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
-        Box::new(RustProvider::new(root))
+
+    // Explicit override wins (incl. fallback languages by name, e.g. CI_LANG=python).
+    match forced.as_deref() {
+        Some("rust") => return rust_provider(root, config),
+        Some("ts") | Some("typescript") => return ts_provider(root),
+        Some(other) => {
+            if let Some(lang) = FbLang::from_name(other) {
+                return fallback_provider(root, config, lang);
+            }
+        }
+        None => {}
+    }
+
+    // Auto-detect by the dominant manifest, then fall back to a tree-sitter language.
+    if has_cargo && !has_pkg {
+        rust_provider(root, config)
+    } else if has_pkg || root.join("tsconfig.json").exists() {
+        ts_provider(root)
+    } else if let Some(lang) = FbLang::detect(root) {
+        fallback_provider(root, config, lang)
     } else {
-        eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
-        Box::new(TsProvider::index(root).unwrap_or_else(|e| die(e)))
+        ts_provider(root)
+    }
+}
+
+fn rust_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider> {
+    config.include = vec!["**/*.rs".into()];
+    config.languages = vec!["rust".into()];
+    config.exclude.push("**/target/**".into());
+    eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
+    Box::new(RustProvider::new(root))
+}
+
+fn ts_provider(root: &Path) -> Box<dyn LanguageProvider> {
+    eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
+    Box::new(TsProvider::index(root).unwrap_or_else(|e| die(e)))
+}
+
+fn fallback_provider(root: &Path, config: &mut Config, lang: FbLang) -> Box<dyn LanguageProvider> {
+    config.include = vec![format!("**/*.{}", lang_ext(lang))];
+    config.languages = vec![lang.label().into()];
+    eprintln!("[codeindex-rs] language: {} (tree-sitter fallback, in-process — ungated edits)", lang.label());
+    Box::new(FallbackProvider::new(root, lang))
+}
+
+fn lang_ext(lang: FbLang) -> &'static str {
+    match lang {
+        FbLang::Python => "py",
     }
 }
 

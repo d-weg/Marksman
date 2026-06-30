@@ -1,4 +1,4 @@
-# CodeGraph — roadmap
+# MarksmanAI — roadmap
 
 Directions, not commitments.
 
@@ -36,7 +36,7 @@ on a non-TS repo. Closing that is the next structural step.
 - [x] **Rust provider — read path (done).** `lang-rust` crate: `structure()` (fns/structs/
       impls/methods + `#sym:body`/`:param.N`/`:return`), `import_graph()` (`mod` resolution),
       `granularity()→Ast`, all in-process `tree-sitter-rust` (no Node). Indexes + retrieves Rust
-      (incl. CodeGraph itself) via CLI and MCP.
+      (incl. MarksmanAI itself) via CLI and MCP.
       - [x] **Rust write path (done).** Full structural-edit coverage — **rename, replace_node,
             move_file** — type-checked via rust-analyzer, reusing the `GateEngine`/`LspClient`/
             `commit_edits` blast-radius gate (all three verified end-to-end). Needs
@@ -74,9 +74,21 @@ on a non-TS repo. Closing that is the next structural step.
       `#sym:body`/`:param.N`/`:return` anchors; keep them gated.
 - [ ] **Config providers (JSON/YAML/TOML)** — tree-sitter providers for surgical key edits
       (package.json, compose, *.toml); no gate needed. Rides on the provider registry.
-- [ ] **Tree-sitter fallback edit provider** — ungated structural edits for languages without
-      SCIP/LSP (Python/Go/…); result flags `gated: false`. Rides on the registry; upgraded
-      per-language to the gated path over time.
+- [x] **Tree-sitter fallback edit provider (done, v0 — Python).** `lang-fallback` crate: a
+      tree-sitter `LanguageProvider` for languages without a SCIP/LSP integration yet. Read path
+      — `structure()` (functions/classes/methods + fn sub-nodes), `import_graph()`
+      (`import` / `from … import` resolution incl. relative dots), skeletal `outline()` (bodies
+      folded to `...`) — all in-process, no external tooling. **Ungated** structural edits
+      (`replace_node` / `insert_before` / `create` / `move` / `delete`, plus a best-effort
+      within-file `rename`) through the same VFS/blast-radius/atomic-commit path as the gated
+      providers, behind a no-op `GateEngine`. The MCP success message reports **`gated: false`**
+      so the agent knows the edit is structural, not type-checked. Dispatched by `FbLang::detect`
+      (`.py` present) / `CI_LANG=python`; indexes + retrieves a Python repo end-to-end.
+      - [ ] **Go** (and Ruby/…) — a data addition to `FbLang` (grammar + the few node-kind names);
+            the provider, dispatch, outline, and ungated edit path are already language-generic.
+      - [ ] Per-language **upgrade to the gated path** as each LSP/indexer lands (pyright + a
+            SCIP-python indexer for Python; gopls + scip-go for Go) — swap the no-op gate for the
+            real `GateEngine`, reaching capability parity with TS/Rust.
 - [ ] **Capability parity across languages.** Every new provider should reach the bar TS and
       Rust now meet: `structure` + `import_graph` + skeletal `outline` + gated structural edits
       (rename / replace_node / move). The seams (`LanguageProvider`, `GateEngine`, the per-crate
@@ -97,7 +109,7 @@ can (TS forces us out to Node):
   in-process for a true zero-external-process build.
 - **Type-checked edits (write/gate):** rust-analyzer's rename / references / diagnostics,
   slotting into the existing `GateEngine` trait exactly as the ts-morph engine does today.
-- **Dogfooding:** once CodeGraph can index and edit Rust, we use *it* to build the remaining
+- **Dogfooding:** once MarksmanAI can index and edit Rust, we use *it* to build the remaining
   providers — the tool accelerates its own development (it's a Rust codebase).
 
 ### Then, via the generic LSP `GateEngine` fallback (already built)
@@ -166,7 +178,7 @@ targets already exist from the SCIP+tree-sitter merge):
 - **Comments / docstrings:** `edit_leading_comment` / docstring control — touch documentation
   without touching executable code.
 - Remaining work: mapping these verbs in `action_to_op` + statement-level targeting within a
-  body + byte-vs-char column handling. **CodeGraph's edge over a pure-AST editor: these stay
+  body + byte-vs-char column handling. **MarksmanAI's edge over a pure-AST editor: these stay
   type-checked** (the blast-radius gate) — surgical *and* safe.
 
 ### Config files as first-class citizens (JSON / YAML / TOML)
@@ -179,7 +191,7 @@ the TS import that needs them.
 
 ### Breadth vs. depth — a pure-tree-sitter fallback edit provider
 The real axis: **breadth** (tree-sitter — 11+ languages, no type safety) vs **depth**
-(SCIP/LSP — type-checked, few languages). CodeGraph can do *both* through the existing
+(SCIP/LSP — type-checked, few languages). MarksmanAI can do *both* through the existing
 `Granularity` + `GateEngine` seams:
 - A **tree-sitter structural-edit provider with no blast-radius gate** is the *fallback* for any
   language we don't yet have SCIP/LSP for (Python, Go, Ruby, …) — structural edits work
