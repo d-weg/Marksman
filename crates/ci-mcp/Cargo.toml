@@ -16,6 +16,7 @@ ci-embed = { path = "../ci-embed" }
 ci-retrieve = { path = "../ci-retrieve" }
 ci-arch = { path = "../ci-arch" }
 ci-edit = { path = "../ci-edit" }
+ci-proto = { path = "../ci-proto" }
 lang-ts = { path = "../langs/lang-ts" }
 lang-rust = { path = "../langs/lang-rust" }
 lang-fallback = { path = "../langs/lang-fallback" }

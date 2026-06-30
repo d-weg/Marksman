@@ -106,6 +106,7 @@ Environment variables:
 | `CI_NPM_CACHE` | npm cache dir for `npx` (scip / tsserver) | system temp |
 | `CI_TSMORPH_DIR` | where the ts-morph sidecar is installed | `<tmp>/ci-tsmorph` |
 | `CI_EDIT_ENGINE` | write engine: `tsmorph` (default) or `lsp` | `tsmorph` |
+| `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
 | `CODEINDEX_ROOT` | repo root for the MCP server | current directory |
 
 An optional `codeindex.config.json` in the repo root overrides retrieval / index settings (top-N, RRF k, weights, …).

@@ -445,6 +445,30 @@ impl ProcessProvider {
     }
 }
 
+/// Resolve the sidecar executable for `lang` (`rust` / `ts` / …) and return a [`Command`] with
+/// `--root` set, ready for [`ProcessProvider::spawn`]. Resolution order: `$CI_PROVIDER_<LANG>`
+/// (an explicit/vendored path) → a sibling of the current exe (the dev/`cargo build` layout) →
+/// the bare name on `PATH`. `None` when the first two miss and the caller wants to fall back to
+/// in-process (the bare-`PATH` arm is only taken when `allow_path`).
+pub fn sidecar_command(lang: &str, root: &Path, allow_path: bool) -> Option<Command> {
+    let bin = format!("marksman-provider-{lang}");
+    let from_env = std::env::var(format!("CI_PROVIDER_{}", lang.to_uppercase()))
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file());
+    let from_sibling = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join(&bin)))
+        .filter(|p| p.is_file());
+    let mut cmd = match from_env.or(from_sibling) {
+        Some(p) => Command::new(p),
+        None if allow_path => Command::new(&bin),
+        None => return None,
+    };
+    cmd.arg("--root").arg(root);
+    Some(cmd)
+}
+
 // ── sidecar: serve ───────────────────────────────────────────────────────────
 
 /// Answer one request against `provider`. `outline` is supplied separately since it isn't a trait

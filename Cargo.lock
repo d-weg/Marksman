@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.103"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
+
+[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -38,6 +44,12 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+
+[[package]]
+name = "bytes"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 
 [[package]]
 name = "cc"
@@ -82,6 +94,7 @@ dependencies = [
  "ci-core",
  "ci-embed",
  "ci-index",
+ "ci-proto",
  "ci-retrieve",
  "lang-fallback",
  "lang-rust",
@@ -147,11 +160,21 @@ dependencies = [
  "ci-edit",
  "ci-embed",
  "ci-index",
+ "ci-proto",
  "ci-retrieve",
  "lang-fallback",
  "lang-rust",
  "lang-ts",
  "serde_json",
+]
+
+[[package]]
+name = "ci-proto"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "prost",
+ "tempfile",
 ]
 
 [[package]]
@@ -514,6 +537,7 @@ dependencies = [
  "ci-core",
  "ci-edit",
  "ci-lsp",
+ "ci-proto",
  "ignore",
  "tempfile",
  "tree-sitter",
@@ -527,6 +551,7 @@ dependencies = [
  "ci-core",
  "ci-edit",
  "ci-lsp",
+ "ci-proto",
  "ci-scip",
  "serde_json",
  "tempfile",
@@ -692,6 +717,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.12.1",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]

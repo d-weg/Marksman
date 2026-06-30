@@ -89,16 +89,22 @@ and **reading** context it doesn't need. Two principles fix this:
       language-agnostic; providers can be third-party / any language. NOT dlopen — Rust has no
       stable ABI, so in-process plugins are unsafe/undistributable; separate processes (the model
       rust-analyzer / the ts-morph sidecar already use) are the correct seam.
-      - [x] **Protocol + host + sidecar (done, v0) — protobuf over JSON for speed.** `ci-proto`
-            (prost messages + ci-core↔proto conversions + length-delimited framing) defines the
-            wire; `ProcessProvider` (host) spawns a provider binary and implements
-            `LanguageProvider` over it; `lang-rust` ships a `marksman-provider-rust` sidecar bin
-            serving `RustProvider`. Round-trips structure / import_graph / outline (+ apply_edits —
-            the rust-analyzer gate runs inside the sidecar). Protobuf is ~compact and far cheaper to
-            encode/decode at indexing volume; it speeds the provider RPC / `sec` axis, NOT the agent
-            token count (that's turns).
-      - [ ] Provider fetch/install + version pinning + a manifest (download the sidecar on demand).
-      - [ ] Move `lang-ts` behind the same protocol; a registry that spawns per-language sidecars.
+      - [x] **Protocol + host + both sidecars + dispatch (done) — protobuf over JSON for speed.**
+            `ci-proto` (prost messages + ci-core↔proto conversions + `[u32-len][bytes]` framing)
+            defines the wire; `ProcessProvider` (host) spawns a provider binary and implements
+            `LanguageProvider` over it; **`marksman-provider-rust`** (serves `RustProvider`) and
+            **`marksman-provider-ts`** (runs scip-typescript, then serves `TsProvider`) are the
+            sidecars — the gate (rust-analyzer / ts-morph) runs *inside* the sidecar, so
+            `apply_edits` travels the wire too. `CI_PROVIDER=sidecar` routes the CLI `index` and the
+            MCP server through a sidecar (binary resolved via `$CI_PROVIDER_<LANG>` or next to the
+            exe; falls back to in-process if absent). Tested: read path + `apply_edits` over the wire
+            (gate in-sidecar); dogfooded end-to-end (`index` + `list_anchors` over the wire).
+            Protobuf is compact + cheap to decode at indexing volume — it speeds the provider RPC /
+            `sec` axis, NOT the agent token count (that's turns).
+      - [ ] **Distribution: fetch/install + version pinning + a manifest** — the only remaining
+            piece. Download the right `marksman-provider-<lang>` on demand from a release/registry
+            and cache+pin it, so the core ships tiny and pulls providers as repos need them. (Needs
+            a release artifact host; the runtime seam is done.)
 - [x] **Skeletal context (done).** `detailLevel` (`pointers`/`outline`/`full`) on
       `retrieve_context` inlines the top files with fn/method bodies folded to `{ /* … */ }`
       (`ci-core::elide_bodies` + tree-sitter `outline` in each provider). TS + Rust.

@@ -10,9 +10,14 @@ ci-core = { path = "../../ci-core" }
 ci-scip = { path = "../../ci-scip" }
 ci-lsp = { path = "../../ci-lsp" }
 ci-edit = { path = "../../ci-edit" }
+ci-proto = { path = "../../ci-proto" }
 serde_json.workspace = true
 tree-sitter = "0.26.10"
 tree-sitter-typescript = "0.23.2"
+
+[[bin]]
+name = "marksman-provider-ts"
+path = "src/sidecar.rs"
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -11,6 +11,7 @@ use ci_core::{Config, LanguageProvider, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
+use ci_proto::ProcessProvider;
 use lang_fallback::{FallbackProvider, FbLang};
 use lang_rust::RustProvider;
 use lang_ts::TsProvider;
@@ -45,59 +46,63 @@ fn die(msg: impl std::fmt::Display) -> ! {
 /// so Node tooling is only invoked for a TypeScript repo. Override with `CI_LANG=rust|ts`.
 /// v0 = dominant-language pick; full multi-provider dispatch is on the roadmap.
 fn select_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider> {
-    let forced = std::env::var("CI_LANG").ok();
-    let has_cargo = root.join("Cargo.toml").exists();
-    let has_pkg = root.join("package.json").exists();
-
-    // Explicit override wins (incl. fallback languages by name, e.g. CI_LANG=python).
-    match forced.as_deref() {
-        Some("rust") => return rust_provider(root, config),
-        Some("ts") | Some("typescript") => return ts_provider(root),
-        Some(other) => {
-            if let Some(lang) = FbLang::from_name(other) {
-                return fallback_provider(root, config, lang);
-            }
-        }
-        None => {}
-    }
-
-    // Auto-detect by the dominant manifest, then fall back to a tree-sitter language.
-    if has_cargo && !has_pkg {
-        rust_provider(root, config)
-    } else if has_pkg || root.join("tsconfig.json").exists() {
-        ts_provider(root)
-    } else if let Some(lang) = FbLang::detect(root) {
-        fallback_provider(root, config, lang)
-    } else {
-        ts_provider(root)
-    }
-}
-
-fn rust_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider> {
-    config.include = vec!["**/*.rs".into()];
-    config.languages = vec!["rust".into()];
-    config.exclude.push("**/target/**".into());
-    eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
-    Box::new(RustProvider::new(root))
-}
-
-fn ts_provider(root: &Path) -> Box<dyn LanguageProvider> {
-    eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
-    Box::new(TsProvider::index(root).unwrap_or_else(|e| die(e)))
-}
-
-fn fallback_provider(root: &Path, config: &mut Config, lang: FbLang) -> Box<dyn LanguageProvider> {
-    config.include = vec![format!("**/*.{}", lang_ext(lang))];
-    config.languages = vec![lang.label().into()];
-    eprintln!("[codeindex-rs] language: {} (tree-sitter fallback, in-process — ungated edits)", lang.label());
-    Box::new(FallbackProvider::new(root, lang))
-}
-
-fn lang_ext(lang: FbLang) -> &'static str {
+    let lang = choose_lang(root);
+    // The indexer's file globs for the chosen language.
     match lang {
-        FbLang::Python => "py",
+        "rust" => {
+            config.include = vec!["**/*.rs".into()];
+            config.languages = vec!["rust".into()];
+            config.exclude.push("**/target/**".into());
+        }
+        "python" => {
+            config.include = vec!["**/*.py".into()];
+            config.languages = vec!["python".into()];
+        }
+        _ => {}
+    }
+    // `CI_PROVIDER=sidecar`: index over the protobuf wire via a `marksman-provider-<lang>` process.
+    if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
+        if let Some(cmd) = ci_proto::sidecar_command(lang, root, false) {
+            eprintln!("[codeindex-rs] language: {lang} (sidecar process — protobuf wire)");
+            return Box::new(ProcessProvider::spawn(cmd).unwrap_or_else(|e| die(e)));
+        }
+        eprintln!("[codeindex-rs] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
+    }
+    match lang {
+        "rust" => {
+            eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
+            Box::new(RustProvider::new(root))
+        }
+        "python" => {
+            eprintln!("[codeindex-rs] language: python (tree-sitter fallback, in-process — ungated edits)");
+            Box::new(FallbackProvider::new(root, FbLang::Python))
+        }
+        _ => {
+            eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
+            Box::new(TsProvider::index(root).unwrap_or_else(|e| die(e)))
+        }
     }
 }
+
+/// The language to index `root` as: `CI_LANG` override, else manifest/extension detection.
+fn choose_lang(root: &Path) -> &'static str {
+    match std::env::var("CI_LANG").ok().as_deref() {
+        Some("rust") => return "rust",
+        Some("ts") | Some("typescript") => return "ts",
+        Some(other) if FbLang::from_name(other).is_some() => return "python",
+        _ => {}
+    }
+    if root.join("Cargo.toml").exists() && !root.join("package.json").exists() {
+        "rust"
+    } else if root.join("package.json").exists() || root.join("tsconfig.json").exists() {
+        "ts"
+    } else if FbLang::detect(root).is_some() {
+        "python"
+    } else {
+        "ts"
+    }
+}
+
 
 fn cmd_index(root: &Path) {
     let mut config = rust_config(root);

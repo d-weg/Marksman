@@ -11,6 +11,7 @@ use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
+use ci_proto::ProcessProvider;
 use lang_fallback::{FallbackProvider, FbLang};
 use lang_rust::RustProvider;
 use lang_ts::TsProvider;
@@ -26,22 +27,25 @@ enum AnyProvider {
     Ts(TsProvider),
     Rust(RustProvider),
     Fallback(FallbackProvider),
+    /// A provider running as a separate sidecar process, spoken to over the protobuf wire.
+    Process(ProcessProvider),
 }
 
 impl AnyProvider {
     /// Warm the write engine on a background thread (tsserver/ts-morph for TS, rust-analyzer
     /// for Rust), so the first `apply_edits` is fast. The tree-sitter fallback has no engine
-    /// to warm.
+    /// to warm; a sidecar warms itself inside its own process.
     fn prewarm(&self) {
         match self {
             AnyProvider::Ts(t) => t.prewarm(),
             AnyProvider::Rust(r) => r.prewarm(),
-            AnyProvider::Fallback(_) => {}
+            AnyProvider::Fallback(_) | AnyProvider::Process(_) => {}
         }
     }
 
     /// Whether this provider type-checks its edits over the blast radius. The tree-sitter
-    /// fallback does not (no compiler/LSP) — its edits are structural-only.
+    /// fallback does not (no compiler/LSP) — its edits are structural-only. Sidecars are the
+    /// gated languages (rust/ts) today.
     fn gated(&self) -> bool {
         !matches!(self, AnyProvider::Fallback(_))
     }
@@ -53,6 +57,7 @@ impl LanguageProvider for AnyProvider {
             AnyProvider::Ts(t) => t.granularity(),
             AnyProvider::Rust(r) => r.granularity(),
             AnyProvider::Fallback(f) => f.granularity(),
+            AnyProvider::Process(p) => p.granularity(),
         }
     }
     fn structure(&self, file: &Path) -> ci_core::Result<Vec<Node>> {
@@ -60,6 +65,7 @@ impl LanguageProvider for AnyProvider {
             AnyProvider::Ts(t) => t.structure(file),
             AnyProvider::Rust(r) => r.structure(file),
             AnyProvider::Fallback(f) => f.structure(file),
+            AnyProvider::Process(p) => p.structure(file),
         }
     }
     fn import_graph(&self) -> ci_core::Result<ci_core::ImportGraph> {
@@ -67,6 +73,7 @@ impl LanguageProvider for AnyProvider {
             AnyProvider::Ts(t) => t.import_graph(),
             AnyProvider::Rust(r) => r.import_graph(),
             AnyProvider::Fallback(f) => f.import_graph(),
+            AnyProvider::Process(p) => p.import_graph(),
         }
     }
     fn apply_edits(&self, ops: &[ci_core::EditOp], opts: &EditOpts) -> ci_core::Result<ci_core::CommitResult> {
@@ -74,37 +81,46 @@ impl LanguageProvider for AnyProvider {
             AnyProvider::Ts(t) => t.apply_edits(ops, opts),
             AnyProvider::Rust(r) => r.apply_edits(ops, opts),
             AnyProvider::Fallback(f) => f.apply_edits(ops, opts),
+            AnyProvider::Process(p) => p.apply_edits(ops, opts),
         }
     }
 }
 
-/// Build the provider for `root`: Rust (in-process tree-sitter, no Node) when it looks like a
-/// Rust repo, else TypeScript (scip-typescript). `CI_LANG=rust|ts` overrides.
-fn build_provider(root: &Path) -> Result<AnyProvider, String> {
-    let forced = std::env::var("CI_LANG").ok();
-    let has_cargo = root.join("Cargo.toml").exists();
-    let has_pkg = root.join("package.json").exists();
-
-    // Explicit override (incl. fallback languages by name, e.g. CI_LANG=python).
-    match forced.as_deref() {
-        Some("rust") => return Ok(rust(root)),
-        Some("ts") | Some("typescript") => return ts(root),
-        Some(other) => {
-            if let Some(lang) = FbLang::from_name(other) {
-                return Ok(fallback(root, lang));
-            }
-        }
-        None => {}
+/// The language Marksman should use for `root`: `CI_LANG` override, else manifest/extension detect.
+fn choose_lang(root: &Path) -> &'static str {
+    match std::env::var("CI_LANG").ok().as_deref() {
+        Some("rust") => return "rust",
+        Some("ts") | Some("typescript") => return "ts",
+        Some(other) if FbLang::from_name(other).is_some() => return "python",
+        _ => {}
     }
-
-    if has_cargo && !has_pkg {
-        Ok(rust(root))
-    } else if has_pkg || root.join("tsconfig.json").exists() {
-        ts(root)
-    } else if let Some(lang) = FbLang::detect(root) {
-        Ok(fallback(root, lang))
+    if root.join("Cargo.toml").exists() && !root.join("package.json").exists() {
+        "rust"
+    } else if root.join("package.json").exists() || root.join("tsconfig.json").exists() {
+        "ts"
+    } else if FbLang::detect(root).is_some() {
+        "python"
     } else {
-        ts(root)
+        "ts"
+    }
+}
+
+/// Build the provider for `root`. With `CI_PROVIDER=sidecar` (and a `marksman-provider-<lang>`
+/// binary present), the provider runs as a separate process over the protobuf wire; otherwise it
+/// is linked in-process.
+fn build_provider(root: &Path) -> Result<AnyProvider, String> {
+    let lang = choose_lang(root);
+    if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
+        if let Some(cmd) = ci_proto::sidecar_command(lang, root, false) {
+            eprintln!("[codeindex-rs-mcp] language: {lang} (sidecar process — protobuf wire)");
+            return ProcessProvider::spawn(cmd).map(AnyProvider::Process).map_err(|e| e.to_string());
+        }
+        eprintln!("[codeindex-rs-mcp] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
+    }
+    match lang {
+        "rust" => Ok(rust(root)),
+        "python" => Ok(fallback(root, FbLang::Python)),
+        _ => ts(root),
     }
 }
 
