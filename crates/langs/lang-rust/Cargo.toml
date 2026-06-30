@@ -9,9 +9,15 @@ description = "Rust LanguageProvider: in-process tree-sitter (read). v0 = struct
 ci-core = { path = "../../ci-core" }
 ci-edit = { path = "../../ci-edit" }
 ci-lsp = { path = "../../ci-lsp" }
+ci-proto = { path = "../../ci-proto" }
 tree-sitter = "0.26.10"
 tree-sitter-rust = "0.24"
 ignore = "0.4"
 
+[[bin]]
+name = "marksman-provider-rust"
+path = "src/sidecar.rs"
+
 [dev-dependencies]
 tempfile.workspace = true
+ci-proto = { path = "../../ci-proto" }

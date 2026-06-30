@@ -7,6 +7,7 @@ members = [
     "crates/ci-index",
     "crates/ci-retrieve",
     "crates/ci-scip",
+    "crates/ci-proto",
     "crates/ci-build",
     "crates/langs/lang-ts",
     "crates/langs/lang-rust",

@@ -1,0 +1,13 @@
+[package]
+name = "ci-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Protobuf wire protocol for out-of-process language providers: prost messages + ci-core conversions, a host ProcessProvider, and a sidecar serve loop. Speeds the provider RPC at indexing volume."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+prost = "0.13"
+
+[dev-dependencies]
+tempfile.workspace = true
