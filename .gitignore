@@ -6,3 +6,6 @@
 
 # agent-bench: never commit the API key
 scripts/agent-bench/.key
+
+# local dogfood: machine-specific MCP config (absolute paths)
+.mcp.json
