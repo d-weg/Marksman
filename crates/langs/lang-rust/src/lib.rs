@@ -23,6 +23,9 @@ type WarmEngine = Arc<Mutex<Option<LspClient>>>;
 pub struct RustProvider {
     root: PathBuf,
     engine: WarmEngine,
+    /// Use the cached `rust-analyzer scip` graph (compiler-accurate `use` edges) over the
+    /// tree-sitter `mod` graph. Set by the caller from `Config::rust_scip_enabled()`.
+    use_scip: bool,
 }
 
 /// The rust-analyzer binary: `$CI_RUST_ANALYZER`, else `~/.cargo/bin/rust-analyzer`, else PATH.
@@ -40,7 +43,13 @@ fn rust_analyzer_command() -> Command {
 
 impl RustProvider {
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf(), engine: Arc::new(Mutex::new(None)) }
+        Self { root: root.to_path_buf(), engine: Arc::new(Mutex::new(None)), use_scip: false }
+    }
+
+    /// Enable the compiler-accurate `rust-analyzer scip` graph (see [`RustProvider::use_scip`]).
+    pub fn with_scip(mut self, use_scip: bool) -> Self {
+        self.use_scip = use_scip;
+        self
     }
 
     /// Start rust-analyzer and load the cargo workspace NOW, on a background thread, so the
@@ -141,11 +150,11 @@ impl LanguageProvider for RustProvider {
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
-        // OPT-IN (`CI_RUST_SCIP`): a compiler-accurate `use`/reference graph from a cached
-        // `rust-analyzer scip` index — far richer than `mod` edges. Read-only here (generation is
-        // `refresh_scip`, run at index time), and we fall back to the instant tree-sitter `mod`
-        // graph whenever the cache is absent, so this never blocks the live path.
-        if std::env::var("CI_RUST_SCIP").is_ok() {
+        // OPT-IN (`use_scip`, from config/env): a compiler-accurate `use`/reference graph from a
+        // cached `rust-analyzer scip` index — far richer than `mod` edges. Read-only here
+        // (generation is `refresh_scip`, run at index time), and we fall back to the instant
+        // tree-sitter `mod` graph whenever the cache is absent, so this never blocks the live path.
+        if self.use_scip {
             if let Some(g) = self.scip_graph() {
                 return Ok(g);
             }

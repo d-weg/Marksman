@@ -48,6 +48,11 @@ pub struct Config {
     pub query_layer_weighting: QueryLayerWeighting,
     #[serde(default)]
     pub package_weights: BTreeMap<String, f32>,
+    /// Build the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges)
+    /// instead of the `mod`-only tree-sitter graph. Costs ≈ a `cargo check` at index time, so it's
+    /// off by default. User key: `rustScip`. The `CI_RUST_SCIP` env var overrides it (force on/off).
+    #[serde(default)]
+    pub rust_scip: bool,
 }
 
 impl Default for Config {
@@ -75,6 +80,7 @@ impl Default for Config {
             query_embed_prefix: "Represent this sentence for searching relevant code: ".into(),
             query_layer_weighting: QueryLayerWeighting::default(),
             package_weights: BTreeMap::new(),
+            rust_scip: false,
         }
     }
 }
@@ -93,6 +99,15 @@ impl Config {
             }
         }
         Ok(Config::default())
+    }
+
+    /// Whether to use the `rust-analyzer scip` graph: the `rustScip` config setting, overridden by
+    /// the `CI_RUST_SCIP` env var when present (`0`/`false`/empty = off, anything else = on).
+    pub fn rust_scip_enabled(&self) -> bool {
+        match std::env::var("CI_RUST_SCIP") {
+            Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => self.rust_scip,
+        }
     }
 }
 
@@ -119,6 +134,16 @@ mod tests {
         let c = Config::default();
         assert!(c.include.iter().any(|g| g.contains("*.ts")));
         assert_eq!(c.rrf_k, 60.0);
+    }
+
+    #[test]
+    fn rust_scip_parses_from_camelcase_key() {
+        let over: serde_json::Value = serde_json::from_str(r#"{ "rustScip": true }"#).unwrap();
+        let mut base = serde_json::to_value(Config::default()).unwrap();
+        merge(&mut base, &over);
+        let c: Config = serde_json::from_value(base).unwrap();
+        assert!(c.rust_scip, "rustScip → rust_scip");
+        assert!(!Config::default().rust_scip, "off by default");
     }
 
     #[test]

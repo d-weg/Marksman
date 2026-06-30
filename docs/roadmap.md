@@ -73,7 +73,8 @@ and **reading** context it doesn't need. Two principles fix this:
             `commit_edits` blast-radius gate (all three verified end-to-end). Needs
             `rustup component add rust-analyzer` (`CI_RUST_ANALYZER` overrides). Next: faster
             cold-start than the ~10s rename/move retry (a "rust-analyzer ready" signal).
-      - [x] **Better Rust graph (done, opt-in).** `CI_RUST_SCIP=1` swaps the `mod`-only graph for a
+      - [x] **Better Rust graph (done, opt-in).** The `rustScip` config setting (or `CI_RUST_SCIP`
+            env override) swaps the `mod`-only graph for a
             **compiler-accurate `use`/reference graph** from `rust-analyzer scip` — read by the
             existing `ci-scip` (no reader changes; validated). Latency-safe: `lang_rust::refresh_scip`
             generates `<root>/.codeindex-rs/rust.scip` at **index time** (a batch step, ≈ a
