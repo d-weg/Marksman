@@ -1,4 +1,4 @@
-# MarksmanAI — roadmap
+# Marksman — roadmap
 
 Directions, not commitments.
 
@@ -36,7 +36,7 @@ on a non-TS repo. Closing that is the next structural step.
 - [x] **Rust provider — read path (done).** `lang-rust` crate: `structure()` (fns/structs/
       impls/methods + `#sym:body`/`:param.N`/`:return`), `import_graph()` (`mod` resolution),
       `granularity()→Ast`, all in-process `tree-sitter-rust` (no Node). Indexes + retrieves Rust
-      (incl. MarksmanAI itself) via CLI and MCP.
+      (incl. Marksman itself) via CLI and MCP.
       - [x] **Rust write path (done).** Full structural-edit coverage — **rename, replace_node,
             move_file** — type-checked via rust-analyzer, reusing the `GateEngine`/`LspClient`/
             `commit_edits` blast-radius gate (all three verified end-to-end). Needs
@@ -109,7 +109,7 @@ can (TS forces us out to Node):
   in-process for a true zero-external-process build.
 - **Type-checked edits (write/gate):** rust-analyzer's rename / references / diagnostics,
   slotting into the existing `GateEngine` trait exactly as the ts-morph engine does today.
-- **Dogfooding:** once MarksmanAI can index and edit Rust, we use *it* to build the remaining
+- **Dogfooding:** once Marksman can index and edit Rust, we use *it* to build the remaining
   providers — the tool accelerates its own development (it's a Rust codebase).
 
 ### Then, via the generic LSP `GateEngine` fallback (already built)
@@ -178,7 +178,7 @@ targets already exist from the SCIP+tree-sitter merge):
 - **Comments / docstrings:** `edit_leading_comment` / docstring control — touch documentation
   without touching executable code.
 - Remaining work: mapping these verbs in `action_to_op` + statement-level targeting within a
-  body + byte-vs-char column handling. **MarksmanAI's edge over a pure-AST editor: these stay
+  body + byte-vs-char column handling. **Marksman's edge over a pure-AST editor: these stay
   type-checked** (the blast-radius gate) — surgical *and* safe.
 
 ### Config files as first-class citizens (JSON / YAML / TOML)
@@ -191,7 +191,7 @@ the TS import that needs them.
 
 ### Breadth vs. depth — a pure-tree-sitter fallback edit provider
 The real axis: **breadth** (tree-sitter — 11+ languages, no type safety) vs **depth**
-(SCIP/LSP — type-checked, few languages). MarksmanAI can do *both* through the existing
+(SCIP/LSP — type-checked, few languages). Marksman can do *both* through the existing
 `Granularity` + `GateEngine` seams:
 - A **tree-sitter structural-edit provider with no blast-radius gate** is the *fallback* for any
   language we don't yet have SCIP/LSP for (Python, Go, Ruby, …) — structural edits work

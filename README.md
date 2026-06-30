@@ -1,8 +1,8 @@
-# MarksmanAI
+# Marksman
 
 **Precise code retrieval and type-checked edits for coding agents — over MCP.**
 
-MarksmanAI is a local-first [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI coding agent two things grep-and-guess can't:
+Marksman is a local-first [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI coding agent two things grep-and-guess can't:
 
 - **Find** the exact code for a task — compiler-accurate symbols + an import graph, fused with semantic and keyword search, returned as a **line-ranged manifest** (not a pile of whole files to read).
 - **Change** it safely — structured edits (rename / move / replace) applied atomically and **type-checked over the blast radius before they land**. A cross-file rename is *one* call, not N hand-edits, and nothing commits if it would break the build.
@@ -11,9 +11,9 @@ Written in Rust: a language-blind core plus per-language providers. **TypeScript
 
 ## Why
 
-Agents burn tokens grepping for context and break builds with blind string edits. MarksmanAI hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
+Agents burn tokens grepping for context and break builds with blind string edits. Marksman hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
 
-On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** MarksmanAI used **~39% fewer tokens and finished ~38% faster** than without — and edged out the mature TypeScript tool it's a rewrite of. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
+On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** Marksman used **~39% fewer tokens and finished ~38% faster** than without — and edged out the mature TypeScript tool it's a rewrite of. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Capabilities (MCP tools)
 
@@ -45,35 +45,35 @@ cargo build --release
 ```
 
 ### 2. Get the embedding model
-MarksmanAI uses a small static Model2Vec embedder. Download the model and point `CI_MODEL_DIR` at the directory:
+Marksman uses a small static Model2Vec embedder. Download the model and point `CI_MODEL_DIR` at the directory:
 ```bash
 # Option A — git-lfs
 git lfs install
-git clone https://huggingface.co/minishlab/potion-code-16M ~/.marksmanai/models/potion-code-16M
+git clone https://huggingface.co/minishlab/potion-code-16M ~/.marksman/models/potion-code-16M
 
 # Option B — Hugging Face CLI
-# huggingface-cli download minishlab/potion-code-16M --local-dir ~/.marksmanai/models/potion-code-16M
+# huggingface-cli download minishlab/potion-code-16M --local-dir ~/.marksman/models/potion-code-16M
 
-export CI_MODEL_DIR="$HOME/.marksmanai/models/potion-code-16M"
+export CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M"
 ```
 The directory must contain `model.safetensors`, `tokenizer.json`, and `config.json`.
 
 ### 3. Index a repo
 ```bash
-export CI_MODEL_DIR="$HOME/.marksmanai/models/potion-code-16M"
+export CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M"
 target/release/codeindex-rs index /path/to/your/ts-repo            # writes .codeindex-rs/ into the repo
 target/release/codeindex-rs retrieve /path/to/your/ts-repo "where is the rate limiter"   # sanity check
 ```
 
 ### 4. Register the MCP server with your agent
-Add MarksmanAI to your MCP client's config (Claude Code, Cursor, or any MCP client). Generic form:
+Add Marksman to your MCP client's config (Claude Code, Cursor, or any MCP client). Generic form:
 ```json
 {
   "mcpServers": {
-    "marksmanai": {
+    "marksman": {
       "command": "/absolute/path/to/Marksman/target/release/codeindex-rs-mcp",
       "env": {
-        "CI_MODEL_DIR": "/home/you/.marksmanai/models/potion-code-16M",
+        "CI_MODEL_DIR": "/home/you/.marksman/models/potion-code-16M",
         "CI_NPM_CACHE": "/tmp/ci-npm-cache"
       }
     }
@@ -84,8 +84,8 @@ The server indexes the repo it is launched in (its working directory); or pass `
 
 For **Claude Code**:
 ```bash
-claude mcp add marksmanai \
-  --env CI_MODEL_DIR="$HOME/.marksmanai/models/potion-code-16M" \
+claude mcp add marksman \
+  --env CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M" \
   -- /absolute/path/to/Marksman/target/release/codeindex-rs-mcp
 ```
 

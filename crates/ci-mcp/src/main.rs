@@ -140,10 +140,10 @@ fn resolve_root() -> PathBuf {
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         // Default to the path the README's download step uses, so the documented
-        // `git clone … ~/.marksmanai/models/potion-code-16M` works without setting CI_MODEL_DIR.
+        // `git clone … ~/.marksman/models/potion-code-16M` works without setting CI_MODEL_DIR.
         std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".marksmanai/models/potion-code-16M"))
-            .unwrap_or_else(|_| PathBuf::from(".marksmanai/models/potion-code-16M"))
+            .map(|h| PathBuf::from(h).join(".marksman/models/potion-code-16M"))
+            .unwrap_or_else(|_| PathBuf::from(".marksman/models/potion-code-16M"))
     })
 }
 

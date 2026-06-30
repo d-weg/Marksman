@@ -1,7 +1,7 @@
 //! lang-rust — the Rust [`LanguageProvider`]. v0 read path: in-process `tree-sitter-rust`
 //! (no external tooling — Rust's parser is a Rust crate) for `structure()` (items + fn
 //! sub-nodes) and `import_graph()` (`mod` resolution). Compiler-accurate references and
-//! type-checked edits via rust-analyzer are on the roadmap; this is what lets MarksmanAI
+//! type-checked edits via rust-analyzer are on the roadmap; this is what lets Marksman
 //! index and retrieve Rust — including its own source — today.
 use ci_core::{
     CommitResult, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node,
