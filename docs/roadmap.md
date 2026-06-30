@@ -101,10 +101,16 @@ and **reading** context it doesn't need. Two principles fix this:
             (gate in-sidecar); dogfooded end-to-end (`index` + `list_anchors` over the wire).
             Protobuf is compact + cheap to decode at indexing volume — it speeds the provider RPC /
             `sec` axis, NOT the agent token count (that's turns).
-      - [ ] **Distribution: fetch/install + version pinning + a manifest** — the only remaining
-            piece. Download the right `marksman-provider-<lang>` on demand from a release/registry
-            and cache+pin it, so the core ships tiny and pulls providers as repos need them. (Needs
-            a release artifact host; the runtime seam is done.)
+      - **Default model: providers live in-repo under `crates/langs/`, built + shipped together.**
+            Each is a crate with a `marksman-provider-<lang>` bin; one `cargo build` produces them
+            all next to the core, and `CI_PROVIDER=sidecar` spawns the one the repo needs (resolved
+            next to the exe). Adding a language is a new folder in `langs/` — no registry. You still
+            get the runtime modularity (out-of-process, language-agnostic wire) without a download
+            system. **This is the chosen model.**
+      - [ ] *(optional, future)* **Downloadable providers** — only if you want a *slim core* that
+            doesn't bundle every provider binary, or *third-party* providers published independently:
+            fetch `marksman-provider-<lang>` on demand from a release/registry + cache + version-pin.
+            Not needed for a repo you control; deferred until there's a reason.
 - [x] **Skeletal context (done).** `detailLevel` (`pointers`/`outline`/`full`) on
       `retrieve_context` inlines the top files with fn/method bodies folded to `{ /* … */ }`
       (`ci-core::elide_bodies` + tree-sitter `outline` in each provider). TS + Rust.
