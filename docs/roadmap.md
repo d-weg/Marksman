@@ -31,6 +31,29 @@ on a non-TS repo. Closing that is the next structural step.
 3. **Provider manifest** so the set is discoverable and configurable — enable/disable a
    language, pin a tool version, point at a vendored binary for offline/air-gapped use.
 
+## Addressing model — intent over location (token-minimal editing)
+
+The cost of an agent run is **turns × ~fixed-per-turn-context** (the harness re-sends everything
+each turn; caching discounts but the metric/cost still scale with turns). So the lever is *fewer
+turns* — and a big source of wasted turns is the agent **locating** things the index already knows
+and **reading** context it doesn't need. Two principles fix this:
+
+1. **The type-check gate licenses minimal context.** Because every edit is verified over the blast
+   radius, the agent can edit *locally and blind* and trust the gate — it never needs to read
+   call sites defensively. That's the real reason gated editing is cheap (not just atomicity).
+2. **Address by handle, not by hand.** A node id (`file#Scope.name`, optionally `:body`/`:doc`/…)
+   is unique AND self-locating. `apply_edits`/`read_node` resolve a reference cheapest-precision
+   first (**done**): a node id is used as-is (no `path`/`file`, no retrieve); a bare name is
+   resolved in a given file, else **across the index** (so the agent edits by name with no prior
+   retrieve — the index supplies the file); a same-name collision returns the **candidate ids** to
+   re-issue with (one cheap round-trip, never a full retrieve). Local variables (not indexed) stay
+   position-addressed via the LSP. Verified: rename `reciprocalRankFusion`→`fuseRanks` by name with
+   no path (2 files, gated); `read_node` by id with no file; ambiguous `freshProject` → 2 candidates.
+   - [ ] Surface the qualified node id in `retrieve_context`'s matched-symbol lines so the handle
+         propagates directly (today the agent reconstructs `file#name` or uses bare-name resolution).
+   - [ ] `read just the sub-node`: encourage `read_node id=…:body`/`:doc` so a body edit loads only
+         the body, not the whole symbol.
+
 ## Backlog (actionable, in dependency order)
 
 - [x] **Rust provider — read path (done).** `lang-rust` crate: `structure()` (fns/structs/
