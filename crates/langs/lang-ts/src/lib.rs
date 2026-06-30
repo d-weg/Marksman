@@ -188,7 +188,11 @@ impl LanguageProvider for TsProvider {
             eprintln!("[timing] engine ready (warm or fresh) {:?}", t0.elapsed());
         }
         let t1 = std::time::Instant::now();
-        let structure_of = |f: &str| self.scip.structure(f).unwrap_or_default();
+        // Resolve anchors from the FULL structure (SCIP + tree-sitter sub-nodes), NOT raw SCIP —
+        // otherwise sub-node targets (`:body`/`:return`/`:param.N`) that `list_anchors` advertises
+        // can't be found here, and `set_body` / `replace_node target:…` reject with "anchor not
+        // found". Must match what `structure()` returns to the agent.
+        let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
 
         // Reverse import map (file -> who imports it) for the delete-safety check.
         let mut reverse: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();

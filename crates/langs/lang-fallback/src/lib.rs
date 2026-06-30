@@ -612,6 +612,25 @@ mod tests {
     }
 
     #[test]
+    fn ungated_set_body_replaces_block() {
+        let dir = py_project();
+        let root = dir.path();
+        let p = FallbackProvider::new(root, FbLang::Python);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        // set_body narrows to the `:body` anchor (the suite) — signature stays.
+        let res = p
+            .apply_edits(
+                &[EditOp::SetBody { node_id: "pkg/math_utils.py#add".into(), body: "return a - b".into() }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "ungated set_body must commit: {res:?}");
+        let after = fs::read_to_string(root.join("pkg/math_utils.py")).unwrap();
+        assert!(after.contains("def add(a, b):"), "signature intact: {after}");
+        assert!(after.contains("return a - b") && !after.contains("return a + b"), "body replaced: {after}");
+    }
+
+    #[test]
     fn ungated_rename_rewrites_within_file() {
         let dir = py_project();
         let root = dir.path();

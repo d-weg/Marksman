@@ -227,13 +227,33 @@ impl Server {
             out.push_str("\n## code\n");
             let mut shown = 0;
             for e in &manifest.entries {
-                if shown >= 8 || e.reason == "doc" || e.file.ends_with(".md") {
+                // Inline only the few top entries, tightly capped: a big `outline`/`full` dump
+                // gets re-read every subsequent turn (cumulative input), so bounding it matters
+                // more than completeness — the agent can read_node / retrieve again for more.
+                if shown >= 4 || e.reason == "doc" || e.file.ends_with(".md") {
                     continue;
                 }
                 let Ok(content) = std::fs::read_to_string(self.root.join(&e.file)) else { continue };
-                let body = if detail == "full" { content } else { outline_for(&e.file, &content) };
-                let body: String = body.lines().take(250).collect::<Vec<_>>().join("\n");
-                out.push_str(&format!("\n### {}\n```\n{}\n```\n", e.file, body));
+                // Secondary files (pulled in via the import graph, not direct query matches) are
+                // CONTEXT, not the target — the agent needs their signatures to call them, not
+                // their bodies. So even when `full` is requested, fold secondaries to `outline`;
+                // only the primary `query-match` files come back in full. Big input-token saver,
+                // and the agent can still `read_node` a secondary's body on demand.
+                let primary = e.reason == "query-match";
+                let body = if detail == "full" && primary {
+                    content
+                } else {
+                    outline_for(&e.file, &content)
+                };
+                let body: String = body.lines().take(100).collect::<Vec<_>>().join("\n");
+                // Flag the case where what we returned differs from what was asked, so the agent
+                // knows the body was elided and can drill in if needed.
+                let label = if detail == "full" && !primary {
+                    format!("{} (outline — imported context; read_node for a body)", e.file)
+                } else {
+                    e.file.clone()
+                };
+                out.push_str(&format!("\n### {label}\n```\n{body}\n```\n"));
                 shown += 1;
             }
         }
@@ -295,6 +315,8 @@ impl Server {
                 target: a["target"].as_str().map(str::to_string),
                 name: a["name"].as_str().map(str::to_string),
                 value: a["value"].as_str().map(str::to_string),
+                old_text: a["oldText"].as_str().map(str::to_string),
+                new_text: a["newText"].as_str().map(str::to_string),
             };
             let resolve = |p: &str, _t: Option<&str>, n: Option<&str>| {
                 let nodes = provider.structure(Path::new(p)).unwrap_or_default();
@@ -420,7 +442,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "retrieve_context",
-            "description": "Find the files and line-ranges relevant to a task. Hybrid index (BM25 + Model2Vec + symbol match) fused with RRF, expanded along the import graph. No API calls. `detailLevel` controls how much code is inlined so you may not need a separate read: `pointers` (default — just file + line-range pointers), `outline` (inline the relevant files with function/method BODIES elided — you get exact signatures, arguments, and return types but not the bodies; a 200-line file becomes ~15 lines), or `full` (inline whole files).",
+            "description": "Find the files and line-ranges relevant to a task. Hybrid index (BM25 + Model2Vec + symbol match) fused with RRF, expanded along the import graph. No API calls. `detailLevel` controls how much code is inlined so you may not need a separate read: `pointers` (default — just file + line-range pointers), `outline` (inline the relevant files with function/method BODIES elided — you get exact signatures, arguments, and return types but not the bodies; a 200-line file becomes ~15 lines), or `full` (inline whole files). DEFAULT to `pointers` when you just need to LOCATE code you'll then edit (apply_edits / replace_text) or expand with read_node — it's by far the cheapest. Use `outline`/`full` only when you genuinely need to read several files' code at once, not merely find them. Under `full`, files pulled in via the import graph (not direct matches) are still returned as outline — you get their signatures to call them; use read_node if you need one of their bodies.",
             "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"},"detailLevel":{"type":"string","enum":["pointers","outline","full"]}},"required":["task"]}
         },
         {
@@ -440,8 +462,8 @@ fn tools_list() -> Value {
         },
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, gated by the TS type-checker (nothing lands if it would introduce a new type error — including in OTHER files that import what you changed). PREFER THIS over grepping + hand-editing: `rename` rewrites the definition AND every reference across the WHOLE codebase in this one call; `move_file` updates every importer. So to rename a symbol everywhere you make ONE call — do not search for or edit call sites yourself, and no verification grep is needed afterward. `actions`: [{path, action, name, value}]. For `rename`: path = the file that DEFINES the symbol (use retrieve_context to find it), name = its current name, value = the new name. For `replace_node`/`insert_before`: name = the target symbol, value = the new code. For `move_file`: path = current file, value = new path. Actions: rename, replace_node, insert_before, create_file, move_file, delete_file.",
-            "inputSchema": {"type":"object","properties":{"actions":{"type":"array"},"dryRun":{"type":"boolean"}},"required":["actions"]}
+            "description": "Apply structured code edits atomically, gated by the language type-checker (nothing lands if it would introduce a new type error — including in OTHER files that import what you changed). NOTE: TypeScript and Rust are type-checked; some languages (e.g. Python) run a structural-only fallback whose result says `gated: false` — verify those yourself. PREFER THIS over grepping + hand-editing: `rename` rewrites the definition AND every reference across the WHOLE codebase in this one call; `move_file` updates every importer. So to rename a symbol everywhere you make ONE call — do not search for or edit call sites yourself, and no verification grep is needed afterward. `actions`: [{path, action, name, value, target?}]. For `rename`: path = the file that DEFINES the symbol (use retrieve_context to find it), name = its current name, value = the new name. For `replace_node`/`insert_before`: name = the target symbol, value = the new code. For `move_file`: path = current file, value = new path. CHOOSING THE RIGHT EDIT (smallest payload wins): if you already KNOW the exact text to change — it's in the task, or you saw it via retrieve_context/read_node — use `replace_text` (name = the symbol, oldText = the exact substring, unique within it, newText = its replacement). It needs NO separate read and re-emits NOTHING — do not Read the file or call list_anchors first just to use it. Only fall back to `set_body` (name = the function/method, value = its whole new `{ … }` block) when you're rewriting MOST of the body — it forces you to know and re-emit the entire body. For one sub-node, set `target` on `replace_node`: `target:\"body\"`, `target:\"return\"` (return-type text), or `target:\"param.N\"` (Nth param, 0-based). Actions: rename, replace_node, replace_text, set_body, insert_before, create_file, move_file, delete_file.",
+            "inputSchema": {"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"action":{"type":"string"},"name":{"type":"string"},"value":{"type":"string"},"oldText":{"type":"string","description":"replace_text: exact substring to replace (unique within the symbol)"},"newText":{"type":"string","description":"replace_text: its replacement"},"target":{"type":"string","description":"optional sub-node selector for surgical edits: body | return | param.N"}},"required":["path","action"]}},"dryRun":{"type":"boolean"}},"required":["actions"]}
         }
     ])
 }

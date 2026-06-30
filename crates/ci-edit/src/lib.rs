@@ -104,14 +104,19 @@ impl GateEngine for LspClient {
     }
 }
 
-/// Structured rich action payload (the MCP/wrapper input shape): `{action, target, name, value}`.
-#[derive(Debug, Clone)]
+/// Structured rich action payload (the MCP/wrapper input shape):
+/// `{action, target, name, value, old_text?, new_text?}`.
+#[derive(Debug, Clone, Default)]
 pub struct Action {
     pub path: String,
     pub action: String,
     pub target: Option<String>,
     pub name: Option<String>,
     pub value: Option<String>,
+    /// For `replace_text`: the exact substring to replace (must be unique within the target node).
+    pub old_text: Option<String>,
+    /// For `replace_text`: its replacement.
+    pub new_text: Option<String>,
 }
 
 /// Map a structured action to an [`EditOp`]. `resolve(path, target, name) -> node_id`
@@ -124,11 +129,37 @@ pub fn action_to_op(
         resolve(&a.path, a.target.as_deref(), a.name.as_deref())
             .ok_or_else(|| Error::Anchor(format!("{}#{}", a.path, a.name.clone().unwrap_or_default())))
     };
+    // The resolved symbol id, optionally NARROWED to a sub-node anchor when `target` names one
+    // (`body` / `return` / `param.N`). For a surgical edit the agent targets a sub-symbol range
+    // — its body or return type or one parameter — instead of re-emitting the whole definition.
+    // Any other `target` (e.g. a symbol-kind hint like "function") leaves the id as the whole
+    // symbol, so existing callers are unaffected. The narrowed id (`f.ts#foo:body`) is validated
+    // against the structure tree in `apply_structural`.
+    let targeted = || -> Result<String> {
+        let base = node()?;
+        Ok(match a.target.as_deref() {
+            Some("body") => format!("{base}:body"),
+            Some("return") | Some("returnType") => format!("{base}:return"),
+            Some(t) if t.starts_with("param.") => format!("{base}:{t}"),
+            _ => base,
+        })
+    };
     let value = || a.value.clone().ok_or_else(|| Error::Other(format!("{} needs a value", a.action)));
     Ok(match a.action.as_str() {
         "rename" => EditOp::Rename { node_id: node()?, new_name: value()? },
-        "replace" | "replace_node" => EditOp::ReplaceNode { node_id: node()?, code: value()? },
-        "insert_before" => EditOp::InsertBefore { node_id: node()?, code: value()? },
+        "replace" | "replace_node" => EditOp::ReplaceNode { node_id: targeted()?, code: value()? },
+        // `replace_text` swaps an exact substring INSIDE a node (optionally a sub-node via
+        // `target`) — the cheapest precise edit: the agent sends only old→new, not the whole
+        // body. `old_text` must be unique within the node. Gated like any structural edit.
+        "replace_text" => EditOp::ReplaceText {
+            node_id: targeted()?,
+            old_text: a.old_text.clone().ok_or_else(|| Error::Other("replace_text needs oldText".into()))?,
+            new_text: a.new_text.clone().ok_or_else(|| Error::Other("replace_text needs newText".into()))?,
+        },
+        // `set_body` is sugar for replacing the `:body` anchor — re-draft a function/method body
+        // without retyping its signature. Gated like any other structural edit.
+        "set_body" => EditOp::SetBody { node_id: node()?, body: value()? },
+        "insert_before" => EditOp::InsertBefore { node_id: targeted()?, code: value()? },
         "create_file" => EditOp::CreateFile { path: a.path.clone().into(), code: value()? },
         "move_file" => EditOp::MoveFile { from: a.path.clone().into(), to: value()?.into() },
         "delete_file" => EditOp::DeleteFile { path: a.path.clone().into() },
@@ -173,6 +204,7 @@ fn op_node_id(op: &EditOp) -> Option<&str> {
         EditOp::ReplaceNode { node_id, .. }
         | EditOp::InsertBefore { node_id, .. }
         | EditOp::ReplaceText { node_id, .. }
+        | EditOp::SetBody { node_id, .. }
         | EditOp::Rename { node_id, .. } => Some(node_id),
         _ => None,
     }
@@ -230,15 +262,35 @@ pub fn apply_structural(
                 .read_range(Path::new(file), &node.range)
                 .ok_or_else(|| Error::Other("node text unavailable".into()))?;
             match text.matches(old_text.as_str()).count() {
-                0 => return Err(Error::Other("REPLACE_TEXT: oldText not found in node".into())),
+                // Echo the node's ACTUAL text so the agent can fix oldText in one retry instead
+                // of spiraling into read_node/Read calls to discover what it should have been.
+                0 => {
+                    return Err(Error::Other(format!(
+                        "REPLACE_TEXT: oldText {old_text:?} not found in node '{node_id}'. Its current text is:\n{text}"
+                    )))
+                }
                 1 => {}
-                _ => return Err(Error::Other("REPLACE_TEXT: oldText not unique in node".into())),
+                _ => {
+                    return Err(Error::Other(format!(
+                        "REPLACE_TEXT: oldText {old_text:?} is not unique in node '{node_id}' — include more surrounding text to disambiguate."
+                    )))
+                }
             }
             vfs.replace_range(Path::new(file), &node.range, &text.replacen(old_text, new_text, 1))
         }
         EditOp::CreateFile { path, code } => vfs.create(path, code.clone()),
-        EditOp::SetBody { .. } => {
-            Err(Error::Driver("SET_BODY needs AST granularity; use replace_node".into()))
+        EditOp::SetBody { node_id, body } => {
+            // Replace just the function/method `:body` anchor (the `{ … }` block), keeping the
+            // signature. Requires AST granularity (the body sub-node must exist in `structure()`).
+            let file = file_of(node_id);
+            let nodes = structure_of(file);
+            let body_id = format!("{node_id}:body");
+            let node = find(&nodes, &body_id).ok_or_else(|| {
+                Error::Anchor(format!(
+                    "{body_id} — no body anchor (symbol has no editable body, or this provider lacks AST granularity; use replace_node)"
+                ))
+            })?;
+            vfs.replace_range(Path::new(file), &node.range, body)
         }
         EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } => {
             Err(Error::Driver("file ops (move/delete) land in P3".into()))
@@ -496,20 +548,65 @@ mod tests {
     }
 
     #[test]
-    fn action_maps_to_ops_and_refuses_set_body() {
+    fn action_maps_set_body_and_subnode_targets() {
         let resolve = |_p: &str, _t: Option<&str>, n: Option<&str>| n.map(|n| format!("a.ts#{n}"));
-        let rn = action_to_op(
-            &Action { path: "a.ts".into(), action: "rename".into(), target: Some("function".into()), name: Some("add".into()), value: Some("sum".into()) },
+        let act = |action: &str, target: Option<&str>| {
+            action_to_op(
+                &Action {
+                    path: "a.ts".into(),
+                    action: action.into(),
+                    target: target.map(str::to_string),
+                    name: Some("add".into()),
+                    value: Some("v".into()),
+                    ..Default::default()
+                },
+                &resolve,
+            )
+        };
+
+        // rename targets the whole symbol regardless of `target`.
+        assert!(matches!(act("rename", Some("function")).unwrap(), EditOp::Rename { .. }));
+
+        // set_body maps to SET_BODY against the symbol (apply_structural narrows to `:body`).
+        match act("set_body", None).unwrap() {
+            EditOp::SetBody { node_id, .. } => assert_eq!(node_id, "a.ts#add"),
+            o => panic!("expected SetBody, got {o:?}"),
+        }
+
+        // replace_node narrows to the sub-node anchor when `target` names one.
+        let id = |op| match op {
+            EditOp::ReplaceNode { node_id, .. } => node_id,
+            o => panic!("expected ReplaceNode, got {o:?}"),
+        };
+        assert_eq!(id(act("replace_node", Some("body")).unwrap()), "a.ts#add:body");
+        assert_eq!(id(act("replace_node", Some("return")).unwrap()), "a.ts#add:return");
+        assert_eq!(id(act("replace_node", Some("param.1")).unwrap()), "a.ts#add:param.1");
+        // an unknown / symbol-kind target leaves the whole-symbol id intact.
+        assert_eq!(id(act("replace_node", Some("function")).unwrap()), "a.ts#add");
+        assert_eq!(id(act("replace_node", None).unwrap()), "a.ts#add");
+
+        // replace_text carries oldText/newText and honors `target` for sub-node scoping.
+        let rt = action_to_op(
+            &Action {
+                path: "a.ts".into(),
+                action: "replace_text".into(),
+                target: Some("body".into()),
+                name: Some("add".into()),
+                old_text: Some("foo".into()),
+                new_text: Some("bar".into()),
+                ..Default::default()
+            },
             &resolve,
         )
         .unwrap();
-        assert!(matches!(rn, EditOp::Rename { .. }));
-
-        let sb = action_to_op(
-            &Action { path: "a.ts".into(), action: "set_body".into(), target: Some("function".into()), name: Some("add".into()), value: Some("x".into()) },
-            &resolve,
-        );
-        assert!(sb.is_err(), "set_body refused at Symbol granularity");
+        match rt {
+            EditOp::ReplaceText { node_id, old_text, new_text } => {
+                assert_eq!(node_id, "a.ts#add:body");
+                assert_eq!(old_text, "foo");
+                assert_eq!(new_text, "bar");
+            }
+            o => panic!("expected ReplaceText, got {o:?}"),
+        }
     }
 
     #[test]
@@ -535,13 +632,13 @@ mod tests {
     fn action_maps_file_ops() {
         let resolve = |_p: &str, _t: Option<&str>, _n: Option<&str>| None;
         let mv = action_to_op(
-            &Action { path: "a.ts".into(), action: "move_file".into(), target: None, name: None, value: Some("b/a.ts".into()) },
+            &Action { path: "a.ts".into(), action: "move_file".into(), target: None, name: None, value: Some("b/a.ts".into()), ..Default::default() },
             &resolve,
         )
         .unwrap();
         assert!(matches!(mv, EditOp::MoveFile { .. }));
         let del = action_to_op(
-            &Action { path: "a.ts".into(), action: "delete_file".into(), target: None, name: None, value: None },
+            &Action { path: "a.ts".into(), action: "delete_file".into(), target: None, name: None, value: None, ..Default::default() },
             &resolve,
         )
         .unwrap();

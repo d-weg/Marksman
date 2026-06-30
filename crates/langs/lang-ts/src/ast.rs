@@ -4,7 +4,7 @@
 //! already pinned semantically — never for cross-file/semantic work — so its
 //! precision limits don't apply. This turns `structure()` from symbol-level into
 //! AST-level (`Granularity::Ast`), unlocking precise sub-symbol edits.
-use ci_core::{Node, NodeKind, Range};
+use ci_core::{Node, NodeKind, Range, SymbolKind};
 use tree_sitter::{Node as TsNode, Parser};
 
 /// Attach tree-sitter sub-nodes as children of each SCIP symbol. On any parse
@@ -24,10 +24,39 @@ pub fn deepen(content: &str, scip_nodes: Vec<Node>) -> Vec<Node> {
         .map(|mut n| {
             if let Some(children) = subnodes(&root, content, bytes, &n) {
                 n.children = children;
+            } else if matches!(n.kind, NodeKind::Symbol(SymbolKind::Variable)) {
+                // SCIP gives a field/variable a NAME-ONLY range (`k1`), so `replace_text` /
+                // `replace_node` scoped to it can't see its initializer (`k1 = 1.5;`). Widen the
+                // range to the enclosing declaration so editing the field by name works.
+                if let Some(r) = field_decl_range(&root, content, &n) {
+                    n.range = r;
+                }
             }
             n
         })
         .collect()
+}
+
+/// Climb from a field/variable's name to its full declaration node and return that range, so the
+/// node spans `k1 = 1.5;` not just `k1`. Bounded climb; bails if it would leave the member.
+fn field_decl_range(root: &TsNode, content: &str, sym: &Node) -> Option<Range> {
+    let a = sym.name_range.as_ref().unwrap_or(&sym.range);
+    let s = point_byte(content, a.start_line, a.start_char)?;
+    let e = point_byte(content, a.end_line, a.end_char)?.max(s + 1);
+    let mut n = root.descendant_for_byte_range(s, e)?;
+    for _ in 0..6 {
+        match n.kind() {
+            "public_field_definition" | "field_definition" | "property_declaration"
+            | "property_signature" | "variable_declarator" | "lexical_declaration"
+            | "enum_assignment" => return Some(ts_range(&n)),
+            // don't climb out of the member into the class/program (a function/method shouldn't
+            // reach here — it gets sub-nodes instead).
+            "class_body" | "statement_block" | "program" => return None,
+            _ => {}
+        }
+        n = n.parent()?;
+    }
+    None
 }
 
 fn subnodes(root: &TsNode, content: &str, bytes: &[u8], sym: &Node) -> Option<Vec<Node>> {
@@ -36,6 +65,16 @@ fn subnodes(root: &TsNode, content: &str, bytes: &[u8], sym: &Node) -> Option<Ve
     let s = point_byte(content, anchor.start_line, anchor.start_char)?;
     let e = point_byte(content, anchor.end_line, anchor.end_char)?.max(s + 1);
     let decl = decl_with_fields(root.descendant_for_byte_range(s, e)?);
+
+    // Guard against climbing PAST the symbol into an enclosing declaration. A class field has no
+    // params/body of its own, so `decl_with_fields` would climb to the enclosing CLASS and hand
+    // back the class body as the field's `:body` (e.g. `BM25.k1:body` = the whole class). A real
+    // function/method's decl starts at/after its own symbol; an ancestor we climbed into starts
+    // BEFORE it. Reject the latter so we never emit a sub-node range that isn't the symbol's own.
+    let sym_start = point_byte(content, sym.range.start_line, sym.range.start_char)?;
+    if decl.start_byte() < sym_start {
+        return None;
+    }
 
     let mut children = Vec::new();
     if let Some(params) = decl.child_by_field_name("parameters") {
@@ -147,5 +186,51 @@ mod tests {
         let body = add.children.iter().find(|c| c.id == "m.ts#add:body").expect("body node");
         assert_eq!(body.range.start_line, 1);
         assert_eq!(body.range.end_line, 3);
+    }
+
+    // Regression: a class FIELD has no body of its own, so it must NOT borrow the enclosing
+    // class body as its `:body` anchor (which would let `set_body` on a field overwrite the whole
+    // class). A real method on the same class still gets its own sub-nodes.
+    #[test]
+    fn field_does_not_borrow_class_body() {
+        let content = "class C {\n  k1 = 1.5;\n  run(): number { return this.k1; }\n}\n";
+        let field = Node {
+            id: "f.ts#C.k1".into(),
+            name: Some("k1".into()),
+            kind: NodeKind::Symbol(SymbolKind::Variable),
+            range: Range { start_line: 2, start_char: 2, end_line: 2, end_char: 11 },
+            name_range: Some(Range { start_line: 2, start_char: 2, end_line: 2, end_char: 4 }),
+            children: vec![],
+        };
+        let method = Node {
+            id: "f.ts#C.run".into(),
+            name: Some("run".into()),
+            kind: NodeKind::Symbol(SymbolKind::Method),
+            range: Range { start_line: 3, start_char: 2, end_line: 3, end_char: 35 },
+            name_range: Some(Range { start_line: 3, start_char: 2, end_line: 3, end_char: 5 }),
+            children: vec![],
+        };
+        let deep = deepen(content, vec![field, method]);
+        let f = deep.iter().find(|n| n.id == "f.ts#C.k1").unwrap();
+        assert!(f.children.is_empty(), "field must not borrow the class body: {:?}", f.children);
+        let m = deep.iter().find(|n| n.id == "f.ts#C.run").unwrap();
+        assert!(m.children.iter().any(|c| c.id == "f.ts#C.run:body"), "method keeps its own :body");
+    }
+
+    // Regression: SCIP hands a field a NAME-ONLY range; deepen must widen it to the full
+    // declaration so `replace_text`/`replace_node` can see the initializer (`k1 = 1.5;`).
+    #[test]
+    fn field_range_widens_to_declaration() {
+        let content = "class C {\n  k1 = 1.5;\n}\n";
+        let field = Node {
+            id: "f.ts#C.k1".into(),
+            name: Some("k1".into()),
+            kind: NodeKind::Symbol(SymbolKind::Variable),
+            range: Range { start_line: 2, start_char: 2, end_line: 2, end_char: 4 }, // just "k1"
+            name_range: Some(Range { start_line: 2, start_char: 2, end_line: 2, end_char: 4 }),
+            children: vec![],
+        };
+        let k1 = deepen(content, vec![field]).pop().unwrap();
+        assert!(k1.range.end_char > 4, "field range widened past the name `k1`: {:?}", k1.range);
     }
 }

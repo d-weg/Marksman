@@ -465,6 +465,53 @@ mod tests {
         assert!(!after.contains("add"), "no 'add' should remain: {after}");
     }
 
+    // Surgical sub-node edits, gated by rust-analyzer. #[ignore]; run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn rust_subnode_edits_gated() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+        let p = RustProvider::new(root);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        // set_body: re-draft just the `{ … }` block, signature untouched -> commits.
+        let ok = p
+            .apply_edits(
+                &[EditOp::SetBody {
+                    node_id: "src/lib.rs#add".into(),
+                    body: "{\n    let s = a + b;\n    s\n}".into(),
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "clean set_body must commit: {ok:?}");
+        let after = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(after.contains("let s = a + b"), "body replaced: {after}");
+        assert!(after.contains("pub fn add(a: i32, b: i32) -> i32"), "signature intact: {after}");
+
+        // set_body introducing a type error -> rejected, disk unchanged.
+        let before = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let bad = p
+            .apply_edits(
+                &[EditOp::SetBody { node_id: "src/lib.rs#add".into(), body: "{\n    \"nope\"\n}".into() }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(bad, CommitResult::Rejected { .. }), "type-error body must be rejected: {bad:?}");
+        assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), before, "disk untouched on reject");
+
+        // Surgical edit of the `:return` anchor (just the type after `->`) that breaks typing
+        // -> rejected. Proves the sub-node anchor is addressable AND still gated.
+        let bad_ret = p
+            .apply_edits(
+                &[EditOp::ReplaceNode { node_id: "src/lib.rs#add:return".into(), code: "String".into() }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(bad_ret, CommitResult::Rejected { .. }), "i32 body vs String return must reject: {bad_ret:?}");
+    }
+
     #[test]
     fn import_graph_follows_mod_decls() {
         let dir = tempfile::tempdir().unwrap();
