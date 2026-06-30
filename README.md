@@ -107,6 +107,7 @@ Environment variables:
 | `CI_TSMORPH_DIR` | where the ts-morph sidecar is installed | `<tmp>/ci-tsmorph` |
 | `CI_EDIT_ENGINE` | write engine: `tsmorph` (default) or `lsp` | `tsmorph` |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
+| `CI_RUST_SCIP` | `1` builds the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) instead of `mod`-only; generated at index time, ≈ a `cargo check` | off (tree-sitter `mod` graph) |
 | `CODEINDEX_ROOT` | repo root for the MCP server | current directory |
 
 An optional `codeindex.config.json` in the repo root overrides retrieval / index settings (top-N, RRF k, weights, …).

@@ -11,7 +11,7 @@ use ci_edit::GateEngine;
 use ci_lsp::LspClient;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node as TsNode, Parser};
 
@@ -78,6 +78,47 @@ impl RustProvider {
         parser.set_language(&lang).ok()?;
         parser.parse(content, None)
     }
+
+    /// The cached `rust-analyzer scip` index (the optional compiler-accurate graph source).
+    fn scip_cache(&self) -> PathBuf {
+        self.root.join(".codeindex-rs").join("rust.scip")
+    }
+
+    /// The `use`/reference import graph from the cached SCIP index, if it exists. `None` (→ the
+    /// `mod`-graph fallback) when no cache has been generated.
+    fn scip_graph(&self) -> Option<ImportGraph> {
+        let cache = self.scip_cache();
+        if !cache.is_file() {
+            return None;
+        }
+        ci_scip::ScipIndex::load(&cache).ok()?.import_graph().ok()
+    }
+}
+
+/// Generate the cached SCIP index (`<root>/.codeindex-rs/rust.scip`) by running
+/// `rust-analyzer scip` — the source for the optional compiler-accurate `use` graph
+/// (`CI_RUST_SCIP`). Run at index time (a batch step); `import_graph` then reads it. Slow (≈ a
+/// `cargo check`), so it's never on the live path. Errors propagate so the caller can warn and
+/// fall back to the tree-sitter `mod` graph.
+pub fn refresh_scip(root: &Path) -> Result<()> {
+    let out = root.join(".codeindex-rs").join("rust.scip");
+    if let Some(d) = out.parent() {
+        std::fs::create_dir_all(d).map_err(|e| Error::Driver(format!("scip cache dir: {e}")))?;
+    }
+    let status = rust_analyzer_command()
+        .arg("scip")
+        .arg(".")
+        .arg("--output")
+        .arg(&out)
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|e| Error::Driver(format!("launching `rust-analyzer scip`: {e}")))?;
+    if !status.success() {
+        return Err(Error::Driver(format!("`rust-analyzer scip` failed ({status})")));
+    }
+    Ok(())
 }
 
 impl LanguageProvider for RustProvider {
@@ -100,6 +141,15 @@ impl LanguageProvider for RustProvider {
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
+        // OPT-IN (`CI_RUST_SCIP`): a compiler-accurate `use`/reference graph from a cached
+        // `rust-analyzer scip` index — far richer than `mod` edges. Read-only here (generation is
+        // `refresh_scip`, run at index time), and we fall back to the instant tree-sitter `mod`
+        // graph whenever the cache is absent, so this never blocks the live path.
+        if std::env::var("CI_RUST_SCIP").is_ok() {
+            if let Some(g) = self.scip_graph() {
+                return Ok(g);
+            }
+        }
         let mut graph: ImportGraph = BTreeMap::new();
         for rel in rust_files(&self.root) {
             let abs = self.root.join(&rel);
@@ -559,6 +609,34 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(bad_ret, CommitResult::Rejected { .. }), "i32 body vs String return must reject: {bad_ret:?}");
+    }
+
+    // Opt-in compiler-accurate graph: `rust-analyzer scip` captures a `use` edge that `mod`-only
+    // misses (parser → lexer). #[ignore] (spawns rust-analyzer); `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn scip_graph_has_use_edges_mod_misses() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(root.join("src/lib.rs"), "mod lexer;\nmod parser;\n").unwrap();
+        fs::write(root.join("src/lexer.rs"), "pub struct Token;\n").unwrap();
+        fs::write(root.join("src/parser.rs"), "use crate::lexer::Token;\npub fn parse(_t: Token) {}\n").unwrap();
+
+        // tree-sitter mod graph: parser is NOT linked to lexer.
+        let p = RustProvider::new(root);
+        let mod_g = p.import_graph().unwrap();
+        assert!(
+            !mod_g.get(&PathBuf::from("src/parser.rs")).map(|e| e.contains(&PathBuf::from("src/lexer.rs"))).unwrap_or(false),
+            "mod graph should NOT have parser->lexer"
+        );
+
+        // SCIP graph: the `use crate::lexer::Token` dependency IS captured.
+        refresh_scip(root).expect("rust-analyzer scip");
+        let cache = root.join(".codeindex-rs/rust.scip");
+        assert!(cache.is_file(), "scip cache written");
+        let scip_g = ci_scip::ScipIndex::load(&cache).unwrap().import_graph().unwrap();
+        let edges = scip_g.get(&PathBuf::from("src/parser.rs")).expect("parser.rs edges from scip");
+        assert!(edges.contains(&PathBuf::from("src/lexer.rs")), "scip use edge parser->lexer: {edges:?}");
     }
 
     #[test]

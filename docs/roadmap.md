@@ -73,8 +73,14 @@ and **reading** context it doesn't need. Two principles fix this:
             `commit_edits` blast-radius gate (all three verified end-to-end). Needs
             `rustup component add rust-analyzer` (`CI_RUST_ANALYZER` overrides). Next: faster
             cold-start than the ~10s rename/move retry (a "rust-analyzer ready" signal).
-      - [ ] **Better Rust graph** — `use`-resolution (not just `mod` edges) + optional
-            `rust-analyzer scip` for compiler-accurate references in retrieval.
+      - [x] **Better Rust graph (done, opt-in).** `CI_RUST_SCIP=1` swaps the `mod`-only graph for a
+            **compiler-accurate `use`/reference graph** from `rust-analyzer scip` — read by the
+            existing `ci-scip` (no reader changes; validated). Latency-safe: `lang_rust::refresh_scip`
+            generates `<root>/.codeindex-rs/rust.scip` at **index time** (a batch step, ≈ a
+            `cargo check`); `import_graph()` only *reads* the cache and **falls back to the instant
+            tree-sitter `mod` graph** when it's absent — SCIP never sits on the live path. Off by
+            default (the analysis latency); flip on per repo. tree-sitter still owns structure +
+            sub-nodes, so Rust now mirrors TS: tree-sitter for AST, SCIP for the semantic graph.
 - [x] **Provider selection (done, v0).** `build_provider`/`select_provider` keyed on manifests
       (Cargo.toml vs package.json; `CI_LANG` override) in `ci-cli` + `ci-mcp` — **Node only for a
       TS repo now.**

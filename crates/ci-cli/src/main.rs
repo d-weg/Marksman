@@ -111,6 +111,15 @@ fn cmd_index(root: &Path) {
 
     let provider = select_provider(root, &mut config);
 
+    // Opt-in (`CI_RUST_SCIP`): generate the compiler-accurate Rust `use` graph BEFORE indexing so
+    // it's the one persisted (import_graph reads the cache). Slow (≈ cargo check); off by default.
+    if std::env::var("CI_RUST_SCIP").is_ok() && choose_lang(root) == "rust" {
+        eprintln!("[codeindex-rs] CI_RUST_SCIP: generating rust-analyzer scip graph (one-time, ~cargo check) …");
+        if let Err(e) = lang_rust::refresh_scip(root) {
+            eprintln!("[codeindex-rs] scip graph unavailable ({e}); using the tree-sitter mod graph");
+        }
+    }
+
     eprintln!("[codeindex-rs] embedding + indexing …");
     let index = build_index(root, &config, provider.as_ref(), |t| {
         embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim])

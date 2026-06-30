@@ -538,6 +538,7 @@ dependencies = [
  "ci-edit",
  "ci-lsp",
  "ci-proto",
+ "ci-scip",
  "ignore",
  "tempfile",
  "tree-sitter",
