@@ -69,9 +69,20 @@ on a non-TS repo. Closing that is the next structural step.
             or `name`, incl. `:body`/`:param`/`:return` sub-nodes.
       - [ ] secondary import-graph files auto-default to `outline` even when the call asks for
             `full` on the primaries.
-- [ ] **Surgical sub-node edits** — map `insert_in_body`/`replace_in_body`/`delete_in_body`/
-      param/return/comment verbs in `ci-edit::action_to_op` over the existing
-      `#sym:body`/`:param.N`/`:return` anchors; keep them gated.
+- [x] **Surgical sub-node edits (done, v0).** Edit part of a function without re-emitting it,
+      still type-checked. `set_body` (new verb) replaces just the `:body` block; `replace_node`
+      now takes a `target` to narrow onto a sub-node anchor — `body`, `return` (the return-type
+      text), or `param.N`. Wired in `ci-edit::action_to_op` (the `SetBody` op is un-stubbed in
+      `apply_structural`) + the MCP `apply_edits` schema/description. All ride the existing
+      blast-radius gate: verified on Rust (`set_body` commits clean / rejects a type error;
+      a `:return` edit that breaks typing is rejected) and on the ungated Python fallback.
+      - [ ] **Statement-level body edits** — `insert_in_body`/`replace_in_body`/`delete_in_body`
+            targeting ONE statement inside a block (needs statement addressing + an old/new-text
+            payload beyond `{path,action,name,value,target}`).
+      - [ ] **`add_parameter` / `set_return_type` where absent** — insert `-> T` / a new param
+            when there's no existing anchor (needs the params-end insertion point; the
+            anchor punctuation differs per language — TS `: T` vs Rust `-> T`).
+      - [ ] Leading-comment / docstring verbs.
 - [ ] **Config providers (JSON/YAML/TOML)** — tree-sitter providers for surgical key edits
       (package.json, compose, *.toml); no gate needed. Rides on the provider registry.
 - [x] **Tree-sitter fallback edit provider (done, v0 — Python).** `lang-fallback` crate: a
@@ -138,9 +149,10 @@ ranking vs a labeled set); edit precision/coverage per op class; end-to-end edit
 agent A/B benchmark (with vs without, vs the TS tool) lives in [benchmarks.md](benchmarks.md).
 
 ## Other directions
-- **Fine verbs over the AST tree** — `set_body` / `set_return_type` / `add_parameter` now have
-  targets (`#sym:body` / `:return` / `:param.N`) via the SCIP+tree-sitter merge; remaining work
-  is mapping them in `action_to_op` + non-ASCII (byte-based) column handling.
+- **Fine verbs over the AST tree** — `set_body` + `replace_node target:body|return|param.N` are
+  mapped in `action_to_op` over the `#sym:body` / `:return` / `:param.N` anchors and shipped
+  (see the gated "Surgical sub-node edits" backlog item). Remaining: statement-level body edits,
+  `add_parameter`/`set_return_type`-where-absent, and non-ASCII (byte-based) column handling.
 - **Incremental index refresh** after a commit (reindex only changed files; `scip-typescript`
   is largely whole-project — measure latency, consider a faster path).
 - **Persisted package roles** (deps-based `infer_role` at index time) for sharper query
