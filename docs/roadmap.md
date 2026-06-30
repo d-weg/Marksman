@@ -53,6 +53,14 @@ and **reading** context it doesn't need. Two principles fix this:
          propagates directly (today the agent reconstructs `file#name` or uses bare-name resolution).
    - [ ] `read just the sub-node`: encourage `read_node id=…:body`/`:doc` so a body edit loads only
          the body, not the whole symbol.
+   - [ ] **Resolve-by-query (`retrieve_and_edit`) — close the T3 floor.** T3 stays at parity because
+         the agent spends a turn to *discover* which symbol to edit (a cheap `pointers` retrieve),
+         then edits. Extend the addressing spectrum with a fourth, fuzziest mode: an `apply_edits`
+         target given as a **search query** instead of a name/id. The server runs retrieval; if the
+         top hit is unambiguous/high-confidence it applies the edit (gated, so a wrong guess is
+         caught), else it returns candidates — collapsing locate+edit into ONE call. Risk: editing a
+         retrieval guess; mitigated by the gate + a confidence threshold + candidate fallback. This
+         is the only remaining lever on grep-trivial "find-and-change" tasks.
 
 ## Backlog (actionable, in dependency order)
 
@@ -81,10 +89,16 @@ and **reading** context it doesn't need. Two principles fix this:
       language-agnostic; providers can be third-party / any language. NOT dlopen — Rust has no
       stable ABI, so in-process plugins are unsafe/undistributable; separate processes (the model
       rust-analyzer / the ts-morph sidecar already use) are the correct seam.
-      - [ ] Define the provider protocol (a serde-serializable mirror of the trait + a tiny RPC).
-      - [ ] A host-side `ProcessProvider` impl of `LanguageProvider` that spawns + talks to a
-            provider binary (mirrors `TsMorphClient`).
-      - [ ] Provider fetch/install + version pinning + a manifest.
+      - [x] **Protocol + host + sidecar (done, v0) — protobuf over JSON for speed.** `ci-proto`
+            (prost messages + ci-core↔proto conversions + length-delimited framing) defines the
+            wire; `ProcessProvider` (host) spawns a provider binary and implements
+            `LanguageProvider` over it; `lang-rust` ships a `marksman-provider-rust` sidecar bin
+            serving `RustProvider`. Round-trips structure / import_graph / outline (+ apply_edits —
+            the rust-analyzer gate runs inside the sidecar). Protobuf is ~compact and far cheaper to
+            encode/decode at indexing volume; it speeds the provider RPC / `sec` axis, NOT the agent
+            token count (that's turns).
+      - [ ] Provider fetch/install + version pinning + a manifest (download the sidecar on demand).
+      - [ ] Move `lang-ts` behind the same protocol; a registry that spawns per-language sidecars.
 - [x] **Skeletal context (done).** `detailLevel` (`pointers`/`outline`/`full`) on
       `retrieve_context` inlines the top files with fn/method bodies folded to `{ /* … */ }`
       (`ci-core::elide_bodies` + tree-sitter `outline` in each provider). TS + Rust.
