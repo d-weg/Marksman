@@ -67,22 +67,31 @@ on a non-TS repo. Closing that is the next structural step.
       (`ci-core::elide_bodies` + tree-sitter `outline` in each provider). TS + Rust.
       - [x] `read_node` drill-down tool (done) — full source + metadata of ONE anchor by `id`
             or `name`, incl. `:body`/`:param`/`:return` sub-nodes.
-      - [ ] secondary import-graph files auto-default to `outline` even when the call asks for
-            `full` on the primaries.
+      - [x] **secondary import-graph files auto-default to `outline` (done)** even when the call
+            asks for `full` on the primaries — they're labeled "(outline — imported context)" so
+            the agent knows to `read_node` if it needs a body. Inline caps tightened (4×100) so a
+            big retrieve isn't re-read every turn.
 - [x] **Surgical sub-node edits (done, v0).** Edit part of a function without re-emitting it,
       still type-checked. `set_body` (new verb) replaces just the `:body` block; `replace_node`
-      now takes a `target` to narrow onto a sub-node anchor — `body`, `return` (the return-type
-      text), or `param.N`. Wired in `ci-edit::action_to_op` (the `SetBody` op is un-stubbed in
-      `apply_structural`) + the MCP `apply_edits` schema/description. All ride the existing
-      blast-radius gate: verified on Rust (`set_body` commits clean / rejects a type error;
-      a `:return` edit that breaks typing is rejected) and on the ungated Python fallback.
-      - [ ] **Statement-level body edits** — `insert_in_body`/`replace_in_body`/`delete_in_body`
-            targeting ONE statement inside a block (needs statement addressing + an old/new-text
-            payload beyond `{path,action,name,value,target}`).
+      takes a `target` to narrow onto a sub-node anchor — `body`, `return`, or `param.N`; and
+      **`replace_text`** swaps an exact substring inside a symbol (`oldText`→`newText`, unique
+      within it) — the cheapest precise edit: no read, no body re-emit, and a not-found error now
+      echoes the node's text so the agent self-corrects. Wired in `ci-edit::action_to_op` +
+      the MCP `apply_edits` schema. All ride the blast-radius gate (verified on Rust + Python).
+      The agent-benchmark T4 win (rust −27% vs ts +25%) comes from `replace_text`.
+      - [ ] **Statement-level body edits** — `insert_in_body`/`delete_in_body` targeting ONE
+            statement inside a block (replace-in-body is already covered by `replace_text` +
+            `target:"body"`; insert/delete still need statement addressing).
       - [ ] **`add_parameter` / `set_return_type` where absent** — insert `-> T` / a new param
             when there's no existing anchor (needs the params-end insertion point; the
             anchor punctuation differs per language — TS `: T` vs Rust `-> T`).
-      - [ ] Leading-comment / docstring verbs.
+      - [x] **Comment / docstring edits (done).** Each symbol carries a `:doc` sub-node anchor —
+            the leading comment / JSDoc (TS), `///`/`/** */` doc comments (Rust), or the docstring
+            (Python). Edit it with the existing verbs: `replace_node target:"doc"` (rewrite),
+            `replace_text target:"doc"` (tweak), or `insert_before` (add where none exists). Safe
+            by construction (comment edits introduce no type errors, so the gate passes trivially).
+            Follow-up: Rust line-comment `:doc` ranges include the trailing newline (replacement
+            should include one); doc separated from the item by an attribute isn't captured yet.
 - [ ] **Config providers (JSON/YAML/TOML)** — tree-sitter providers for surgical key edits
       (package.json, compose, *.toml); no gate needed. Rides on the provider registry.
 - [x] **Tree-sitter fallback edit provider (done, v0 — Python).** `lang-fallback` crate: a
@@ -100,11 +109,32 @@ on a non-TS repo. Closing that is the next structural step.
       - [ ] Per-language **upgrade to the gated path** as each LSP/indexer lands (pyright + a
             SCIP-python indexer for Python; gopls + scip-go for Go) — swap the no-op gate for the
             real `GateEngine`, reaching capability parity with TS/Rust.
-- [ ] **Capability parity across languages.** Every new provider should reach the bar TS and
-      Rust now meet: `structure` + `import_graph` + skeletal `outline` + gated structural edits
-      (rename / replace_node / move). The seams (`LanguageProvider`, `GateEngine`, the per-crate
-      `outline`) make each language *wiring*, not core work — pick the language's LSP/indexer and
-      implement the trait. Don't ship a read-only language without a path to its edit gate.
+### Requirements for ANY new language provider (the capability checklist)
+
+This is the bar TS and Rust now meet — **every new provider should target all of it.** The seams
+(`LanguageProvider`, `GateEngine`, per-crate `outline`) make most of it *wiring*, not core work.
+Treat this as the definition-of-done when adding a language; don't ship a read-only language
+without a path to its edit gate.
+
+**Read**
+- [ ] `structure()` — symbols (fns / methods / types / fields) AND their **sub-node anchors**:
+      `:param.N`, `:return`, `:body`, **`:doc`** (leading comment / docstring). Field/variable
+      ranges must span the full declaration, not just the name.
+- [ ] `import_graph()` — the language's real dependency edges (imports / `mod` / `use` / `from`).
+- [ ] `outline()` — skeletal context: fold function/method bodies, keep signatures + structure.
+
+**Write** (all atomic + through the blast-radius gate)
+- [ ] Structural: `rename`, `replace_node`, `move_file` (+ create / delete / insert_before).
+- [ ] Surgical sub-node: `set_body`, `replace_node target:body|return|param.N|doc`, `replace_text`.
+- [ ] **Gate:** a real `GateEngine` (LSP/indexer) so edits are type-checked; until one exists, the
+      tree-sitter fallback path applies them **ungated** and the result says `gated: false`.
+
+**Dispatch**
+- [ ] Manifest/extension detection in `build_provider`/`select_provider` (+ `CI_LANG` override);
+      a `.ext → outline` arm in the MCP `outline_for`.
+
+Per-language status: **TS ✅ · Rust ✅ · Python** (read + outline + ungated edits ✅; gated path
+pending — pyright/scip-python) · **Go/Ruby/…** (fallback is a data addition to `FbLang`).
 
 ## Languages
 
