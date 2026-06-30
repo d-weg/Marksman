@@ -26,6 +26,7 @@ CI_TOOLS = ",".join([
     "mcp__codeindex__retrieve_context",
     "mcp__codeindex__describe_architecture",
     "mcp__codeindex__list_anchors",
+    "mcp__codeindex__read_node",
     "mcp__codeindex__apply_edits",
 ])
 
@@ -80,16 +81,24 @@ def reset(repo, base):
 # tool. The baseline gets no such nudge; it uses its standard tools.
 PREAMBLE = (
     "You have codeindex MCP tools: retrieve_context (find relevant code for a task), "
-    "list_anchors (a file's symbols/anchors), apply_edits (structural edits — rename / "
-    "replace_node / move_file — type-checked before they land). Prefer them over grepping "
-    "and hand-editing.\n\nTask: "
+    "list_anchors (a file's symbols/anchors), read_node (the full source + metadata of ONE "
+    "symbol/anchor — use instead of a separate Read), apply_edits (structural edits — rename / "
+    "replace_node / move_file, plus surgical edits: replace_text to swap an exact substring you "
+    "already know, or set_body / replace_node target:body|return|param.N — all type-checked "
+    "before they land). Prefer them over grepping and hand-editing.\n\nTask: "
 )
 
 
-def run_agent(repo, prompt, mcp_config, model):
+def run_agent(repo, prompt, mcp_config, model, transcript=None):
     full = (PREAMBLE + prompt) if mcp_config else prompt
-    cmd = [CLAUDE, "-p", full, "--output-format", "json", "--model", model,
+    # When capturing a transcript, stream every message (tool_use / tool_result) so we can see
+    # exactly which tools the agent called and how big each response was. Otherwise the compact
+    # `json` result is all we need for the token table.
+    fmt = "stream-json" if transcript else "json"
+    cmd = [CLAUDE, "-p", full, "--output-format", fmt, "--model", model,
            "--max-turns", "40", "--dangerously-skip-permissions"]
+    if transcript:
+        cmd += ["--verbose"]
     tools = BASE_TOOLS + ("," + CI_TOOLS if mcp_config else "")
     if mcp_config:
         cmd += ["--mcp-config", mcp_config]
@@ -99,7 +108,12 @@ def run_agent(repo, prompt, mcp_config, model):
     r = sh(cmd, cwd=repo)
     dur = time.time() - t
     try:
-        out = json.loads(r.stdout)
+        if transcript:
+            pathlib.Path(transcript).write_text(r.stdout)
+            out = next((o for line in reversed(r.stdout.splitlines())
+                        if (o := json.loads(line)) and o.get("type") == "result"), {})
+        else:
+            out = json.loads(r.stdout)
         u = out.get("usage", {})
         intok = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
                  + u.get("cache_creation_input_tokens", 0))
@@ -107,6 +121,35 @@ def run_agent(repo, prompt, mcp_config, model):
                 "turns": out.get("num_turns", 0), "cost": out.get("total_cost_usd", 0.0), "dur": dur}
     except Exception:
         return {"in": 0, "out": 0, "turns": 0, "cost": 0.0, "dur": dur, "err": (r.stderr or r.stdout)[:200]}
+
+
+def summarize_transcript(path):
+    """Print the agent's tool calls (name + response size) from a saved stream-json transcript —
+    so we can see WHERE the tokens went (e.g. a big retrieve_context response re-read each turn)."""
+    try:
+        lines = pathlib.Path(path).read_text().splitlines()
+    except Exception as e:
+        print(f"  (no transcript: {e})"); return
+    print(f"  tool calls in {os.path.basename(path)}:")
+    names = {}  # tool_use_id -> name
+    for line in lines:
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        msg = o.get("message", o)
+        for block in (msg.get("content") or []) if isinstance(msg.get("content"), list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                names[block.get("id")] = block.get("name", "?")
+                inp = json.dumps(block.get("input", {}))
+                print(f"    → {block.get('name'):42} in={len(inp):6d}ch")
+            elif block.get("type") == "tool_result":
+                c = block.get("content")
+                txt = c if isinstance(c, str) else json.dumps(c)
+                nm = names.get(block.get("tool_use_id"), "result")
+                print(f"      ← {nm:40} resp={len(txt):6d}ch (~{len(txt)//4} tok)")
 
 
 def check(repo, cmd):
@@ -142,6 +185,7 @@ def main():
     ap.add_argument("--arms", default="baseline,rust,ts")
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
                     help="cost lever: claude-haiku-4-5 (cheapest) · claude-sonnet-4-6 (default) · claude-opus-4-8")
+    ap.add_argument("--save-transcript", help="dir to dump per-run stream-json transcripts + a tool-usage summary (to see where tokens go)")
     args = ap.parse_args()
     repo = os.path.abspath(args.repo)
     arms = [a for a in args.arms.split(",") if a in ARMS]
@@ -158,12 +202,19 @@ def main():
         if args.task and task["id"] != args.task:
             continue
         agg = {a: [] for a in arms}
-        for _ in range(args.runs):
+        for ri in range(args.runs):
             for arm in arms:
                 reset(repo, base)
-                m = run_agent(repo, task["prompt"], ARMS[arm], args.model)
+                tx = None
+                if args.save_transcript:
+                    os.makedirs(args.save_transcript, exist_ok=True)
+                    tx = os.path.join(args.save_transcript, f"{task['id']}.{arm}.run{ri}.jsonl")
+                m = run_agent(repo, task["prompt"], ARMS[arm], args.model, transcript=tx)
                 m["ok"] = check(repo, task["check"])
                 agg[arm].append(m)
+                if tx:
+                    print(f"[{task['id']} {arm} run{ri}] in={m['in']} out={m['out']} turns={m['turns']} ok={m['ok']}")
+                    summarize_transcript(tx)
         reset(repo, base)
         rows.append((task["id"], agg))
 
@@ -171,28 +222,32 @@ def main():
     # `sec` = median wall-clock for the whole agent run (turns x model+tool latency). It's the
     # time a user actually waits, and rewards a fast tool (e.g. ts-morph ~1s vs a cold LSP);
     # noisier than tokens since it rides on live API latency, so read it alongside turns.
-    print("\n| task | arm | in_tok | out_tok | turns | sec | ok |")
-    print("|---|---|--:|--:|--:|--:|:--:|")
-    tot = {a: {"in": 0, "out": 0, "sec": 0, "pass": 0, "n": 0} for a in arms}
+    # `$` = Claude Code's reported total_cost_usd — the TRUE economic score. It bakes in prompt
+    # caching (re-sent context bills at ~10% as cache reads) and output's higher per-token price,
+    # so it can diverge from `in_tok`: a many-turn run looks token-heavy yet its re-reads are
+    # cheap, while fewer turns mean less (pricey) output. Read `$` as the real headline.
+    print("\n| task | arm | in_tok | out_tok | turns | sec | $ | ok |")
+    print("|---|---|--:|--:|--:|--:|--:|:--:|")
+    tot = {a: {"in": 0, "out": 0, "sec": 0, "cost": 0, "pass": 0, "n": 0} for a in arms}
     for tid, agg in rows:
         for arm in arms:
             xs = agg[arm]
             ok = sum(1 for x in xs if x["ok"])
-            print(f"| {tid} | {arm} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {med(xs,'dur'):.0f} | {ok}/{len(xs)} |")
+            print(f"| {tid} | {arm} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {med(xs,'dur'):.0f} | {med(xs,'cost'):.4f} | {ok}/{len(xs)} |")
             tot[arm]["in"] += med(xs, "in"); tot[arm]["out"] += med(xs, "out")
-            tot[arm]["sec"] += med(xs, "dur")
+            tot[arm]["sec"] += med(xs, "dur"); tot[arm]["cost"] += med(xs, "cost")
             tot[arm]["pass"] += ok; tot[arm]["n"] += len(xs)
 
     pct = lambda a, b: f"{(b-a)/a*100:+.0f}%" if a else "n/a"
     bl = tot.get("baseline")
     print("\n## Totals (median per task, summed)\n")
-    print("| arm | input tok | output tok | sec | vs baseline (in/out/sec) | success |")
-    print("|---|--:|--:|--:|---|--:|")
+    print("| arm | input tok | output tok | sec | $ cost | vs baseline (in/out/sec/$) | success |")
+    print("|---|--:|--:|--:|--:|---|--:|")
     for arm in arms:
         t = tot[arm]
         vs = "—" if (arm == "baseline" or not bl) else \
-            f"{pct(bl['in'],t['in'])} / {pct(bl['out'],t['out'])} / {pct(bl['sec'],t['sec'])}"
-        print(f"| {arm} | {t['in']:.0f} | {t['out']:.0f} | {t['sec']:.0f} | {vs} | {t['pass']}/{t['n']} |")
+            f"{pct(bl['in'],t['in'])} / {pct(bl['out'],t['out'])} / {pct(bl['sec'],t['sec'])} / {pct(bl['cost'],t['cost'])}"
+        print(f"| {arm} | {t['in']:.0f} | {t['out']:.0f} | {t['sec']:.0f} | {t['cost']:.4f} | {vs} | {t['pass']}/{t['n']} |")
 
     spent = sum(x["cost"] for _, agg in rows for arm in arms for x in agg[arm])
     print(f"\n_actual spend this run: ${spent:.2f} ({args.model})_")

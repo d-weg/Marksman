@@ -16,5 +16,11 @@
     "prompt": "In the BM25 class, change the default value of the k1 field from 1.5 to 1.2. Change nothing else.",
     "check": "grep -Eq 'k1\\s*=\\s*1\\.2' src/bm25.ts && npm run -s typecheck",
     "why": "Locate-then-edit a small change — measures the find cost (retrieval vs grep)."
+  },
+  {
+    "id": "T4-body-edit",
+    "prompt": "In the tokenize function (src/bm25.ts), raise the minimum token length so it keeps only tokens LONGER THAN 2 characters instead of longer than 1. There are two length checks inside the function body — `lower.length > 1` and `lp.length > 1` — change both to `> 2`. Change nothing else and keep it compiling.",
+    "check": "grep -Eq 'lower\\.length > 2' src/bm25.ts && grep -Eq 'lp\\.length > 2' src/bm25.ts && ! grep -Eq 'lower\\.length > 1' src/bm25.ts && ! grep -Eq 'lp\\.length > 1' src/bm25.ts && grep -Eq 'parts\\.length > 1' src/bm25.ts && npm run -s typecheck",
+    "why": "Edit confined to ONE function body (two spots) — exercises surgical sub-node edits (set_body / replace_node target:body) vs re-emitting the whole function."
   }
 ]
