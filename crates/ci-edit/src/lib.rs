@@ -140,6 +140,7 @@ pub fn action_to_op(
         Ok(match a.target.as_deref() {
             Some("body") => format!("{base}:body"),
             Some("return") | Some("returnType") => format!("{base}:return"),
+            Some("doc") | Some("comment") | Some("docstring") => format!("{base}:doc"),
             Some(t) if t.starts_with("param.") => format!("{base}:{t}"),
             _ => base,
         })
@@ -581,6 +582,7 @@ mod tests {
         assert_eq!(id(act("replace_node", Some("body")).unwrap()), "a.ts#add:body");
         assert_eq!(id(act("replace_node", Some("return")).unwrap()), "a.ts#add:return");
         assert_eq!(id(act("replace_node", Some("param.1")).unwrap()), "a.ts#add:param.1");
+        assert_eq!(id(act("replace_node", Some("doc")).unwrap()), "a.ts#add:doc");
         // an unknown / symbol-kind target leaves the whole-symbol id intact.
         assert_eq!(id(act("replace_node", Some("function")).unwrap()), "a.ts#add");
         assert_eq!(id(act("replace_node", None).unwrap()), "a.ts#add");

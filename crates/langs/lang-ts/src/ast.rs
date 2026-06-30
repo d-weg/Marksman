@@ -77,6 +77,17 @@ fn subnodes(root: &TsNode, content: &str, bytes: &[u8], sym: &Node) -> Option<Ve
     }
 
     let mut children = Vec::new();
+    // Leading comment / JSDoc — the `:doc` anchor, editable like any other sub-node.
+    if let Some(r) = doc_comment_range(decl) {
+        children.push(Node {
+            id: format!("{}:doc", sym.id),
+            name: None,
+            kind: NodeKind::Syntax("doc".into()),
+            range: r,
+            name_range: None,
+            children: vec![],
+        });
+    }
     if let Some(params) = decl.child_by_field_name("parameters") {
         let mut cursor = params.walk();
         for (i, p) in params.named_children(&mut cursor).enumerate() {
@@ -95,6 +106,36 @@ fn subnodes(root: &TsNode, content: &str, bytes: &[u8], sym: &Node) -> Option<Ve
     } else {
         Some(children)
     }
+}
+
+/// Range of the leading comment immediately above a declaration (JSDoc `/** */` or `//`), if any.
+/// The comment is a sibling of the STATEMENT-level node (the decl, or its `export` wrapper), so
+/// climb to that node first, then take the previous sibling. Spans a contiguous run of comment
+/// lines so a multi-line `//` block is captured whole (a JSDoc `/** */` is a single comment node).
+fn doc_comment_range(decl: TsNode) -> Option<Range> {
+    let mut stmt = decl;
+    while let Some(p) = stmt.parent() {
+        if matches!(p.kind(), "program" | "class_body" | "statement_block" | "module" | "interface_body") {
+            break;
+        }
+        stmt = p;
+    }
+    let last = stmt.prev_sibling().filter(|n| n.kind() == "comment")?;
+    let mut first = last;
+    while let Some(prev) = first.prev_sibling() {
+        if prev.kind() == "comment" {
+            first = prev;
+        } else {
+            break;
+        }
+    }
+    let (s, e) = (first.start_position(), last.end_position());
+    Some(Range {
+        start_line: s.row as u32 + 1,
+        start_char: s.column as u32,
+        end_line: e.row as u32 + 1,
+        end_char: e.column as u32,
+    })
 }
 
 /// Climb to the nearest ancestor (or self) that has parameter/body fields — the
@@ -232,5 +273,22 @@ mod tests {
         };
         let k1 = deepen(content, vec![field]).pop().unwrap();
         assert!(k1.range.end_char > 4, "field range widened past the name `k1`: {:?}", k1.range);
+    }
+
+    #[test]
+    fn leading_comment_becomes_doc_anchor() {
+        let content = "/** Adds two numbers. */\nexport function add(a: number): number {\n  return a;\n}\n";
+        let scip = vec![Node {
+            id: "m.ts#add".into(),
+            name: Some("add".into()),
+            kind: NodeKind::Symbol(SymbolKind::Function),
+            range: Range { start_line: 2, start_char: 0, end_line: 4, end_char: 1 },
+            name_range: Some(Range { start_line: 2, start_char: 16, end_line: 2, end_char: 19 }),
+            children: vec![],
+        }];
+        let add = deepen(content, scip).pop().unwrap();
+        let doc = add.children.iter().find(|c| c.id == "m.ts#add:doc").expect("doc anchor");
+        assert_eq!(doc.range.start_line, 1, "JSDoc on line 1: {:?}", doc.range);
+        assert_eq!(doc.range.end_line, 1);
     }
 }

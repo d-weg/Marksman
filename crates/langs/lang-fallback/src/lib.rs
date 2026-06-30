@@ -314,8 +314,25 @@ fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
         n.children.push(syntax(&format!("{}:return", n.id), None, "returnType", &rt));
     }
     if let Some(body) = item.child_by_field_name("body") {
+        // Docstring = the first statement when it's a bare string literal — the `:doc` anchor.
+        if let Some(ds) = python_docstring(&body) {
+            n.children.push(syntax(&format!("{}:doc", n.id), None, "doc", &ds));
+        }
         n.children.push(syntax(&format!("{}:body", n.id), None, "body", &body));
     }
+}
+
+/// The docstring node of a function/class body: its first statement, if that statement is a bare
+/// string expression (`"""…"""` / `'…'`).
+fn python_docstring<'a>(body: &TsNode<'a>) -> Option<TsNode<'a>> {
+    let first = body.named_child(0)?;
+    if first.kind() == "expression_statement" {
+        let s = first.named_child(0)?;
+        if s.kind() == "string" {
+            return Some(s);
+        }
+    }
+    None
 }
 
 fn syntax(id: &str, name: Option<String>, kind: &str, n: &TsNode) -> Node {
@@ -568,6 +585,17 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"body") && kinds.contains(&"returnType"), "sub-nodes: {kinds:?}");
         assert!(total.children.iter().all(|c| c.name.as_deref() != Some("self")), "self dropped");
+    }
+
+    #[test]
+    fn python_docstring_becomes_doc_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("m.py"), "def f(x):\n    \"\"\"Return x.\"\"\"\n    return x\n").unwrap();
+        let p = FallbackProvider::new(root, FbLang::Python);
+        let nodes = p.structure(Path::new("m.py")).unwrap();
+        let f = nodes.iter().find(|n| n.id == "m.py#f").unwrap();
+        assert!(f.children.iter().any(|c| c.id == "m.py#f:doc"), "doc anchor: {:?}", f.children);
     }
 
     #[test]

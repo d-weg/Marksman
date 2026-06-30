@@ -192,17 +192,53 @@ fn push(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind, out: &mut V
     }
 }
 
-/// Build a declaration `Node` from an item with a `name` field.
+/// Build a declaration `Node` from an item with a `name` field. Attaches a `:doc` sub-node for
+/// the item's leading doc comments (`///` / `//!` / `/** */`) so they're editable like any anchor.
 fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Option<Node> {
     let name_node = item.child_by_field_name("name")?;
     let name = name_node.utf8_text(bytes).ok()?.to_string();
+    let id = format!("{prefix}{name}");
+    let mut children = Vec::new();
+    if let Some(r) = doc_range(item) {
+        children.push(Node {
+            id: format!("{id}:doc"),
+            name: None,
+            kind: NodeKind::Syntax("doc".to_string()),
+            range: r,
+            name_range: None,
+            children: vec![],
+        });
+    }
     Some(Node {
-        id: format!("{prefix}{name}"),
+        id,
         name: Some(name),
         kind: NodeKind::Symbol(kind),
         range: ts_range(item),
         name_range: Some(ts_range(&name_node)),
-        children: vec![],
+        children,
+    })
+}
+
+/// Range spanning the contiguous leading comment lines directly above `item` (Rust doc comments
+/// `///` / `//!` are `line_comment`s; `/** */` is a `block_comment`). v0 stops at a non-comment
+/// sibling, so a doc comment separated from the item by an attribute isn't captured yet.
+fn doc_range(item: &TsNode) -> Option<Range> {
+    let is_comment = |n: &TsNode| matches!(n.kind(), "line_comment" | "block_comment");
+    let last = item.prev_sibling().filter(is_comment)?;
+    let mut first = last;
+    while let Some(prev) = first.prev_sibling() {
+        if is_comment(&prev) {
+            first = prev;
+        } else {
+            break;
+        }
+    }
+    let (s, e) = (first.start_position(), last.end_position());
+    Some(Range {
+        start_line: s.row as u32 + 1,
+        start_char: s.column as u32,
+        end_line: e.row as u32 + 1,
+        end_char: e.column as u32,
     })
 }
 
@@ -369,6 +405,19 @@ mod tests {
             })
             .collect();
         assert!(kinds.contains(&"body") && kinds.contains(&"returnType"), "sub-nodes: {kinds:?}");
+    }
+
+    #[test]
+    fn doc_comment_becomes_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "/// Adds two ints.\n/// Second line.\npub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+        let p = RustProvider::new(root);
+        let nodes = p.structure(Path::new("a.rs")).unwrap();
+        let add = nodes.iter().find(|n| n.id == "a.rs#add").unwrap();
+        let doc = add.children.iter().find(|c| c.id == "a.rs#add:doc").expect("doc anchor");
+        assert_eq!(doc.range.start_line, 1, "doc starts at the first /// line: {:?}", doc.range);
+        assert!(doc.range.end_line >= 2, "doc spans both /// lines: {:?}", doc.range);
     }
 
     fn tiny_crate() -> tempfile::TempDir {
