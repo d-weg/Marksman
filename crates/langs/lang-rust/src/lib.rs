@@ -24,7 +24,7 @@ pub struct RustProvider {
     root: PathBuf,
     engine: WarmEngine,
     /// Use the cached `rust-analyzer scip` graph (compiler-accurate `use` edges) over the
-    /// tree-sitter `mod` graph. Set by the caller from `Config::rust_scip_enabled()`.
+    /// tree-sitter `mod` graph. Set by the caller from `Config::scip_enabled("rust")`.
     use_scip: bool,
 }
 

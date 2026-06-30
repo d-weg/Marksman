@@ -125,7 +125,7 @@ fn build_provider(root: &Path) -> Result<AnyProvider, String> {
 }
 
 fn rust(root: &Path) -> AnyProvider {
-    let use_scip = Config::load(root).unwrap_or_default().rust_scip_enabled();
+    let use_scip = Config::load(root).unwrap_or_default().scip_enabled("rust");
     eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
     AnyProvider::Rust(RustProvider::new(root).with_scip(use_scip))
 }

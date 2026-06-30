@@ -71,7 +71,7 @@ fn select_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider
     match lang {
         "rust" => {
             eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
-            Box::new(RustProvider::new(root).with_scip(config.rust_scip_enabled()))
+            Box::new(RustProvider::new(root).with_scip(config.scip_enabled("rust")))
         }
         "python" => {
             eprintln!("[codeindex-rs] language: python (tree-sitter fallback, in-process — ungated edits)");
@@ -114,8 +114,8 @@ fn cmd_index(root: &Path) {
     // Opt-in (`rustScip` config / `CI_RUST_SCIP` env): generate the compiler-accurate Rust `use`
     // graph BEFORE indexing so it's the one persisted (import_graph reads the cache). Slow
     // (≈ cargo check); off by default.
-    if config.rust_scip_enabled() && choose_lang(root) == "rust" {
-        eprintln!("[codeindex-rs] rustScip enabled: generating rust-analyzer scip graph (one-time, ~cargo check) …");
+    if config.scip_enabled("rust") && choose_lang(root) == "rust" {
+        eprintln!("[codeindex-rs] scip[rust] enabled: generating rust-analyzer scip graph (one-time, ~cargo check) …");
         if let Err(e) = lang_rust::refresh_scip(root) {
             eprintln!("[codeindex-rs] scip graph unavailable ({e}); using the tree-sitter mod graph");
         }

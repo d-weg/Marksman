@@ -48,11 +48,13 @@ pub struct Config {
     pub query_layer_weighting: QueryLayerWeighting,
     #[serde(default)]
     pub package_weights: BTreeMap<String, f32>,
-    /// Build the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges)
-    /// instead of the `mod`-only tree-sitter graph. Costs ≈ a `cargo check` at index time, so it's
-    /// off by default. User key: `rustScip`. The `CI_RUST_SCIP` env var overrides it (force on/off).
+    /// Per-language toggle for the SCIP-backed graph: `{ "scip": { "rust": true } }`. Where SCIP is
+    /// *optional* this turns it on — today that's Rust (`rust-analyzer scip` `use` edges vs the
+    /// `mod`-only tree-sitter graph), which costs ≈ a `cargo check` at index time, so it's off by
+    /// default. (TS always uses SCIP; other languages are future hooks.) `CI_SCIP_<LANG>` (e.g.
+    /// `CI_SCIP_RUST`) overrides a language per-run.
     #[serde(default)]
-    pub rust_scip: bool,
+    pub scip: BTreeMap<String, bool>,
 }
 
 impl Default for Config {
@@ -80,7 +82,7 @@ impl Default for Config {
             query_embed_prefix: "Represent this sentence for searching relevant code: ".into(),
             query_layer_weighting: QueryLayerWeighting::default(),
             package_weights: BTreeMap::new(),
-            rust_scip: false,
+            scip: BTreeMap::new(),
         }
     }
 }
@@ -101,13 +103,20 @@ impl Config {
         Ok(Config::default())
     }
 
-    /// Whether to use the `rust-analyzer scip` graph: the `rustScip` config setting, overridden by
-    /// the `CI_RUST_SCIP` env var when present (`0`/`false`/empty = off, anything else = on).
-    pub fn rust_scip_enabled(&self) -> bool {
-        match std::env::var("CI_RUST_SCIP") {
-            Ok(v) => !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"),
-            Err(_) => self.rust_scip,
+    /// Whether SCIP is enabled for `lang`: the `scip.<lang>` config setting, overridden by the
+    /// `CI_SCIP_<LANG>` env var when present (`0`/`false`/empty = off, anything else = on). The
+    /// legacy `CI_RUST_SCIP` is still honored for `rust`.
+    pub fn scip_enabled(&self, lang: &str) -> bool {
+        let on = |v: String| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false");
+        if let Ok(v) = std::env::var(format!("CI_SCIP_{}", lang.to_uppercase())) {
+            return on(v);
         }
+        if lang == "rust" {
+            if let Ok(v) = std::env::var("CI_RUST_SCIP") {
+                return on(v);
+            }
+        }
+        self.scip.get(lang).copied().unwrap_or(false)
     }
 }
 
@@ -137,13 +146,15 @@ mod tests {
     }
 
     #[test]
-    fn rust_scip_parses_from_camelcase_key() {
-        let over: serde_json::Value = serde_json::from_str(r#"{ "rustScip": true }"#).unwrap();
+    fn scip_map_parses_and_resolves_per_language() {
+        let over: serde_json::Value = serde_json::from_str(r#"{ "scip": { "rust": true } }"#).unwrap();
         let mut base = serde_json::to_value(Config::default()).unwrap();
         merge(&mut base, &over);
         let c: Config = serde_json::from_value(base).unwrap();
-        assert!(c.rust_scip, "rustScip → rust_scip");
-        assert!(!Config::default().rust_scip, "off by default");
+        assert_eq!(c.scip.get("rust"), Some(&true), "scip.rust parsed");
+        assert!(c.scip_enabled("rust"), "rust enabled via config");
+        assert!(!c.scip_enabled("go"), "unset language off");
+        assert!(Config::default().scip.is_empty(), "empty by default");
     }
 
     #[test]

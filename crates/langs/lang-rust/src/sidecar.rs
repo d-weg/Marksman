@@ -16,7 +16,7 @@ fn main() {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
 
-    let use_scip = ci_core::Config::load(&root).map(|c| c.rust_scip_enabled()).unwrap_or(false);
+    let use_scip = ci_core::Config::load(&root).map(|c| c.scip_enabled("rust")).unwrap_or(false);
     let provider = RustProvider::new(&root).with_scip(use_scip);
     if let Err(e) = ci_proto::serve_stdio(provider, outline) {
         eprintln!("[marksman-provider-rust] serve error: {e}");
