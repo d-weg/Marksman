@@ -119,15 +119,23 @@ step is `read_node id=…` / `apply_edits name=…` with no re-derivation.
       duplicated. Tests: exact→one handle, substring→all (docs excluded), cap truncates but total
       still counts every match.
 
-### Batch 5 — Ranking evaluation + multi-language retrieval weighting
+### Batch 5 — Ranking evaluation + multi-language retrieval weighting  ◐ (5a done)
 **Why:** retrieval weights (`rrf_k`, `symbol_match_bonus`, the layer boost) are hand-tuned with **no
 labeled eval** to catch a regression, and role/layer signals are **npm/tsconfig-centric** — a Rust
 or Python repo gets degraded weighting even once indexing is multi-language.
-- [ ] A labeled eval set (task → expected files/symbols) + a runner reporting manifest overlap +
-      rank; wire `scripts/agent-bench` as the harness. This becomes the gate for any weight change.
-- [ ] Role/layer fingerprints beyond npm: Cargo (`[dependencies]`, workspace members) and Python
-      (pyproject/requirements) so `infer_role` classifies non-TS packages.
-- [ ] Persisted package roles (deps-based `infer_role` at index time) for sharper query weighting.
+- [x] **5a — cross-language path/query vocabularies (done).** `segment_role` now classifies
+      Django/DRF + DDD dirs (`serializers`/`repositories`/`usecases`/`entities`/…) as backend, and
+      `default_layer_terms` fires on Rust/Python framework+ORM query terms (axum/sqlx/tokio/tonic,
+      django/flask/fastapi/sqlalchemy/celery/…). This is the **active** signal (path-role + query
+      layer boost already work cross-language), so Rust/Python repos now get real layer weighting.
+      Tested (path roles + layer firing across languages).
+- [ ] **5b — dep-based persisted roles.** Extract deps from `Cargo.toml`/`pyproject.toml`/
+      `package.json` at index time and persist each package's `infer_role` in `PackageMeta`, so the
+      static/package-role signal is real (not name/dir-only). Needs a `toml` parser + a
+      `detect_workspace` rework (today it only discovers `package.json`). **Decision: add `toml`.**
+- [ ] **5c — labeled eval harness.** A small hand-labeled set (task → expected files/symbols) run
+      against `retrieve`, reporting overlap@k + MRR — the gate for any future weight change (see the
+      Invariants) and the home for `scripts/agent-bench`. Seed it on Marksman's own repo.
 - [ ] (ref) the three-way + agent A/B benchmark design lives in [benchmarks.md](benchmarks.md).
 
 ### Batch 6 — Provider registry (multi-language repos)

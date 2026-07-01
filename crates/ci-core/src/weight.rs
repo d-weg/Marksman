@@ -133,7 +133,11 @@ fn segment_role(seg: &str) -> Option<PackageRole> {
         "server" | "backend" | "api" | "apis" | "routes" | "route" | "controllers"
         | "controller" | "services" | "service" | "db" | "database" | "migrations"
         | "migration" | "prisma" | "drizzle" | "worker" | "workers" | "jobs" | "queue"
-        | "lambda" | "functions" | "handlers" | "middleware" => PackageRole::Backend,
+        | "lambda" | "functions" | "handlers" | "middleware"
+        // cross-language backend conventions (Django/DRF, DDD/hexagonal, Rust):
+        | "serializers" | "repositories" | "repository" | "usecases" | "dao" | "entities" => {
+            PackageRole::Backend
+        }
         "web" | "www" | "frontend" | "client" | "pages" | "dashboard" | "admin" | "site" => {
             PackageRole::Frontend
         }
@@ -172,6 +176,10 @@ fn default_layer_terms(role: PackageRole) -> &'static [&'static str] {
             "storage", "upload", "cdn", "webhook", "cron", "queue", "worker", "middleware",
             "auth", "token", "credit", "billing", "payment", "deduct", "balance", "ledger",
             "invoice", "server",
+            // cross-language backend frameworks / ORMs (fire when a task names them):
+            "axum", "actix", "tokio", "sqlx", "diesel", "tonic", "grpc", "django", "flask",
+            "fastapi", "sqlalchemy", "alembic", "celery", "pydantic", "orm", "repository",
+            "usecase", "serializer", "gorm",
         ],
         PackageRole::Frontend => &[
             "page", "css", "dom", "browser", "spa", "ssr", "hydrate", "vite", "webpack",
@@ -355,6 +363,24 @@ mod tests {
         let m = layer_multipliers(&q, &Config::default());
         assert!(m["backend"] > 1.0, "backend should be boosted: {m:?}");
         assert_eq!(m["mobile"], 1.0, "mobile untouched by a backend query");
+    }
+
+    #[test]
+    fn path_roles_cover_python_and_rust_conventions() {
+        // Django/DRF + DDD directories now classify as backend, not Unknown.
+        assert_eq!(infer_role_from_path("app/serializers/user.py"), PackageRole::Backend);
+        assert_eq!(infer_role_from_path("src/repositories/order_repo.rs"), PackageRole::Backend);
+        assert_eq!(infer_role_from_path("service/usecases/checkout.go"), PackageRole::Backend);
+    }
+
+    #[test]
+    fn layer_query_boosts_backend_across_languages() {
+        // A Rust (axum/sqlx) and a Python (django/sqlalchemy) query both fire the backend layer.
+        for q in ["add an axum route backed by sqlx", "a django model with a sqlalchemy query"] {
+            let toks: Vec<String> = q.split_whitespace().map(str::to_string).collect();
+            let m = layer_multipliers(&toks, &Config::default());
+            assert!(m["backend"] > 1.0, "backend should be boosted for {q:?}: {m:?}");
+        }
     }
 
     #[test]
