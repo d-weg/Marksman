@@ -4,7 +4,7 @@
 //! an [`IndexData`]. The embedder is injected so this crate stays free of the model
 //! and is unit-testable with a trivial stand-in (mirrors how ci-retrieve injects the
 //! query vector).
-use ci_core::{Config, LanguageProvider, Result, SymbolKind};
+use ci_core::{Config, Result, SymbolKind};
 use ci_index::{
     build_graph, tokenize, Adjacency, Bm25, ChunkMeta, FileRecord, IndexData, IndexMeta,
     PackageMeta, SymbolEntry,
@@ -13,6 +13,9 @@ use ci_walk::{detect_workspace, discover, Lang};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+mod registry;
+pub use registry::{build_registry, ProviderRegistry};
 
 struct Item {
     sym: SymbolEntry,
@@ -126,7 +129,7 @@ fn doc_items(rel: &str, content: &str) -> Vec<Item> {
 pub fn build_index(
     root: &Path,
     config: &Config,
-    provider: &dyn LanguageProvider,
+    registry: &ProviderRegistry,
     embed: impl Fn(&str) -> Vec<f32>,
 ) -> Result<IndexData> {
     let files = discover(root, config)?;
@@ -139,7 +142,10 @@ pub fn build_index(
         let rel = f.rel.to_string_lossy().replace('\\', "/");
         let abs = root.join(&f.rel);
 
+        // Per-file provider dispatch: a mixed repo indexes each file with its own language's
+        // provider (skip a code file whose language has no active provider).
         if f.lang.is_code() {
+            let Some(provider) = registry.provider_for(&f.rel) else { continue };
             let pkg = ws.package_for(&f.rel).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
             let content = std::fs::read_to_string(&abs).unwrap_or_default();
             for node in provider.structure(&f.rel)? {
@@ -167,8 +173,10 @@ pub fn build_index(
         bm25.add_doc(&i.chunk.id, &i.chunk.file, &tokenize(&i.text));
     }
 
-    // Import graph (provider-derived) -> string adjacency.
-    let forward = forward_adjacency(provider)?;
+    // Import graph: the UNION of each active provider's graph. Import edges are within-language
+    // and each provider scopes its graph to its own files, so the file keys are disjoint across
+    // languages — a plain union, no cross-language merge.
+    let forward = forward_adjacency(registry)?;
 
     let meta = IndexMeta {
         version: ci_index::INDEX_VERSION,
@@ -196,7 +204,7 @@ pub fn build_index(
 /// graph from the (already-refreshed) provider. Deleted files are dropped.
 pub fn update_index(
     root: &Path,
-    provider: &dyn LanguageProvider,
+    registry: &ProviderRegistry,
     embed: impl Fn(&str) -> Vec<f32>,
     mut data: IndexData,
     changed: &[String],
@@ -226,6 +234,7 @@ pub fn update_index(
         }
         let lang = Lang::of(Path::new(rel));
         if lang.is_code() {
+            let Some(provider) = registry.provider_for(Path::new(rel)) else { continue };
             let pkg =
                 ws.package_for(Path::new(rel)).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
             let content = std::fs::read_to_string(&abs).unwrap_or_default();
@@ -251,8 +260,8 @@ pub fn update_index(
         data.bm25.add_doc(&item.chunk.id, &item.chunk.file, &tokenize(&item.text));
     }
 
-    // 4. Import graph: SCIP is whole-project, so take the fresh full graph.
-    let forward = forward_adjacency(provider)?;
+    // 4. Import graph: SCIP is whole-project, so take the fresh full union graph.
+    let forward = forward_adjacency(registry)?;
     let graph = build_graph(forward.clone());
 
     // 5. Meta: refresh/remove the changed files' records.
@@ -293,16 +302,21 @@ fn package_meta(p: &ci_walk::Package) -> PackageMeta {
     PackageMeta { name: p.name.clone(), dir, role }
 }
 
-/// The provider's import graph as string adjacency (repo-relative posix paths), dropping any
-/// file with no outgoing edges. Both the full build and the incremental refresh take the whole
-/// graph from the provider (SCIP is whole-project), so this is shared.
-fn forward_adjacency(provider: &dyn LanguageProvider) -> Result<Adjacency> {
+/// The UNION of every active provider's import graph, as string adjacency (repo-relative posix
+/// paths), dropping any file with no outgoing edges. Import edges are within-language and each
+/// provider scopes its graph to its own files, so keys are disjoint across languages — combining
+/// is a plain union. Both the full build and the incremental refresh take the whole graph from the
+/// providers (SCIP is whole-project), so this is shared.
+fn forward_adjacency(registry: &ProviderRegistry) -> Result<Adjacency> {
     let mut forward = Adjacency::new();
-    for (from, tos) in provider.import_graph()? {
-        let from_s = from.to_string_lossy().replace('\\', "/");
-        let tos_s: Vec<String> = tos.iter().map(|t| t.to_string_lossy().replace('\\', "/")).collect();
-        if !tos_s.is_empty() {
-            forward.insert(from_s, tos_s);
+    for provider in registry.providers() {
+        for (from, tos) in provider.import_graph()? {
+            let from_s = from.to_string_lossy().replace('\\', "/");
+            let tos_s: Vec<String> =
+                tos.iter().map(|t| t.to_string_lossy().replace('\\', "/")).collect();
+            if !tos_s.is_empty() {
+                forward.insert(from_s, tos_s);
+            }
         }
     }
     Ok(forward)
@@ -340,10 +354,11 @@ fn node_items(node: &ci_core::Node, rel: &str, pkg: &str, content: &str, out: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ci_core::{Granularity, ImportGraph, Node, NodeKind, Range};
+    use ci_core::{Granularity, ImportGraph, LanguageProvider, Node, NodeKind, Range};
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// A stand-in provider: structure per relative path + a fixed import graph.
     struct MockProvider {
@@ -407,7 +422,8 @@ mod tests {
         let provider = MockProvider { by_file, graph };
 
         let config = Config { index_docs: false, ..Default::default() };
-        let index = build_index(root, &config, &provider, toy_embed).unwrap();
+        let registry = ProviderRegistry::single(Arc::new(provider));
+        let index = build_index(root, &config, &registry, toy_embed).unwrap();
 
         // Two code symbols chunked; vectors row-aligned at dim 4.
         assert_eq!(index.chunks.len(), 2);
@@ -424,6 +440,51 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_per_file_and_unions_graphs() {
+        // A mixed TS+Rust repo: each file must be indexed by ITS language's provider, and the two
+        // providers' import graphs must combine into one (union) graph.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/app.ts"), "import { add } from './math.js';\nexport function main() {}\n").unwrap();
+        fs::write(root.join("src/math.ts"), "export function add() {}\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "mod util;\npub fn run() {}\n").unwrap();
+        fs::write(root.join("src/util.rs"), "pub fn helper() {}\n").unwrap();
+
+        // TS provider: only its files + its within-language graph (app.ts -> math.ts).
+        let mut ts_files = HashMap::new();
+        ts_files.insert("src/app.ts".into(), vec![sym_node("src/app.ts#main", "main", 2, 2)]);
+        ts_files.insert("src/math.ts".into(), vec![sym_node("src/math.ts#add", "add", 1, 1)]);
+        let mut ts_graph = ImportGraph::new();
+        ts_graph.insert(PathBuf::from("src/app.ts"), vec![PathBuf::from("src/math.ts")]);
+        let ts = MockProvider { by_file: ts_files, graph: ts_graph };
+
+        // Rust provider: only its files + its own graph (lib.rs -> util.rs).
+        let mut rs_files = HashMap::new();
+        rs_files.insert("src/lib.rs".into(), vec![sym_node("src/lib.rs#run", "run", 2, 2)]);
+        rs_files.insert("src/util.rs".into(), vec![sym_node("src/util.rs#helper", "helper", 1, 1)]);
+        let mut rs_graph = ImportGraph::new();
+        rs_graph.insert(PathBuf::from("src/lib.rs"), vec![PathBuf::from("src/util.rs")]);
+        let rs = MockProvider { by_file: rs_files, graph: rs_graph };
+
+        let mut registry = ProviderRegistry::new();
+        registry.register(vec![Lang::Ts, Lang::Tsx], Arc::new(ts));
+        registry.register(vec![Lang::Rust], Arc::new(rs));
+
+        let config = Config { index_docs: false, include: vec!["**/*.ts".into(), "**/*.rs".into()], ..Default::default() };
+        let index = build_index(root, &config, &registry, toy_embed).unwrap();
+
+        // Every language's symbols are indexed into the one unified index.
+        let ids: Vec<&str> = index.chunks.iter().map(|c| c.id.as_str()).collect();
+        assert!(ids.contains(&"src/app.ts#main"), "TS symbol indexed");
+        assert!(ids.contains(&"src/util.rs#helper"), "Rust symbol indexed");
+
+        // The graph is the union of both providers' edges (disjoint file keys).
+        assert_eq!(index.graph.reverse.get("src/math.ts").unwrap(), &vec!["src/app.ts".to_string()]);
+        assert_eq!(index.graph.reverse.get("src/util.rs").unwrap(), &vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
     fn update_index_refreshes_only_changed_files() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -437,7 +498,8 @@ mod tests {
         let v1 = MockProvider { by_file, graph: ImportGraph::new() };
 
         let config = Config { index_docs: false, ..Default::default() };
-        let initial = build_index(root, &config, &v1, toy_embed).unwrap();
+        let r1 = ProviderRegistry::single(Arc::new(v1));
+        let initial = build_index(root, &config, &r1, toy_embed).unwrap();
         assert!(initial.bm25.search(&tokenize("alpha"), 5).iter().any(|(id, _)| id == "src/a.ts#alpha"));
 
         // Edit a.ts on disk + provider now reports the new structure.
@@ -447,7 +509,8 @@ mod tests {
         by_file2.insert("src/b.ts".into(), vec![sym_node("src/b.ts#bee", "bee", 1, 3)]);
         let v2 = MockProvider { by_file: by_file2, graph: ImportGraph::new() };
 
-        let updated = update_index(root, &v2, toy_embed, initial, &["src/a.ts".into()]).unwrap();
+        let r2 = ProviderRegistry::single(Arc::new(v2));
+        let updated = update_index(root, &r2, toy_embed, initial, &["src/a.ts".into()]).unwrap();
 
         // New symbol present, stale one gone, untouched file intact.
         assert!(updated.chunks.iter().any(|c| c.id == "src/a.ts#beta"));
@@ -474,7 +537,8 @@ mod tests {
         fs::write(root.join("svc/src/lib.rs"), "pub fn handler() {}\n").unwrap();
 
         let provider = MockProvider { by_file: HashMap::new(), graph: ImportGraph::new() };
-        let index = build_index(root, &config, &provider, toy_embed).unwrap();
+        let registry = ProviderRegistry::single(Arc::new(provider));
+        let index = build_index(root, &config, &registry, toy_embed).unwrap();
         let svc = index.meta.packages.iter().find(|p| p.name == "svc").expect("svc package");
         assert_eq!(svc.role.as_deref(), Some("backend"), "axum dep → backend role persisted");
     }
@@ -493,7 +557,8 @@ mod tests {
         let mut by_file = HashMap::new();
         by_file.insert("src/a.ts".into(), vec![sym_node("src/a.ts#alpha", "alpha", 1, 3)]);
         let v1 = MockProvider { by_file, graph: ImportGraph::new() };
-        let initial = build_index(root, &config, &v1, toy_embed).unwrap();
+        let r1 = ProviderRegistry::single(Arc::new(v1));
+        let initial = build_index(root, &config, &r1, toy_embed).unwrap();
         ci_index::save_index(root, &config, &initial).unwrap();
 
         // Edit a.ts on disk + provider reports the new structure; incrementally update, then persist.
@@ -501,7 +566,8 @@ mod tests {
         let mut by_file2 = HashMap::new();
         by_file2.insert("src/a.ts".into(), vec![sym_node("src/a.ts#beta", "beta", 1, 3)]);
         let v2 = MockProvider { by_file: by_file2, graph: ImportGraph::new() };
-        let updated = update_index(root, &v2, toy_embed, initial, &["src/a.ts".into()]).unwrap();
+        let r2 = ProviderRegistry::single(Arc::new(v2));
+        let updated = update_index(root, &r2, toy_embed, initial, &["src/a.ts".into()]).unwrap();
         ci_index::save_index(root, &config, &updated).unwrap();
 
         // Reload from disk — the edit is durable.

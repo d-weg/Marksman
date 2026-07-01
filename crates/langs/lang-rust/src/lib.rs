@@ -53,29 +53,6 @@ impl RustProvider {
         self
     }
 
-    /// Start rust-analyzer and load the cargo workspace NOW, on a background thread, so the
-    /// first `apply_edits` finds it warm instead of paying the cold `cargo metadata` + analysis
-    /// inline. No-op-safe if rust-analyzer can't start (apply_edits then surfaces the error).
-    pub fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let root = self.root.clone();
-        let warm = rust_files(&root)
-            .into_iter()
-            .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
-        std::thread::spawn(move || {
-            let Ok(mut guard) = slot.lock() else { return };
-            if guard.is_some() {
-                return;
-            }
-            if let Ok(mut client) = LspClient::start(&root, rust_analyzer_command()) {
-                if let Some((f, content)) = warm {
-                    let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
-                }
-                *guard = Some(client);
-            }
-        });
-    }
-
     /// Normalize a (possibly absolute) path to the repo-relative posix form.
     fn rel(&self, file: &Path) -> String {
         let p = if file.is_absolute() { file.strip_prefix(&self.root).unwrap_or(file) } else { file };
@@ -176,6 +153,29 @@ impl LanguageProvider for RustProvider {
             }
         }
         Ok(graph)
+    }
+
+    /// Start rust-analyzer and load the cargo workspace NOW, on a background thread, so the
+    /// first `apply_edits` finds it warm instead of paying the cold `cargo metadata` + analysis
+    /// inline. No-op-safe if rust-analyzer can't start (apply_edits then surfaces the error).
+    fn prewarm(&self) {
+        let slot = self.engine.clone();
+        let root = self.root.clone();
+        let warm = rust_files(&root)
+            .into_iter()
+            .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
+        std::thread::spawn(move || {
+            let Ok(mut guard) = slot.lock() else { return };
+            if guard.is_some() {
+                return;
+            }
+            if let Ok(mut client) = LspClient::start(&root, rust_analyzer_command()) {
+                if let Some((f, content)) = warm {
+                    let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
+                }
+                *guard = Some(client);
+            }
+        });
     }
 
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {

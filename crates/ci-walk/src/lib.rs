@@ -4,6 +4,6 @@ pub mod discover;
 pub mod lang;
 pub mod workspace;
 
-pub use discover::{discover, DiscoveredFile};
+pub use discover::{discover, present_langs, DiscoveredFile};
 pub use lang::Lang;
 pub use workspace::{detect_workspace, Package, Workspace};

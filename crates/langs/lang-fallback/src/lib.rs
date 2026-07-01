@@ -72,12 +72,6 @@ impl FallbackProvider {
         Self { root: root.to_path_buf(), lang }
     }
 
-    /// Fallback edits are never type-checked — there's no compiler/LSP behind them. The MCP
-    /// layer reports this as `gated: false` so the agent knows the edit is structural only.
-    pub fn gated(&self) -> bool {
-        false
-    }
-
     /// Skeletal outline: function/method bodies folded to `...` (valid, idiomatic Python),
     /// signatures and class structure intact. Best-effort: original on a parse failure.
     pub fn outline(&self, content: &str) -> String {
@@ -99,6 +93,12 @@ impl FallbackProvider {
 impl LanguageProvider for FallbackProvider {
     fn granularity(&self) -> Granularity {
         Granularity::Ast // tree-sitter sub-nodes (params / return / body)
+    }
+
+    /// Fallback edits are never type-checked — there's no compiler/LSP behind them. The MCP
+    /// layer reports this as `gated: false` so the agent knows the edit is structural only.
+    fn gated(&self) -> bool {
+        false
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {

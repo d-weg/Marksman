@@ -3,6 +3,7 @@
 //! Runs `scip-typescript` to index `--root`, then serves `TsProvider` over the [`ci_proto`]
 //! protobuf wire (the ts-morph / LSP gate runs inside this process, so `apply_edits` is served
 //! here too). Usage: `marksman-provider-ts --root /path/to/repo`.
+use ci_core::LanguageProvider; // brings `prewarm` (a trait method) into scope
 use lang_ts::{outline, TsProvider};
 use std::path::PathBuf;
 

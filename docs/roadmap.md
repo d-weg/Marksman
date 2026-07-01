@@ -25,9 +25,10 @@ smallest safe change, keep the suite green, one commit per batch, tick the boxes
 ## North star: pure-Rust core; languages as modular, on-demand providers
 The core runs on Rust alone; each language provider declares its own toolchain and **fetches it
 lazily, only when a file of that language is indexed**. A Rust-only repo never invokes Node; a repo
-with no TypeScript never fetches `scip-typescript`/`ts-morph`. `build_index` is already generic over
-`LanguageProvider` and Node is confined to `lang-ts` — the gap is that entry points still pick **one
-provider per repo** (Batch 6) and the embedder model isn't lazily fetched (Batch 3).
+with no TypeScript never fetches `scip-typescript`/`ts-morph`. `build_index` dispatches per file
+through an **extension → provider registry** (Batch 6), so a mixed repo indexes every language and
+Node is only touched when `.ts*` files are present; the remaining gap is that the embedder model
+isn't lazily fetched (Batch 3).
 
 **Chosen distribution model:** providers live in-repo under `crates/langs/`, each with a
 `marksman-provider-<lang>` bin; one `cargo build` produces them all, and `CI_PROVIDER=sidecar`
@@ -145,7 +146,7 @@ or Python repo gets degraded weighting even once indexing is multi-language.
       follow-up.)
 - [ ] (ref) the three-way + agent A/B benchmark design lives in [benchmarks.md](benchmarks.md).
 
-### Batch 6 — Provider registry (multi-language repos)  ← next
+### Batch 6 — Provider registry (multi-language repos)  ✅ done
 **Why:** indexing/editing still bind **one** provider per repo, so a mixed Rust+TS+Python repo can't
 be fully indexed, and tooling isn't fetched per-language.
 
@@ -157,15 +158,20 @@ network boundary, not a syntactic import, and no provider emits an edge for it),
 already scopes its graph to its own files — so combining graphs is a trivial **union**
 (`forward_adjacency` per provider, extend into one map), NOT a cross-language merge. The real work is
 per-file dispatch at index time.
-- [ ] `extension → provider` registry; `build_index` picks the provider by file extension (today it
-      loops every code file through one `provider.structure`) so a multi-language repo indexes fully;
-      Node touched only if `.ts*` are present.
-- [ ] Union the per-provider `import_graph()`s (each already scoped to its own files).
-- [ ] Lazy per-language tooling fetch, cached per provider; nothing fetched for absent languages
-      (mostly already true — each provider fetches its own tooling; the registry just gates which
-      providers activate).
-- [ ] Provider manifest: enable/disable a language, pin a tool version, point at a vendored binary
-      (offline/air-gapped).
+- [x] `extension → provider` registry (`ci_build::ProviderRegistry`); `build_index`/`update_index`
+      pick the provider per file by extension via `ci_walk::Lang::of`, so a mixed Rust+TS+Python repo
+      indexes fully. Retrieval was already language-blind, so it needed zero changes. The MCP output
+      tools (`list_anchors`/`read_node`/`apply_edits`) dispatch per file through the same registry.
+- [x] Union the per-provider `import_graph()`s in `forward_adjacency` (each provider scopes its graph
+      to its own files, so the file keys are disjoint across languages — a plain union, verified with
+      a mixed repo whose graph carries both the Rust `mod` edge and the Python `from`-import edge).
+- [x] Lazy per-language tooling fetch: `ci_build::build_registry` detects present languages
+      (`ci_walk::present_langs`) and only constructs a provider for each, so a repo with no `.ts*`
+      never runs `scip-typescript`/Node. `CI_LANG` still forces a single language.
+- [x] Provider manifest (`config.providers.<lang>`): `enabled` gates a language out of the registry
+      (verified — a repo can turn Python indexing off); `bin` points at a vendored sidecar binary
+      (highest-priority in `sidecar_command_with` — the offline/air-gapped path); `version` pins a
+      tool version. Env override `CI_PROVIDER_<LANG>_ENABLED`.
 
 ### Batch 7 — Deeper edits + structured non-code providers
 **Why:** extend surgical editing to single statements and to the config/data/docs files agents touch

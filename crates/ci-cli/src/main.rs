@@ -6,7 +6,7 @@
 //!
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
-use ci_build::build_index;
+use ci_build::{build_index, build_registry};
 use ci_core::{Config, LanguageProvider, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
@@ -17,6 +17,7 @@ use lang_rust::RustProvider;
 use lang_ts::TsProvider;
 use std::path::{Path, PathBuf};
 use std::process::exit;
+use std::sync::Arc;
 
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
@@ -42,67 +43,47 @@ fn die(msg: impl std::fmt::Display) -> ! {
     exit(1);
 }
 
-/// Pick the language provider from the repo's manifests (and adjust the file globs for it),
-/// so Node tooling is only invoked for a TypeScript repo. Override with `CI_LANG=rust|ts`.
-/// v0 = dominant-language pick; full multi-provider dispatch is on the roadmap.
-fn select_provider(root: &Path, config: &mut Config) -> Box<dyn LanguageProvider> {
-    let lang = choose_lang(root);
-    // The indexer's file globs for the chosen language.
-    match lang {
-        "rust" => {
-            config.include = vec!["**/*.rs".into()];
-            config.languages = vec!["rust".into()];
-            config.exclude.push("**/target/**".into());
-        }
-        "python" => {
-            config.include = vec!["**/*.py".into()];
-            config.languages = vec!["python".into()];
-        }
-        _ => {}
-    }
+/// Construct the provider for one language, honoring the manifest's vendored binary and
+/// `CI_PROVIDER=sidecar`. Returns `None` (and warns) when a language's tooling can't start, so a
+/// mixed-language index isn't sunk by one language failing. Called by [`build_registry`] once per
+/// active language — so Node's `scip-typescript` only runs when the repo actually has `.ts*`.
+fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn LanguageProvider>> {
     // `CI_PROVIDER=sidecar`: index over the protobuf wire via a `marksman-provider-<lang>` process.
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
-        if let Some(cmd) = ci_proto::sidecar_command(lang, root, false) {
+        if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
             eprintln!("[codeindex-rs] language: {lang} (sidecar process — protobuf wire)");
-            return Box::new(ProcessProvider::spawn(cmd).unwrap_or_else(|e| die(e)));
+            match ProcessProvider::spawn(cmd) {
+                Ok(p) => return Some(Arc::new(p)),
+                Err(e) => {
+                    eprintln!("[codeindex-rs] sidecar {lang} failed to start ({e}); skipping");
+                    return None;
+                }
+            }
         }
         eprintln!("[codeindex-rs] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
     }
     match lang {
         "rust" => {
             eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
-            Box::new(RustProvider::new(root).with_scip(config.scip_enabled("rust")))
+            Some(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
         "python" => {
             eprintln!("[codeindex-rs] language: python (tree-sitter fallback, in-process — ungated edits)");
-            Box::new(FallbackProvider::new(root, FbLang::Python))
+            Some(Arc::new(FallbackProvider::new(root, FbLang::Python)))
         }
-        _ => {
+        "ts" => {
             eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
-            Box::new(TsProvider::index(root).unwrap_or_else(|e| die(e)))
+            match TsProvider::index(root) {
+                Ok(p) => Some(Arc::new(p)),
+                Err(e) => {
+                    eprintln!("[codeindex-rs] typescript indexing failed ({e}); skipping TS files");
+                    None
+                }
+            }
         }
+        _ => None,
     }
 }
-
-/// The language to index `root` as: `CI_LANG` override, else manifest/extension detection.
-fn choose_lang(root: &Path) -> &'static str {
-    match std::env::var("CI_LANG").ok().as_deref() {
-        Some("rust") => return "rust",
-        Some("ts") | Some("typescript") => return "ts",
-        Some(other) if FbLang::from_name(other).is_some() => return "python",
-        _ => {}
-    }
-    if root.join("Cargo.toml").exists() && !root.join("package.json").exists() {
-        "rust"
-    } else if root.join("package.json").exists() || root.join("tsconfig.json").exists() {
-        "ts"
-    } else if FbLang::detect(root).is_some() {
-        "python"
-    } else {
-        "ts"
-    }
-}
-
 
 fn cmd_index(root: &Path) {
     let mut config = rust_config(root);
@@ -110,12 +91,18 @@ fn cmd_index(root: &Path) {
     let embedder = StaticEmbedder::load(&model_dir()).unwrap_or_else(|e| die(e));
     let dim = embedder.dim();
 
-    let provider = select_provider(root, &mut config);
+    // Extension → provider registry: dispatch each file to its language's provider (a mixed
+    // Rust+TS+Python repo indexes fully). `cfg` is a snapshot for the constructors — build_registry
+    // only rewrites include/exclude, which they don't read.
+    let cfg = config.clone();
+    let registry = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg))
+        .unwrap_or_else(|e| die(e));
 
     // Opt-in (`rustScip` config / `CI_RUST_SCIP` env): generate the compiler-accurate Rust `use`
     // graph BEFORE indexing so it's the one persisted (import_graph reads the cache). Slow
-    // (≈ cargo check); off by default.
-    if config.scip_enabled("rust") && choose_lang(root) == "rust" {
+    // (≈ cargo check); off by default. Only when a Rust provider is actually active.
+    let rust_active = registry.provider_for(Path::new("_.rs")).is_some();
+    if rust_active && config.scip_enabled("rust") {
         eprintln!("[codeindex-rs] scip[rust] enabled: generating rust-analyzer scip graph (one-time, ~cargo check) …");
         if let Err(e) = lang_rust::refresh_scip(root) {
             eprintln!("[codeindex-rs] scip graph unavailable ({e}); using the tree-sitter mod graph");
@@ -123,7 +110,7 @@ fn cmd_index(root: &Path) {
     }
 
     eprintln!("[codeindex-rs] embedding + indexing …");
-    let index = build_index(root, &config, provider.as_ref(), |t| {
+    let index = build_index(root, &config, &registry, |t| {
         embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim])
     })
     .unwrap_or_else(|e| die(e));

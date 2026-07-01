@@ -22,6 +22,23 @@ fn default_symbol_match_bonus() -> f32 {
     3.0
 }
 
+/// One language's entry in the provider manifest (`providers.<lang>` in the config). Lets a repo
+/// turn a language off, pin the tool version, or point at a vendored binary (offline/air-gapped).
+/// Every field is optional so a partial entry (`{ "enabled": false }`) only overrides what it sets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderManifest {
+    /// Whether this language is indexed/edited at all. `None` = default (enabled); `Some(false)`
+    /// gates the language out of the provider registry so its tooling never runs.
+    pub enabled: Option<bool>,
+    /// Pin the language tool's version (e.g. the `scip-typescript` npm version). Advisory — passed
+    /// through to the tool invocation where it supports a version selector.
+    pub version: Option<String>,
+    /// Point at a vendored tool binary (the sidecar process / language server) instead of resolving
+    /// one from `PATH` — the offline/air-gapped path.
+    pub bin: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -55,6 +72,11 @@ pub struct Config {
     /// `CI_SCIP_RUST`) overrides a language per-run.
     #[serde(default)]
     pub scip: BTreeMap<String, bool>,
+    /// Per-language provider manifest: enable/disable a language, pin a tool version, point at a
+    /// vendored binary. Keyed by language name (`ts` / `rust` / `python`). Absent languages take
+    /// the defaults (enabled, tools resolved from `PATH`/env).
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderManifest>,
 }
 
 impl Default for Config {
@@ -83,6 +105,7 @@ impl Default for Config {
             query_layer_weighting: QueryLayerWeighting::default(),
             package_weights: BTreeMap::new(),
             scip: BTreeMap::new(),
+            providers: BTreeMap::new(),
         }
     }
 }
@@ -117,6 +140,26 @@ impl Config {
             }
         }
         self.scip.get(lang).copied().unwrap_or(false)
+    }
+
+    /// Whether `lang`'s provider is enabled (the manifest's `enabled`, defaulting to `true`), with
+    /// a `CI_PROVIDER_<LANG>_ENABLED` env override (`0`/`false`/empty = off). A disabled language is
+    /// left out of the provider registry entirely, so its tooling never runs.
+    pub fn provider_enabled(&self, lang: &str) -> bool {
+        if let Ok(v) = std::env::var(format!("CI_PROVIDER_{}_ENABLED", lang.to_uppercase())) {
+            return !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false");
+        }
+        self.providers.get(lang).and_then(|p| p.enabled).unwrap_or(true)
+    }
+
+    /// The vendored tool binary for `lang` from the manifest, if any (offline/air-gapped path).
+    pub fn provider_bin(&self, lang: &str) -> Option<&str> {
+        self.providers.get(lang).and_then(|p| p.bin.as_deref())
+    }
+
+    /// The pinned tool version for `lang` from the manifest, if any.
+    pub fn provider_version(&self, lang: &str) -> Option<&str> {
+        self.providers.get(lang).and_then(|p| p.version.as_deref())
     }
 }
 
@@ -155,6 +198,26 @@ mod tests {
         assert!(c.scip_enabled("rust"), "rust enabled via config");
         assert!(!c.scip_enabled("go"), "unset language off");
         assert!(Config::default().scip.is_empty(), "empty by default");
+    }
+
+    #[test]
+    fn provider_manifest_parses_and_gates() {
+        let over: serde_json::Value = serde_json::from_str(
+            r#"{ "providers": { "python": { "enabled": false }, "ts": { "version": "0.3.14", "bin": "/opt/vendored/marksman-provider-ts" } } }"#,
+        )
+        .unwrap();
+        let mut base = serde_json::to_value(Config::default()).unwrap();
+        merge(&mut base, &over);
+        let c: Config = serde_json::from_value(base).unwrap();
+        // enabled defaults to true for unlisted/omitted languages, false only when set so.
+        assert!(!c.provider_enabled("python"), "python disabled via manifest");
+        assert!(c.provider_enabled("ts"), "ts has no enabled key → default true");
+        assert!(c.provider_enabled("rust"), "unlisted language → default true");
+        // version + vendored binary are surfaced for the tool-resolution seam.
+        assert_eq!(c.provider_version("ts"), Some("0.3.14"));
+        assert_eq!(c.provider_bin("ts"), Some("/opt/vendored/marksman-provider-ts"));
+        assert_eq!(c.provider_bin("rust"), None);
+        assert!(Config::default().providers.is_empty(), "empty by default");
     }
 
     #[test]

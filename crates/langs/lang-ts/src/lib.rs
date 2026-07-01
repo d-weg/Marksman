@@ -91,45 +91,6 @@ impl TsProvider {
         })
     }
 
-    /// Start the write engine and load the project NOW, on a background thread, so the first
-    /// `apply_edits` finds it warm instead of paying the ~seconds cold project load inline.
-    /// The thread holds the engine lock for the duration, so an `apply_edits` that arrives
-    /// mid-warm simply waits for it rather than racing in a second cold engine. Safe no-op if
-    /// the engine can't start (apply_edits falls back to starting one fresh).
-    pub fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let root = self.root.clone();
-        // A real source file to open: LSP needs it to load the tsconfig project (an empty
-        // diagnostics short-circuits); ts-morph loads at startup, so the round-trip just
-        // confirms it's ready.
-        let warm_file = self
-            .scip
-            .import_graph()
-            .ok()
-            .and_then(|g| g.into_keys().next())
-            .map(|p| p.to_string_lossy().replace('\\', "/"));
-        std::thread::spawn(move || {
-            let mut guard = match slot.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if guard.is_some() {
-                return; // already warm
-            }
-            if let Ok(mut engine) = start_engine(&root) {
-                match warm_file.and_then(|f| std::fs::read_to_string(root.join(&f)).ok().map(|c| (f, c))) {
-                    Some(file) => {
-                        let _ = engine.diagnostics(&[file]); // forces the project to load
-                    }
-                    None => {
-                        let _ = engine.diagnostics(&[]);
-                    }
-                }
-                *guard = Some(engine);
-            }
-        });
-    }
-
     /// The TS language-server command (npx tsls). All external/Node tooling lives
     /// here in the provider — the core + ci-lsp stay pure Rust.
     fn ts_lsp_command() -> Command {
@@ -171,6 +132,45 @@ impl LanguageProvider for TsProvider {
 
     fn import_graph(&self) -> Result<ImportGraph> {
         self.scip.import_graph()
+    }
+
+    /// Start the write engine and load the project NOW, on a background thread, so the first
+    /// `apply_edits` finds it warm instead of paying the ~seconds cold project load inline.
+    /// The thread holds the engine lock for the duration, so an `apply_edits` that arrives
+    /// mid-warm simply waits for it rather than racing in a second cold engine. Safe no-op if
+    /// the engine can't start (apply_edits falls back to starting one fresh).
+    fn prewarm(&self) {
+        let slot = self.engine.clone();
+        let root = self.root.clone();
+        // A real source file to open: LSP needs it to load the tsconfig project (an empty
+        // diagnostics short-circuits); ts-morph loads at startup, so the round-trip just
+        // confirms it's ready.
+        let warm_file = self
+            .scip
+            .import_graph()
+            .ok()
+            .and_then(|g| g.into_keys().next())
+            .map(|p| p.to_string_lossy().replace('\\', "/"));
+        std::thread::spawn(move || {
+            let mut guard = match slot.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if guard.is_some() {
+                return; // already warm
+            }
+            if let Ok(mut engine) = start_engine(&root) {
+                match warm_file.and_then(|f| std::fs::read_to_string(root.join(&f)).ok().map(|c| (f, c))) {
+                    Some(file) => {
+                        let _ = engine.diagnostics(&[file]); // forces the project to load
+                    }
+                    None => {
+                        let _ = engine.diagnostics(&[]);
+                    }
+                }
+                *guard = Some(engine);
+            }
+        });
     }
 
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {

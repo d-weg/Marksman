@@ -12,7 +12,7 @@ pub mod outline;
 pub mod types;
 pub mod weight;
 
-pub use config::Config;
+pub use config::{Config, ProviderManifest};
 pub use driver::LanguageProvider;
 pub use error::{Error, Result};
 pub use outline::{elide_bodies, elide_bodies_with};

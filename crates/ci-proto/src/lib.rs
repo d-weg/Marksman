@@ -451,7 +451,21 @@ impl ProcessProvider {
 /// the bare name on `PATH`. `None` when the first two miss and the caller wants to fall back to
 /// in-process (the bare-`PATH` arm is only taken when `allow_path`).
 pub fn sidecar_command(lang: &str, root: &Path, allow_path: bool) -> Option<Command> {
+    sidecar_command_with(lang, root, allow_path, None)
+}
+
+/// Like [`sidecar_command`], but takes a `manifest_bin` — a vendored binary from the provider
+/// manifest (`providers.<lang>.bin`), the highest-priority source in the resolution order (the
+/// offline/air-gapped path). Resolution: `manifest_bin` → `$CI_PROVIDER_<LANG>` → exe sibling →
+/// bare name on `PATH` (only when `allow_path`).
+pub fn sidecar_command_with(
+    lang: &str,
+    root: &Path,
+    allow_path: bool,
+    manifest_bin: Option<&str>,
+) -> Option<Command> {
     let bin = format!("marksman-provider-{lang}");
+    let from_manifest = manifest_bin.map(PathBuf::from).filter(|p| p.is_file());
     let from_env = std::env::var(format!("CI_PROVIDER_{}", lang.to_uppercase()))
         .ok()
         .map(PathBuf::from)
@@ -460,7 +474,7 @@ pub fn sidecar_command(lang: &str, root: &Path, allow_path: bool) -> Option<Comm
         .ok()
         .and_then(|e| e.parent().map(|d| d.join(&bin)))
         .filter(|p| p.is_file());
-    let mut cmd = match from_env.or(from_sibling) {
+    let mut cmd = match from_manifest.or(from_env).or(from_sibling) {
         Some(p) => Command::new(p),
         None if allow_path => Command::new(&bin),
         None => return None,
@@ -514,4 +528,22 @@ pub fn serve_stdio(provider: impl LanguageProvider, outline: impl Fn(&str) -> St
         write_msg(&mut w, &resp)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_prefers_vendored_manifest_bin() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("vendored-provider");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        // `zzlang` avoids colliding with any real `marksman-provider-*` sibling of the test exe.
+        let cmd = sidecar_command_with("zzlang", dir.path(), false, bin.to_str())
+            .expect("a vendored manifest bin resolves the sidecar");
+        assert_eq!(cmd.get_program(), bin.as_os_str(), "vendored binary used verbatim");
+        // A missing vendored path with no env/sibling and no PATH fallback → nothing to spawn.
+        assert!(sidecar_command_with("zzlang", dir.path(), false, Some("/no/such/bin")).is_none());
+    }
 }

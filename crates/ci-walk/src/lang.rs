@@ -2,7 +2,7 @@ use std::path::Path;
 
 /// Coarse language tag used for driver dispatch + doc handling. v1 only routes
 /// TS/TSX to a driver; everything else is either docs or ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lang {
     Ts,
     Tsx,

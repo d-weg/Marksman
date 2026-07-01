@@ -35,4 +35,17 @@ pub trait LanguageProvider: Send + Sync {
     /// the whole batch must roll back together, so independent per-op calls won't do.
     /// A SCIP (`Symbol`-granularity) provider rejects sub-symbol ops it can't target.
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult>;
+
+    /// Warm any background write engine (LSP / SCIP indexer) so the first
+    /// [`apply_edits`](LanguageProvider::apply_edits) is fast instead of paying a cold
+    /// project load inline. Default: a no-op (providers with nothing to warm — the
+    /// tree-sitter fallback, or a sidecar that warms itself inside its own process).
+    fn prewarm(&self) {}
+
+    /// Whether this provider type-checks its edits over the blast radius (nothing commits
+    /// if it introduces a new type error). Default: `true` — the gated TS/Rust path. The
+    /// tree-sitter fallback overrides this to `false`: its edits are structural, not verified.
+    fn gated(&self) -> bool {
+        true
+    }
 }

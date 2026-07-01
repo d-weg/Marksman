@@ -6,6 +6,7 @@
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
+use ci_build::{build_registry, ProviderRegistry};
 use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
@@ -20,126 +21,54 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// The active provider for this repo. Both variants are cheap to clone (Arc-shared / a
-/// PathBuf), so the server hands one out of its lock per call.
-#[derive(Clone)]
-enum AnyProvider {
-    Ts(TsProvider),
-    Rust(RustProvider),
-    Fallback(FallbackProvider),
-    /// A provider running as a separate sidecar process, spoken to over the protobuf wire.
-    Process(ProcessProvider),
-}
-
-impl AnyProvider {
-    /// Warm the write engine on a background thread (tsserver/ts-morph for TS, rust-analyzer
-    /// for Rust), so the first `apply_edits` is fast. The tree-sitter fallback has no engine
-    /// to warm; a sidecar warms itself inside its own process.
-    fn prewarm(&self) {
-        match self {
-            AnyProvider::Ts(t) => t.prewarm(),
-            AnyProvider::Rust(r) => r.prewarm(),
-            AnyProvider::Fallback(_) | AnyProvider::Process(_) => {}
-        }
-    }
-
-    /// Whether this provider type-checks its edits over the blast radius. The tree-sitter
-    /// fallback does not (no compiler/LSP) — its edits are structural-only. Sidecars are the
-    /// gated languages (rust/ts) today.
-    fn gated(&self) -> bool {
-        !matches!(self, AnyProvider::Fallback(_))
-    }
-}
-
-impl LanguageProvider for AnyProvider {
-    fn granularity(&self) -> ci_core::Granularity {
-        match self {
-            AnyProvider::Ts(t) => t.granularity(),
-            AnyProvider::Rust(r) => r.granularity(),
-            AnyProvider::Fallback(f) => f.granularity(),
-            AnyProvider::Process(p) => p.granularity(),
-        }
-    }
-    fn structure(&self, file: &Path) -> ci_core::Result<Vec<Node>> {
-        match self {
-            AnyProvider::Ts(t) => t.structure(file),
-            AnyProvider::Rust(r) => r.structure(file),
-            AnyProvider::Fallback(f) => f.structure(file),
-            AnyProvider::Process(p) => p.structure(file),
-        }
-    }
-    fn import_graph(&self) -> ci_core::Result<ci_core::ImportGraph> {
-        match self {
-            AnyProvider::Ts(t) => t.import_graph(),
-            AnyProvider::Rust(r) => r.import_graph(),
-            AnyProvider::Fallback(f) => f.import_graph(),
-            AnyProvider::Process(p) => p.import_graph(),
-        }
-    }
-    fn apply_edits(&self, ops: &[ci_core::EditOp], opts: &EditOpts) -> ci_core::Result<ci_core::CommitResult> {
-        match self {
-            AnyProvider::Ts(t) => t.apply_edits(ops, opts),
-            AnyProvider::Rust(r) => r.apply_edits(ops, opts),
-            AnyProvider::Fallback(f) => f.apply_edits(ops, opts),
-            AnyProvider::Process(p) => p.apply_edits(ops, opts),
-        }
-    }
-}
-
-/// The language Marksman should use for `root`: `CI_LANG` override, else manifest/extension detect.
-fn choose_lang(root: &Path) -> &'static str {
-    match std::env::var("CI_LANG").ok().as_deref() {
-        Some("rust") => return "rust",
-        Some("ts") | Some("typescript") => return "ts",
-        Some(other) if FbLang::from_name(other).is_some() => return "python",
-        _ => {}
-    }
-    if root.join("Cargo.toml").exists() && !root.join("package.json").exists() {
-        "rust"
-    } else if root.join("package.json").exists() || root.join("tsconfig.json").exists() {
-        "ts"
-    } else if FbLang::detect(root).is_some() {
-        "python"
-    } else {
-        "ts"
-    }
-}
-
-/// Build the provider for `root`. With `CI_PROVIDER=sidecar` (and a `marksman-provider-<lang>`
-/// binary present), the provider runs as a separate process over the protobuf wire; otherwise it
-/// is linked in-process.
-fn build_provider(root: &Path) -> Result<AnyProvider, String> {
-    let lang = choose_lang(root);
+/// Construct the provider for one language, honoring the manifest's vendored binary and
+/// `CI_PROVIDER=sidecar`. `None` (with a warning) when a language's tooling can't start, so one
+/// language failing doesn't sink a mixed-language repo. Called once per active language by
+/// [`build_registry`], so Node's `scip-typescript` only runs when the repo has `.ts*` files.
+fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn LanguageProvider>> {
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
-        if let Some(cmd) = ci_proto::sidecar_command(lang, root, false) {
+        if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
             eprintln!("[codeindex-rs-mcp] language: {lang} (sidecar process — protobuf wire)");
-            return ProcessProvider::spawn(cmd).map(AnyProvider::Process).map_err(|e| e.to_string());
+            match ProcessProvider::spawn(cmd) {
+                Ok(p) => return Some(Arc::new(p)),
+                Err(e) => {
+                    eprintln!("[codeindex-rs-mcp] sidecar {lang} failed to start ({e}); skipping");
+                    return None;
+                }
+            }
         }
         eprintln!("[codeindex-rs-mcp] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
     }
     match lang {
-        "rust" => Ok(rust(root)),
-        "python" => Ok(fallback(root, FbLang::Python)),
-        _ => ts(root),
+        "rust" => {
+            eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
+            Some(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
+        }
+        "python" => {
+            eprintln!("[codeindex-rs-mcp] language: python (tree-sitter fallback, in-process — edits are ungated)");
+            Some(Arc::new(FallbackProvider::new(root, FbLang::Python)))
+        }
+        "ts" => {
+            eprintln!("[codeindex-rs-mcp] language: typescript — running scip-typescript on {} …", root.display());
+            match TsProvider::index(root) {
+                Ok(p) => Some(Arc::new(p)),
+                Err(e) => {
+                    eprintln!("[codeindex-rs-mcp] typescript indexing failed ({e}); skipping TS files");
+                    None
+                }
+            }
+        }
+        _ => None,
     }
 }
 
-fn rust(root: &Path) -> AnyProvider {
-    let use_scip = Config::load(root).unwrap_or_default().scip_enabled("rust");
-    eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
-    AnyProvider::Rust(RustProvider::new(root).with_scip(use_scip))
-}
-
-fn ts(root: &Path) -> Result<AnyProvider, String> {
-    Ok(AnyProvider::Ts(TsProvider::index(root).map_err(|e| e.to_string())?))
-}
-
-fn fallback(root: &Path, lang: FbLang) -> AnyProvider {
-    eprintln!(
-        "[codeindex-rs-mcp] language: {} (tree-sitter fallback, in-process — edits are ungated)",
-        lang.label()
-    );
-    AnyProvider::Fallback(FallbackProvider::new(root, lang))
+/// The extension → provider registry for `root`, dispatching each file to its language's provider
+/// so a mixed repo reads/edits fully. Absent/disabled languages register nothing.
+fn build_registry_for(root: &Path) -> Result<ProviderRegistry, String> {
+    let mut config = Config::load(root).unwrap_or_default();
+    config.index_dir = ".codeindex-rs".into();
+    let cfg = config.clone();
+    build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg)).map_err(|e| e.to_string())
 }
 
 fn resolve_root() -> PathBuf {
@@ -169,7 +98,7 @@ struct Server {
     config: Config,
     // Behind Arc<Mutex> so it can be built + warmed on a background thread at startup
     // (see `start_prewarm`) and cheaply cloned out for each tool call.
-    provider: Arc<Mutex<Option<AnyProvider>>>,
+    registry: Arc<Mutex<Option<ProviderRegistry>>>,
     embedder: Option<StaticEmbedder>,
 }
 
@@ -178,37 +107,37 @@ impl Server {
         let mut config = Config::load(&root).unwrap_or_default();
         config.embedding_model = "minishlab/potion-code-16M".into();
         config.index_dir = ".codeindex-rs".into();
-        Server { root, config, provider: Arc::new(Mutex::new(None)), embedder: None }
+        Server { root, config, registry: Arc::new(Mutex::new(None)), embedder: None }
     }
 
-    /// Build the provider for the repo AND warm the write engine on a background thread at
-    /// startup — so the first output-tool call finds it ready. For a TS repo this runs
+    /// Build the provider registry for the repo AND warm each write engine on a background thread
+    /// at startup — so the first output-tool call finds it ready. For a TS repo this runs
     /// scip-typescript + warms the language server; for a Rust repo it's instant (in-process
-    /// tree-sitter, no Node). Holding the provider lock across the build means a tool that
+    /// tree-sitter, no Node). Holding the registry lock across the build means a tool that
     /// needs it mid-build waits, not races.
     fn start_prewarm(&self) {
-        let slot = self.provider.clone();
+        let slot = self.registry.clone();
         let root = self.root.clone();
         std::thread::spawn(move || {
             let Ok(mut g) = slot.lock() else { return };
             if g.is_some() {
                 return;
             }
-            if let Ok(p) = build_provider(&root) {
-                p.prewarm();
-                *g = Some(p);
+            if let Ok(reg) = build_registry_for(&root) {
+                reg.prewarm_all();
+                *g = Some(reg);
             }
         });
     }
 
-    /// Get the provider, building it if `start_prewarm` hasn't finished. Returns a cheap
+    /// Get the provider registry, building it if `start_prewarm` hasn't finished. Returns a cheap
     /// clone so the caller doesn't hold the lock. Needed by the output tools only.
-    fn provider(&self) -> Result<AnyProvider, String> {
-        let mut g = self.provider.lock().map_err(|_| "provider lock poisoned".to_string())?;
+    fn registry(&self) -> Result<ProviderRegistry, String> {
+        let mut g = self.registry.lock().map_err(|_| "registry lock poisoned".to_string())?;
         if g.is_none() {
-            let p = build_provider(&self.root)?;
-            p.prewarm();
-            *g = Some(p);
+            let reg = build_registry_for(&self.root)?;
+            reg.prewarm_all();
+            *g = Some(reg);
         }
         Ok(g.as_ref().unwrap().clone())
     }
@@ -325,7 +254,7 @@ impl Server {
 
     fn list_anchors(&mut self, args: &Value) -> Result<String, String> {
         let file = args["file"].as_str().ok_or("`file` is required")?.to_string();
-        let nodes = self.provider()?.structure(Path::new(&file)).map_err(|e| e.to_string())?;
+        let nodes = self.registry()?.structure(Path::new(&file)).map_err(|e| e.to_string())?;
         let mut out = String::new();
         for n in &nodes {
             write_anchors(n, &mut out, 0);
@@ -340,18 +269,18 @@ impl Server {
     ///   3. a bare name + NO usable path — searched across the INDEX: unique → resolved;
     ///      ambiguous → Err listing the candidate ids so the agent re-issues with one (one cheap
     ///      round-trip, never a full retrieve). The server disambiguates because it owns the index.
-    fn resolve_symbol(&self, provider: &AnyProvider, path: &str, reference: &str) -> Result<String, String> {
+    fn resolve_symbol(&self, registry: &ProviderRegistry, path: &str, reference: &str) -> Result<String, String> {
         if reference.contains('#') {
             return Ok(reference.to_string()); // already a node_id
         }
         if !path.is_empty() {
-            let nodes = provider.structure(Path::new(path)).unwrap_or_default();
+            let nodes = registry.structure(Path::new(path)).unwrap_or_default();
             if let Some(id) = resolve_in(&nodes, reference) {
                 return Ok(id);
             }
         }
         let files = self.files_defining(reference)?;
-        let id_in = |f: &str| resolve_in(&provider.structure(Path::new(f)).unwrap_or_default(), reference);
+        let id_in = |f: &str| resolve_in(&registry.structure(Path::new(f)).unwrap_or_default(), reference);
         let ids: Vec<String> = files.iter().filter_map(|f| id_in(f)).collect();
         match ids.len() {
             0 => Err(format!("symbol '{reference}' not found in the index — pass a `path`, or a node id from list_anchors/retrieve_context")),
@@ -369,8 +298,8 @@ impl Server {
     /// resolves directly when unique; otherwise it falls back to retrieval and **only** auto-
     /// resolves when the top result is unambiguous — any ambiguity returns candidate ids for the
     /// agent to pick, so we never silently edit a vague guess.
-    fn resolve_query(&mut self, provider: &AnyProvider, query: &str) -> Result<String, String> {
-        let id_in = |f: &str, n: &str| resolve_in(&provider.structure(Path::new(f)).unwrap_or_default(), n);
+    fn resolve_query(&mut self, registry: &ProviderRegistry, query: &str) -> Result<String, String> {
+        let id_in = |f: &str, n: &str| resolve_in(&registry.structure(Path::new(f)).unwrap_or_default(), n);
         if !index_exists(&self.root, &self.config) {
             return Err("no index — run `codeindex-rs index` first, or address by name/id".into());
         }
@@ -430,16 +359,16 @@ impl Server {
     /// `:return`/`:doc` sub-node). Address by `id` (a node id — self-locating, no `file` needed),
     /// or by `name` (+ optional `file`; resolved via the index when `file` is omitted).
     fn read_node(&mut self, args: &Value) -> Result<String, String> {
-        let provider = self.provider()?;
+        let registry = self.registry()?;
         let id = if let Some(id) = args["id"].as_str() {
             id.to_string()
         } else if let Some(name) = args["name"].as_str() {
-            self.resolve_symbol(&provider, args["file"].as_str().unwrap_or(""), name)?
+            self.resolve_symbol(&registry, args["file"].as_str().unwrap_or(""), name)?
         } else {
             return Err("provide `id` (a node id from list_anchors) or `name`".into());
         };
         let file = file_of(&id).to_string();
-        let nodes = provider.structure(Path::new(&file)).map_err(|e| e.to_string())?;
+        let nodes = registry.structure(Path::new(&file)).map_err(|e| e.to_string())?;
         let node = find_node(&nodes, &id).ok_or_else(|| format!("anchor '{id}' not found in {file}"))?;
         let content = std::fs::read_to_string(self.root.join(&file)).map_err(|e| e.to_string())?;
         let text = slice_lines(&content, node.range.start_line, node.range.end_line);
@@ -458,18 +387,28 @@ impl Server {
     fn apply_edits(&mut self, args: &Value) -> Result<String, String> {
         let dry_run = args["dryRun"].as_bool().unwrap_or(false);
         let actions = args["actions"].as_array().ok_or("`actions` array is required")?.clone();
-        let provider = self.provider()?;
+        let registry = self.registry()?;
+
+        // Which file this batch edits, so we dispatch to the right language's edit engine. Set from
+        // the first action's path, else the file of the first resolved node_id (`file#…`).
+        let mut target_file: Option<String> = None;
+        let mut note_target = |f: &str| {
+            if target_file.is_none() && !f.is_empty() {
+                target_file = Some(f.to_string());
+            }
+        };
 
         let mut ops = Vec::new();
         for a in &actions {
             let act = a["action"].as_str().unwrap_or("");
             let path = a["path"].as_str().unwrap_or("").to_string();
+            note_target(&path);
             let mut name = a["name"].as_str().map(str::to_string);
             // `query` — the fuzziest target: resolve a free-text description to a node_id via the
             // index/retrieval (fuse locate+edit). Only when no explicit name/id was given.
             if name.is_none() {
                 if let Some(q) = a["query"].as_str() {
-                    name = Some(self.resolve_query(&provider, q)?);
+                    name = Some(self.resolve_query(&registry, q)?);
                 }
             }
             // For a symbol-targeting action, resolve the reference to a node_id UP FRONT through
@@ -480,7 +419,13 @@ impl Server {
             let symbol_action = matches!(act, "rename" | "replace" | "replace_node" | "replace_text" | "set_body" | "insert_before");
             if symbol_action {
                 if let Some(reference) = name.as_deref() {
-                    name = Some(self.resolve_symbol(&provider, &path, reference)?);
+                    name = Some(self.resolve_symbol(&registry, &path, reference)?);
+                }
+            }
+            // A resolved node_id (`file#…`) also pins the target file.
+            if let Some(n) = name.as_deref() {
+                if n.contains('#') {
+                    note_target(file_of(n));
                 }
             }
             let action = Action {
@@ -499,12 +444,21 @@ impl Server {
                     if nm.contains('#') {
                         Some(nm.to_string())
                     } else {
-                        resolve_in(&provider.structure(Path::new(p)).unwrap_or_default(), nm)
+                        resolve_in(&registry.structure(Path::new(p)).unwrap_or_default(), nm)
                     }
                 })
             };
             ops.push(action_to_op(&action, resolve).map_err(|e| e.to_string())?);
         }
+
+        // Dispatch to the edit engine for the target file's language (fall back to any registered
+        // provider for an empty batch). A cross-language batch isn't a real scenario — the gate is
+        // per-language — so one engine handles the batch.
+        let provider = target_file
+            .as_deref()
+            .and_then(|f| registry.provider_for(Path::new(f)))
+            .or_else(|| registry.providers().next())
+            .ok_or("no language provider available for this repo")?;
 
         let opts = EditOpts { write: !dry_run, dry_run, tsconfig: None };
         let res = provider.apply_edits(&ops, &opts).map_err(|e| e.to_string())?;
@@ -559,7 +513,7 @@ impl Server {
         if changed.is_empty() || !index_exists(&root, &config) {
             return Ok(());
         }
-        let provider = self.provider()?;
+        let registry = self.registry()?;
         let data = load_index(&root, &config).map_err(|e| e.to_string())?;
         let changed_rel: Vec<String> =
             changed.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
@@ -567,7 +521,7 @@ impl Server {
         let dim = embedder.dim();
         let updated = ci_build::update_index(
             &root,
-            &provider,
+            &registry,
             |t| embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim]),
             data,
             &changed_rel,
