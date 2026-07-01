@@ -8,8 +8,9 @@ description = "Tree-sitter fallback LanguageProvider for languages without a SCI
 [dependencies]
 ci-core = { path = "../../ci-core" }
 ci-edit = { path = "../../ci-edit" }
+ci-treesitter = { path = "../../ci-treesitter" }
 serde_json = { workspace = true }
-tree-sitter = "0.26.10"
+tree-sitter = { workspace = true }
 tree-sitter-python = "0.23"
 ignore = "0.4"
 

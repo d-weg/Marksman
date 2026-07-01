@@ -5,6 +5,7 @@
 //! precision limits don't apply. This turns `structure()` from symbol-level into
 //! AST-level (`Granularity::Ast`), unlocking precise sub-symbol edits.
 use ci_core::{Node, NodeKind, Range, SymbolKind};
+use ci_treesitter::{syntax_node, ts_range};
 use tree_sitter::{Node as TsNode, Parser};
 
 /// Attach tree-sitter sub-nodes as children of each SCIP symbol. On any parse
@@ -92,14 +93,14 @@ fn subnodes(root: &TsNode, content: &str, bytes: &[u8], sym: &Node) -> Option<Ve
         let mut cursor = params.walk();
         for (i, p) in params.named_children(&mut cursor).enumerate() {
             let name = p.utf8_text(bytes).ok().map(str::to_string);
-            children.push(syntax(&format!("{}:param.{i}", sym.id), name, "parameter", &p));
+            children.push(syntax_node(&format!("{}:param.{i}", sym.id), name, "parameter", &p));
         }
     }
     if let Some(rt) = decl.child_by_field_name("return_type") {
-        children.push(syntax(&format!("{}:return", sym.id), None, "returnType", &rt));
+        children.push(syntax_node(&format!("{}:return", sym.id), None, "returnType", &rt));
     }
     if let Some(body) = decl.child_by_field_name("body") {
-        children.push(syntax(&format!("{}:body", sym.id), None, "body", &body));
+        children.push(syntax_node(&format!("{}:body", sym.id), None, "body", &body));
     }
     if children.is_empty() {
         None
@@ -120,22 +121,7 @@ fn doc_comment_range(decl: TsNode) -> Option<Range> {
         }
         stmt = p;
     }
-    let last = stmt.prev_sibling().filter(|n| n.kind() == "comment")?;
-    let mut first = last;
-    while let Some(prev) = first.prev_sibling() {
-        if prev.kind() == "comment" {
-            first = prev;
-        } else {
-            break;
-        }
-    }
-    let (s, e) = (first.start_position(), last.end_position());
-    Some(Range {
-        start_line: s.row as u32 + 1,
-        start_char: s.column as u32,
-        end_line: e.row as u32 + 1,
-        end_char: e.column as u32,
-    })
+    ci_treesitter::leading_comment_range(&stmt, |n| n.kind() == "comment")
 }
 
 /// Climb to the nearest ancestor (or self) that has parameter/body fields — the
@@ -152,27 +138,6 @@ fn decl_with_fields(mut n: TsNode) -> TsNode {
     }
 }
 
-fn syntax(id: &str, name: Option<String>, kind: &str, n: &TsNode) -> Node {
-    Node {
-        id: id.to_string(),
-        name,
-        kind: NodeKind::Syntax(kind.to_string()),
-        range: ts_range(n),
-        name_range: None,
-        children: vec![],
-    }
-}
-
-fn ts_range(n: &TsNode) -> Range {
-    let s = n.start_position();
-    let e = n.end_position();
-    Range {
-        start_line: s.row as u32 + 1,
-        start_char: s.column as u32,
-        end_line: e.row as u32 + 1,
-        end_char: e.column as u32,
-    }
-}
 
 /// Byte offset of (1-based line, 0-based char). ASCII-accurate (code is ~ASCII).
 fn point_byte(content: &str, line_1: u32, char_0: u32) -> Option<usize> {

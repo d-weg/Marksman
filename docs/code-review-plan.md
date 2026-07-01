@@ -25,7 +25,13 @@ clearer code — *no behavior changes* unless a fix is clearly warranted (and th
 - **API consistency** — trait method shapes, error types, the `Node`/`EditOp`/`Range` contracts.
 - **Tests** — a unit test for each non-trivial branch; a named regression for each past bug.
 
-## Cross-cutting finding (do FIRST — it shrinks later batches)
+## Cross-cutting finding  ✅ (landed as `ci-treesitter`)
+Extracted `ts_range`, `syntax_node`, `leading_comment_range`, and a `body_ranges(root, def_kinds,
+body_kinds)` outline driver into a new `ci-treesitter` crate; `lang-rust`, `lang-fallback`, and
+`lang-ts` now depend on it and shed their private copies (each provider shrank; ~180 dup lines →
+one tested 105-line crate). `tree-sitter` centralized in `[workspace.dependencies]` so the shared
+`TsNode` ABI matches across crates. Done AFTER Batch 1 (needed the locked `Node`/`Range` contracts).
+
 **Tree-sitter helper duplication.** `ts_range`, the `syntax(...)` sub-node builder, the
 `Node`-from-named-item construction, the leading-comment/`:doc` finder, and the body-eliding
 `outline` walk are **re-implemented in `lang-rust`, `lang-fallback`, and `lang-ts/ast.rs`.** Extract

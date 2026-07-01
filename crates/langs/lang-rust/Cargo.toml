@@ -11,7 +11,8 @@ ci-edit = { path = "../../ci-edit" }
 ci-lsp = { path = "../../ci-lsp" }
 ci-proto = { path = "../../ci-proto" }
 ci-scip = { path = "../../ci-scip" }
-tree-sitter = "0.26.10"
+ci-treesitter = { path = "../../ci-treesitter" }
+tree-sitter = { workspace = true }
 tree-sitter-rust = "0.24"
 ignore = "0.4"
 

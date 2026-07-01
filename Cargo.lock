@@ -196,6 +196,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ci-treesitter"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "tree-sitter",
+ "tree-sitter-rust",
+]
+
+[[package]]
 name = "ci-vfs"
 version = "0.1.0"
 dependencies = [
@@ -524,6 +533,7 @@ version = "0.1.0"
 dependencies = [
  "ci-core",
  "ci-edit",
+ "ci-treesitter",
  "ignore",
  "serde_json",
  "tempfile",
@@ -540,6 +550,7 @@ dependencies = [
  "ci-lsp",
  "ci-proto",
  "ci-scip",
+ "ci-treesitter",
  "ignore",
  "tempfile",
  "tree-sitter",
@@ -555,6 +566,7 @@ dependencies = [
  "ci-lsp",
  "ci-proto",
  "ci-scip",
+ "ci-treesitter",
  "serde_json",
  "tempfile",
  "tree-sitter",

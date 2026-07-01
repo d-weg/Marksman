@@ -9,6 +9,7 @@ use ci_core::{
 };
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
+use ci_treesitter::{syntax_node, ts_range};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -282,22 +283,8 @@ fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Op
 /// `///` / `//!` are `line_comment`s; `/** */` is a `block_comment`). v0 stops at a non-comment
 /// sibling, so a doc comment separated from the item by an attribute isn't captured yet.
 fn doc_range(item: &TsNode) -> Option<Range> {
-    let is_comment = |n: &TsNode| matches!(n.kind(), "line_comment" | "block_comment");
-    let last = item.prev_sibling().filter(is_comment)?;
-    let mut first = last;
-    while let Some(prev) = first.prev_sibling() {
-        if is_comment(&prev) {
-            first = prev;
-        } else {
-            break;
-        }
-    }
-    let (s, e) = (first.start_position(), last.end_position());
-    Some(Range {
-        start_line: s.row as u32 + 1,
-        start_char: s.column as u32,
-        end_line: e.row as u32 + 1,
-        end_char: e.column as u32,
+    ci_treesitter::leading_comment_range(item, |n| {
+        matches!(n.kind(), "line_comment" | "block_comment")
     })
 }
 
@@ -307,25 +294,14 @@ fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
         let mut cursor = params.walk();
         for (i, p) in params.named_children(&mut cursor).enumerate() {
             let name = p.utf8_text(bytes).ok().map(str::to_string);
-            n.children.push(syntax(&format!("{}:param.{i}", n.id), name, "parameter", &p));
+            n.children.push(syntax_node(&format!("{}:param.{i}", n.id), name, "parameter", &p));
         }
     }
     if let Some(rt) = item.child_by_field_name("return_type") {
-        n.children.push(syntax(&format!("{}:return", n.id), None, "returnType", &rt));
+        n.children.push(syntax_node(&format!("{}:return", n.id), None, "returnType", &rt));
     }
     if let Some(body) = item.child_by_field_name("body") {
-        n.children.push(syntax(&format!("{}:body", n.id), None, "body", &body));
-    }
-}
-
-fn syntax(id: &str, name: Option<String>, kind: &str, n: &TsNode) -> Node {
-    Node {
-        id: id.to_string(),
-        name,
-        kind: NodeKind::Syntax(kind.to_string()),
-        range: ts_range(n),
-        name_range: None,
-        children: vec![],
+        n.children.push(syntax_node(&format!("{}:body", n.id), None, "body", &body));
     }
 }
 
@@ -341,17 +317,6 @@ fn type_text(t: &TsNode, bytes: &[u8]) -> Option<String> {
         }
     }
     t.utf8_text(bytes).ok().map(str::to_string)
-}
-
-fn ts_range(n: &TsNode) -> Range {
-    let s = n.start_position();
-    let e = n.end_position();
-    Range {
-        start_line: s.row as u32 + 1,
-        start_char: s.column as u32,
-        end_line: e.row as u32 + 1,
-        end_char: e.column as u32,
-    }
 }
 
 // ── import graph (mod resolution) ────────────────────────────────────────────
@@ -412,23 +377,9 @@ fn rust_files(root: &Path) -> Vec<String> {
 /// Best-effort: returns the original on a parse failure.
 pub fn outline(content: &str) -> String {
     let Some(tree) = RustProvider::parse(content) else { return content.to_string() };
-    let mut bodies = Vec::new();
-    collect_rust_bodies(tree.root_node(), &mut bodies);
+    // Fold each `function_item`'s `block` body; keep everything else (signatures, types).
+    let bodies = ci_treesitter::body_ranges(tree.root_node(), &["function_item"], &["block"]);
     ci_core::elide_bodies(content, bodies)
-}
-
-fn collect_rust_bodies(node: TsNode, out: &mut Vec<(usize, usize)>) {
-    if node.kind() == "function_item" {
-        if let Some(body) = node.child_by_field_name("body") {
-            if body.kind() == "block" {
-                out.push((body.start_byte(), body.end_byte()));
-            }
-        }
-    }
-    let mut c = node.walk();
-    for ch in node.named_children(&mut c) {
-        collect_rust_bodies(ch, out);
-    }
 }
 
 #[cfg(test)]

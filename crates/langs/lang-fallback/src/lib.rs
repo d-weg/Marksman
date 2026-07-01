@@ -10,9 +10,10 @@
 //! to the gated [`GateEngine`] path as its LSP/indexer lands (the Rust provider is the model).
 use ci_core::{
     CommitResult, Diag, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node,
-    NodeKind, Range, Result, SymbolKind,
+    NodeKind, Result, SymbolKind,
 };
 use ci_edit::GateEngine;
+use ci_treesitter::{syntax_node, ts_range};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -160,8 +161,8 @@ pub fn outline(lang: FbLang, content: &str) -> String {
         return content.to_string();
     }
     let Some(tree) = parser.parse(content, None) else { return content.to_string() };
-    let mut bodies = Vec::new();
-    collect_bodies(tree.root_node(), &mut bodies);
+    // Fold every `function_definition` body (any body kind); Python uses `...` as the placeholder.
+    let bodies = ci_treesitter::body_ranges(tree.root_node(), &["function_definition"], &[]);
     ci_core::elide_bodies_with(content, bodies, "...")
 }
 
@@ -281,7 +282,7 @@ fn emit_class(def: &TsNode, bytes: &[u8], prefix: &str, out: &mut Vec<Node>) {
         if let Some(body) = def.child_by_field_name("body") {
             // class docstring → `:doc` anchor (parity with functions/methods).
             if let Some(ds) = python_docstring(&body) {
-                n.children.push(syntax(&format!("{}:doc", n.id), None, "doc", &ds));
+                n.children.push(syntax_node(&format!("{}:doc", n.id), None, "doc", &ds));
             }
         }
         out.push(n);
@@ -313,18 +314,18 @@ fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
             if matches!(name.as_deref(), Some("self") | Some("cls")) {
                 continue;
             }
-            n.children.push(syntax(&format!("{}:param.{i}", n.id), name, "parameter", &p));
+            n.children.push(syntax_node(&format!("{}:param.{i}", n.id), name, "parameter", &p));
         }
     }
     if let Some(rt) = item.child_by_field_name("return_type") {
-        n.children.push(syntax(&format!("{}:return", n.id), None, "returnType", &rt));
+        n.children.push(syntax_node(&format!("{}:return", n.id), None, "returnType", &rt));
     }
     if let Some(body) = item.child_by_field_name("body") {
         // Docstring = the first statement when it's a bare string literal — the `:doc` anchor.
         if let Some(ds) = python_docstring(&body) {
-            n.children.push(syntax(&format!("{}:doc", n.id), None, "doc", &ds));
+            n.children.push(syntax_node(&format!("{}:doc", n.id), None, "doc", &ds));
         }
-        n.children.push(syntax(&format!("{}:body", n.id), None, "body", &body));
+        n.children.push(syntax_node(&format!("{}:body", n.id), None, "body", &body));
     }
 }
 
@@ -339,42 +340,6 @@ fn python_docstring<'a>(body: &TsNode<'a>) -> Option<TsNode<'a>> {
         }
     }
     None
-}
-
-fn syntax(id: &str, name: Option<String>, kind: &str, n: &TsNode) -> Node {
-    Node {
-        id: id.to_string(),
-        name,
-        kind: NodeKind::Syntax(kind.to_string()),
-        range: ts_range(n),
-        name_range: None,
-        children: vec![],
-    }
-}
-
-fn ts_range(n: &TsNode) -> Range {
-    let s = n.start_position();
-    let e = n.end_position();
-    Range {
-        start_line: s.row as u32 + 1,
-        start_char: s.column as u32,
-        end_line: e.row as u32 + 1,
-        end_char: e.column as u32,
-    }
-}
-
-// ── outline ──────────────────────────────────────────────────────────────────
-
-fn collect_bodies(node: TsNode, out: &mut Vec<(usize, usize)>) {
-    if node.kind() == "function_definition" {
-        if let Some(body) = node.child_by_field_name("body") {
-            out.push((body.start_byte(), body.end_byte()));
-        }
-    }
-    let mut c = node.walk();
-    for ch in node.named_children(&mut c) {
-        collect_bodies(ch, out);
-    }
 }
 
 // ── import graph ─────────────────────────────────────────────────────────────

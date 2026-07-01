@@ -9,6 +9,7 @@ members = [
     "crates/ci-scip",
     "crates/ci-proto",
     "crates/ci-build",
+    "crates/ci-treesitter",
     "crates/langs/lang-ts",
     "crates/langs/lang-rust",
     "crates/langs/lang-fallback",
@@ -34,6 +35,9 @@ thiserror = "2"
 ignore = "0.4"
 globset = "0.4"
 tempfile = "3"
+# Shared so ci-treesitter and every lang-* crate compile against ONE tree-sitter (a
+# `tree_sitter::Node` crosses the ci-treesitter ↔ provider boundary, so the ABI must match).
+tree-sitter = "0.26.10"
 
 [profile.release]
 lto = true

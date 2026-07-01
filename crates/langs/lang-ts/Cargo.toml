@@ -11,8 +11,9 @@ ci-scip = { path = "../../ci-scip" }
 ci-lsp = { path = "../../ci-lsp" }
 ci-edit = { path = "../../ci-edit" }
 ci-proto = { path = "../../ci-proto" }
+ci-treesitter = { path = "../../ci-treesitter" }
 serde_json.workspace = true
-tree-sitter = "0.26.10"
+tree-sitter = { workspace = true }
 tree-sitter-typescript = "0.23.2"
 
 [[bin]]

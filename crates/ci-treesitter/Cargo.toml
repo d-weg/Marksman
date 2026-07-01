@@ -1,0 +1,13 @@
+[package]
+name = "ci-treesitter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared tree-sitter → ci-core conversions (Range, Syntax nodes, doc-comment span, outline body ranges) reused by every tree-sitter-backed LanguageProvider."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+tree-sitter = { workspace = true }
+
+[dev-dependencies]
+tree-sitter-rust = "0.24"
