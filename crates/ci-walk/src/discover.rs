@@ -5,13 +5,12 @@ use ignore::WalkBuilder;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// A file selected for indexing, with its language and whether it's a doc.
+/// A code file selected for indexing, with its language.
 #[derive(Debug, Clone)]
 pub struct DiscoveredFile {
     pub rel: PathBuf,
     pub abs: PathBuf,
     pub lang: Lang,
-    pub is_doc: bool,
 }
 
 /// Build a GlobSet from config patterns. Each `**/x` pattern also gets a bare `x`
@@ -27,12 +26,11 @@ fn build_globset(patterns: &[String]) -> Result<GlobSet> {
     b.build().map_err(|e| Error::Config(e.to_string()))
 }
 
-/// Walk `root` honoring `.gitignore`, applying config include/exclude/doc globs.
-/// Returns code files (TS/TSX) and, if `index_docs`, markdown — sorted by path.
+/// Walk `root` honoring `.gitignore`, applying config include/exclude globs.
+/// Returns the code files a provider handles — sorted by path.
 pub fn discover(root: &Path, config: &Config) -> Result<Vec<DiscoveredFile>> {
     let include = build_globset(&config.include)?;
     let exclude = build_globset(&config.exclude)?;
-    let docs = build_globset(&config.doc_globs)?;
 
     let mut out = Vec::new();
     for result in WalkBuilder::new(root).build() {
@@ -50,12 +48,10 @@ pub fn discover(root: &Path, config: &Config) -> Result<Vec<DiscoveredFile>> {
             continue;
         }
         let lang = Lang::of(&rel);
-        let is_code = lang.is_code() && include.is_match(rel_str.as_str());
-        let is_doc = config.index_docs && docs.is_match(rel_str.as_str());
-        if !is_code && !is_doc {
+        if !lang.is_code() || !include.is_match(rel_str.as_str()) {
             continue;
         }
-        out.push(DiscoveredFile { rel, abs, lang, is_doc });
+        out.push(DiscoveredFile { rel, abs, lang });
     }
     out.sort_by(|a, b| a.rel.cmp(&b.rel));
     Ok(out)
@@ -92,7 +88,7 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn finds_code_and_docs_skips_excluded() {
+    fn finds_code_skips_docs_and_excluded() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::create_dir_all(root.join("src")).unwrap();
@@ -108,7 +104,7 @@ mod tests {
 
         assert!(rels.contains(&"src/a.ts".to_string()));
         assert!(rels.contains(&"src/b.tsx".to_string()));
-        assert!(rels.contains(&"README.md".to_string()));
+        assert!(!rels.contains(&"README.md".to_string()), "docs are not indexed (code-only)");
         assert!(!rels.iter().any(|r| r.contains("node_modules")), "node_modules excluded");
         assert!(!rels.iter().any(|r| r.ends_with(".d.ts")), "declaration files skipped");
     }
@@ -130,7 +126,7 @@ mod tests {
         assert!(langs.contains(&Lang::Ts));
         assert!(langs.contains(&Lang::Rust));
         assert!(langs.contains(&Lang::Python));
-        assert!(!langs.contains(&Lang::Markdown), "markdown is not a code language");
+        assert!(!langs.contains(&Lang::Other), "non-code files (md) don't count");
         // A repo with no source of a language doesn't report it.
         let empty = tempfile::tempdir().unwrap();
         assert!(present_langs(empty.path(), &Config::default()).unwrap().is_empty());

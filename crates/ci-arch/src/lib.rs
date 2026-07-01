@@ -1,8 +1,8 @@
 //! ci-arch — zero-API folder/architecture map. Pure Rust, language-blind: it dispatches
 //! on the same `ci_walk::Lang` extension tag the indexer uses (TS/TSX/Rust/Python/…), so any
-//! language a provider handles is mapped — per-directory file-kind histograms, co-located docs,
-//! and detected "module templates" (sibling dirs that repeat a file shape). Tells an agent where
-//! a new module goes before a create.
+//! language a provider handles is mapped — per-directory file-kind histograms and detected
+//! "module templates" (sibling dirs that repeat a file shape). Tells an agent where a new module
+//! goes before a create.
 use ci_core::{Error, Result};
 use ci_walk::Lang;
 use ignore::WalkBuilder;
@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 const MAX_ARCH_FILES: usize = 20_000;
-const DOC_NAMES: &[&str] = &["README.md", "AGENTS.md", "CLAUDE.md", "ARCHITECTURE.md"];
 
 #[derive(Debug, Clone)]
 pub struct ArchNode {
@@ -19,7 +18,6 @@ pub struct ArchNode {
     pub files: usize,
     /// filename-pattern histogram, e.g. {".service.ts": 3, "index": 1, ".tsx": 5}.
     pub suffixes: BTreeMap<String, usize>,
-    pub doc: Option<String>,
     /// If this dir is a module container: the file shape its sub-modules repeat.
     pub template: Option<Vec<String>>,
     pub module_count: usize,
@@ -127,7 +125,6 @@ pub fn build_architecture(root: &Path) -> Result<Vec<ArchNode>> {
         for n in &names {
             *suffixes.entry(file_suffix(n)).or_insert(0) += 1;
         }
-        let doc = DOC_NAMES.iter().find(|dn| root.join(d).join(dn).exists()).map(|s| s.to_string());
 
         // Module container: immediate child dirs that repeat a file shape.
         let child_dirs: Vec<&String> = dirs
@@ -169,7 +166,7 @@ pub fn build_architecture(root: &Path) -> Result<Vec<ArchNode>> {
         if names.is_empty() && template.is_none() {
             continue;
         }
-        nodes.push(ArchNode { dir: d.clone(), files: names.len(), suffixes, doc, template, module_count });
+        nodes.push(ArchNode { dir: d.clone(), files: names.len(), suffixes, template, module_count });
     }
     nodes.sort_by(|a, b| a.dir.cmp(&b.dir));
     Ok(nodes)
@@ -191,9 +188,6 @@ pub fn format_architecture(nodes: &[ArchNode], subpath: Option<&str>) -> String 
             sufs.iter().take(5).map(|(s, c)| format!("{s}×{c}")).collect::<Vec<_>>().join(", ");
         let dir = if n.dir.is_empty() { "." } else { n.dir.as_str() };
         let mut line = format!("{dir}/  ({} files: {top})", n.files);
-        if let Some(doc) = &n.doc {
-            line.push_str(&format!("  [doc: {doc}]"));
-        }
         if let Some(t) = &n.template {
             line.push_str(&format!(
                 "\n    ↳ module container: {} sub-modules, each ~ {{ {} }}",

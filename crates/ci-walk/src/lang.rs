@@ -1,14 +1,13 @@
 use std::path::Path;
 
-/// Coarse language tag used for driver dispatch + doc handling. v1 only routes
-/// TS/TSX to a driver; everything else is either docs or ignored.
+/// Coarse language tag used for provider dispatch. Marksman is code-only; anything that isn't a
+/// source language a provider handles is `Other` (ignored).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lang {
     Ts,
     Tsx,
     Rust,
     Python,
-    Markdown,
     Other,
 }
 
@@ -23,7 +22,6 @@ impl Lang {
             Some("tsx") => Lang::Tsx,
             Some("rs") => Lang::Rust,
             Some("py") | Some("pyi") => Lang::Python,
-            Some("md") | Some("mdx") => Lang::Markdown,
             _ => Lang::Other,
         }
     }
@@ -44,7 +42,7 @@ mod tests {
         assert_eq!(Lang::of(Path::new("src/a.ts")), Lang::Ts);
         assert_eq!(Lang::of(Path::new("src/a.tsx")), Lang::Tsx);
         assert_eq!(Lang::of(Path::new("src/a.d.ts")), Lang::Other);
-        assert_eq!(Lang::of(Path::new("README.md")), Lang::Markdown);
+        assert_eq!(Lang::of(Path::new("README.md")), Lang::Other);
         assert_eq!(Lang::of(Path::new("Cargo.toml")), Lang::Other);
         assert!(Lang::of(Path::new("x.ts")).is_code());
         assert!(!Lang::of(Path::new("x.md")).is_code());

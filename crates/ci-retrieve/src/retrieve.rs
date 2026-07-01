@@ -17,10 +17,6 @@ pub struct RetrieveOptions {
     pub max_expand: Option<usize>,
 }
 
-fn is_doc_file(f: &str) -> bool {
-    f.ends_with(".md") || f.ends_with(".mdx")
-}
-
 fn files_from_rows(rows: &[(usize, f64)], chunks: &[ChunkMeta]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -75,9 +71,6 @@ fn symbol_name_search(
     let ql = q_raw.to_lowercase();
     let mut best: HashMap<String, (i32, bool)> = HashMap::new();
     for s in symbols {
-        if matches!(s.kind, SymbolKind::Doc) {
-            continue;
-        }
         let mut score = 0i32;
         for t in tokenize(&s.name) {
             if q.contains(t.as_str()) {
@@ -246,18 +239,16 @@ pub fn retrieve(
     let mut matched: HashMap<String, Vec<MatchedSym>> = HashMap::new();
     for (row, _) in vec_rows.iter().take(40) {
         if let Some(c) = index.chunks.get(*row) {
-            if !matches!(c.kind, SymbolKind::Doc) {
-                let arr = matched.entry(c.file.clone()).or_default();
-                if arr.len() < 6
-                    && !arr.iter().any(|x| x.name == c.symbol && x.line_range[0] == c.start_line)
-                {
-                    arr.push(MatchedSym {
-                        node_id: c.id.clone(),
-                        name: c.symbol.clone(),
-                        kind: c.kind,
-                        line_range: [c.start_line, c.end_line],
-                    });
-                }
+            let arr = matched.entry(c.file.clone()).or_default();
+            if arr.len() < 6
+                && !arr.iter().any(|x| x.name == c.symbol && x.line_range[0] == c.start_line)
+            {
+                arr.push(MatchedSym {
+                    node_id: c.id.clone(),
+                    name: c.symbol.clone(),
+                    kind: c.kind,
+                    line_range: [c.start_line, c.end_line],
+                });
             }
         }
     }
@@ -282,7 +273,7 @@ pub fn retrieve(
         let sym_b = config.symbol_match_bonus as f64 * sym_strength.get(file).copied().unwrap_or(0.0);
         let score = base + config.adjacency_bonus as f64 * adj as f64 + sym_b;
         let reason: String = if is_seed {
-            if is_doc_file(file) { "doc".into() } else { "query-match".into() }
+            "query-match".into()
         } else {
             exp.unwrap().reason.to_string()
         };
@@ -408,7 +399,6 @@ pub fn find_symbols(
     let mut hits: Vec<SymbolHit> = index
         .symbols
         .iter()
-        .filter(|s| !matches!(s.kind, SymbolKind::Doc))
         .filter_map(|s| {
             let nl = s.name.to_lowercase();
             let exact = nl == ql;
@@ -499,15 +489,14 @@ mod tests {
     }
 
     #[test]
-    fn find_symbols_returns_handles_exact_first_excludes_docs() {
+    fn find_symbols_returns_handles_exact_first() {
         let index = index_with_symbols(vec![
             sym("a.ts", "parseConfig"),
             sym("b.ts", "parse"),
             sym("c.ts", "parseConfigFile"),
-            SymbolEntry { kind: SymbolKind::Doc, ..sym("d.md", "parse") }, // doc: never a hit
         ]);
 
-        // Exact mode: only the whole-name "parse" (doc excluded).
+        // Exact mode: only the whole-name "parse".
         let (hits, total) = find_symbols(&index, "parse", false, &Config::default(), 50);
         assert_eq!(total, 1, "exact-only match count");
         assert_eq!(hits[0].node_id, "b.ts#parse", "hit is a self-locating handle");
@@ -517,7 +506,6 @@ mod tests {
         let (hits, total) = find_symbols(&index, "parse", true, &Config::default(), 50);
         assert_eq!(total, 3);
         assert_eq!(hits[0].node_id, "b.ts#parse", "exact match ranks ahead of substrings");
-        assert!(hits.iter().all(|h| h.kind != SymbolKind::Doc), "docs excluded");
 
         // Cap truncates but the total still reports every match.
         let (capped, total) = find_symbols(&index, "parse", true, &Config::default(), 1);

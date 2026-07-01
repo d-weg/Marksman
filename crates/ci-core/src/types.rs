@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 /// Symbol categories, normalized across languages. The TS driver maps ts-morph
 /// node kinds onto these; future drivers map their own. Mirrors the nodeId
-/// prefixes (fn_/cls_/iface_/enum_/type_/var_/meth_) plus doc sections.
+/// prefixes (fn_/cls_/iface_/enum_/type_/var_/meth_).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SymbolKind {
@@ -19,7 +19,6 @@ pub enum SymbolKind {
     Variable,
     Method,
     Struct,
-    Doc,
 }
 
 impl SymbolKind {
@@ -35,7 +34,6 @@ impl SymbolKind {
             SymbolKind::Variable => "var",
             SymbolKind::Method => "method",
             SymbolKind::Struct => "struct",
-            SymbolKind::Doc => "doc",
         }
     }
 }
@@ -320,7 +318,6 @@ mod tests {
         for k in [
             SymbolKind::Function, SymbolKind::Class, SymbolKind::Interface, SymbolKind::Enum,
             SymbolKind::TypeAlias, SymbolKind::Variable, SymbolKind::Method, SymbolKind::Struct,
-            SymbolKind::Doc,
         ] {
             let serde_name = serde_json::to_string(&k).unwrap();
             assert_eq!(format!("\"{}\"", k.as_str()), serde_name, "as_str vs serde for {k:?}");

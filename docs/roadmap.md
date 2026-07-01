@@ -12,6 +12,11 @@ smallest safe change, keep the suite green, one commit per batch, tick the boxes
    note here. Optionally `/code-review` the diff first.
 
 ## Invariants (the bar every batch holds)
+- **Code only.** Marksman indexes and edits **source code** — nothing else. No docs (`.md`), no
+  config/data (`.toml`/`.json`/`.yaml`). Code already has richer structural editing (AST-anchored,
+  gated `apply_edits`) than any key-path editor could give a data file, and non-code files are a
+  different domain agents handle with plain text tools. Keeps the surface (and the MCP tool schema)
+  focused. The only "doc" that stays is a code symbol's own leading comment/docstring (`:doc`).
 - **Pure-Rust core.** Indexing, the Model2Vec embedder, BM25, RRF, retrieval, the VFS, and the
   edit-gate *orchestration* need nothing but Rust. Any runtime dependency (Node, an indexer, a
   language server) belongs to a **language provider**, never the core. Load-bearing.

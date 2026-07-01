@@ -181,7 +181,7 @@ impl Server {
                 // Inline only the few top entries, tightly capped: a big `outline`/`full` dump
                 // gets re-read every subsequent turn (cumulative input), so bounding it matters
                 // more than completeness — the agent can read_node / retrieve again for more.
-                if shown >= 4 || e.reason == "doc" || e.file.ends_with(".md") {
+                if shown >= 4 {
                     continue;
                 }
                 let Ok(content) = std::fs::read_to_string(self.root.join(&e.file)) else { continue };

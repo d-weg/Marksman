@@ -164,7 +164,6 @@ fn sym_to_i32(k: SymbolKind) -> i32 {
         Variable => 5,
         Method => 6,
         Struct => 7,
-        Doc => 8,
     }
 }
 
@@ -178,7 +177,6 @@ fn i32_to_sym(i: i32) -> SymbolKind {
         5 => Variable,
         6 => Method,
         7 => Struct,
-        8 => Doc,
         _ => Function,
     }
 }

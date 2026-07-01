@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 
 /// On-disk index schema version. Bump when a persisted shape changes; `load_index` refuses a
 /// mismatched index (with a "re-run index" hint) rather than silently mis-reading an old layout.
-pub const INDEX_VERSION: u32 = 1;
+/// v2: dropped the `doc` symbol kind — Marksman is code-only, so an old index that holds doc
+/// chunks is rejected and rebuilt cleanly.
+pub const INDEX_VERSION: u32 = 2;
 
 pub struct IndexData {
     pub meta: IndexMeta,
@@ -183,7 +185,7 @@ mod tests {
 
         let data = IndexData {
             meta: IndexMeta {
-                version: 1,
+                version: INDEX_VERSION,
                 created_at: "t".into(),
                 updated_at: "t".into(),
                 model: "m".into(),
@@ -225,7 +227,7 @@ mod tests {
         forward.insert("a.ts".into(), vec!["b.ts".into()]);
         IndexData {
             meta: IndexMeta {
-                version: 1, created_at: "t".into(), updated_at: "t".into(), model: "m".into(),
+                version: INDEX_VERSION, created_at: "t".into(), updated_at: "t".into(), model: "m".into(),
                 dims: 2, root: root.display().to_string(), is_monorepo: false, packages: vec![],
                 package_names: vec![], files: BTreeMap::new(),
             },

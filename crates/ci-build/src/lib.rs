@@ -4,7 +4,7 @@
 //! an [`IndexData`]. The embedder is injected so this crate stays free of the model
 //! and is unit-testable with a trivial stand-in (mirrors how ci-retrieve injects the
 //! query vector).
-use ci_core::{Config, Result, SymbolKind};
+use ci_core::{Config, Result};
 use ci_index::{
     build_graph, tokenize, Adjacency, Bm25, ChunkMeta, FileRecord, IndexData, IndexMeta,
     PackageMeta, SymbolEntry,
@@ -48,82 +48,6 @@ fn slice_lines(text: &str, start_line: u32, end_line: u32) -> String {
         .join("\n")
 }
 
-fn truncate_chars(s: &str, n: usize) -> String {
-    s.chars().take(n).collect()
-}
-
-fn heading(line: &str) -> Option<String> {
-    let l = line.trim_start_matches(' ');
-    let hashes = l.chars().take_while(|c| *c == '#').count();
-    if (1..=3).contains(&hashes) {
-        let rest = &l[hashes..];
-        if rest.starts_with([' ', '\t']) {
-            let title = rest.trim();
-            if !title.is_empty() {
-                return Some(title.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Split a markdown file into heading sections -> doc chunks (port of extractDocChunks).
-fn doc_items(rel: &str, content: &str) -> Vec<Item> {
-    let base = Path::new(rel)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| rel.to_string());
-    struct Sec {
-        title: String,
-        start: usize,
-        body: Vec<String>,
-    }
-    let mut sections: Vec<Sec> = Vec::new();
-    let mut cur = Sec { title: base.clone(), start: 1, body: vec![] };
-    for (i, line) in content.split('\n').enumerate() {
-        if let Some(t) = heading(line) {
-            if cur.body.iter().any(|l| !l.trim().is_empty()) {
-                sections.push(cur);
-            }
-            cur = Sec { title: t, start: i + 1, body: vec![] };
-        }
-        cur.body.push(line.to_string());
-    }
-    if cur.body.iter().any(|l| !l.trim().is_empty()) {
-        sections.push(cur);
-    }
-
-    sections
-        .into_iter()
-        .map(|s| {
-            let end_line = s.start + s.body.len() - 1;
-            let name = truncate_chars(&format!("{base}:{}", s.title), 80);
-            let id = format!("{rel}#{}@{}", s.title, s.start);
-            let sym = SymbolEntry {
-                id: id.clone(),
-                name: name.clone(),
-                kind: SymbolKind::Doc,
-                file: rel.to_string(),
-                pkg: "docs".to_string(),
-                start_line: s.start as u32,
-                end_line: end_line as u32,
-                signature: Some(truncate_chars(&s.title, 140)),
-            };
-            let chunk = ChunkMeta {
-                id,
-                symbol: name,
-                kind: SymbolKind::Doc,
-                file: rel.to_string(),
-                pkg: "docs".to_string(),
-                start_line: s.start as u32,
-                end_line: end_line as u32,
-            };
-            let text = truncate_chars(&format!("doc {}\n{}", s.title, s.body.join("\n")), 1500);
-            Item { sym, chunk, text }
-        })
-        .collect()
-}
-
 /// Build a fresh index. `embed` maps chunk text -> a normalized vector (all the
 /// same dimension). Returns the assembled [`IndexData`]; the caller persists it.
 pub fn build_index(
@@ -144,19 +68,13 @@ pub fn build_index(
 
         // Per-file provider dispatch: a mixed repo indexes each file with its own language's
         // provider (skip a code file whose language has no active provider).
-        if f.lang.is_code() {
-            let Some(provider) = registry.provider_for(&f.rel) else { continue };
-            let pkg = ws.package_for(&f.rel).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
-            let content = std::fs::read_to_string(&abs).unwrap_or_default();
-            for node in provider.structure(&f.rel)? {
-                node_items(&node, &rel, &pkg, &content, &mut items);
-            }
-            file_records.insert(rel.clone(), FileRecord { mtime_ms: mtime_ms(&abs), pkg });
-        } else if f.is_doc {
-            let content = std::fs::read_to_string(&abs).unwrap_or_default();
-            items.extend(doc_items(&rel, &content));
-            file_records.insert(rel.clone(), FileRecord { mtime_ms: mtime_ms(&abs), pkg: "docs".into() });
+        let Some(provider) = registry.provider_for(&f.rel) else { continue };
+        let pkg = ws.package_for(&f.rel).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        for node in provider.structure(&f.rel)? {
+            node_items(&node, &rel, &pkg, &content, &mut items);
         }
+        file_records.insert(rel.clone(), FileRecord { mtime_ms: mtime_ms(&abs), pkg });
     }
 
     // Embed (injected) — vectors are row-aligned with `items`.
@@ -232,18 +150,15 @@ pub fn update_index(
         if !abs.exists() {
             continue; // deletion -> nothing to add back
         }
-        let lang = Lang::of(Path::new(rel));
-        if lang.is_code() {
-            let Some(provider) = registry.provider_for(Path::new(rel)) else { continue };
-            let pkg =
-                ws.package_for(Path::new(rel)).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
-            let content = std::fs::read_to_string(&abs).unwrap_or_default();
-            for node in provider.structure(Path::new(rel))? {
-                node_items(&node, rel, &pkg, &content, &mut new_items);
-            }
-        } else if matches!(lang, Lang::Markdown) {
-            let content = std::fs::read_to_string(&abs).unwrap_or_default();
-            new_items.extend(doc_items(rel, &content));
+        if !Lang::of(Path::new(rel)).is_code() {
+            continue; // non-code files aren't indexed
+        }
+        let Some(provider) = registry.provider_for(Path::new(rel)) else { continue };
+        let pkg =
+            ws.package_for(Path::new(rel)).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
+        let content = std::fs::read_to_string(&abs).unwrap_or_default();
+        for node in provider.structure(Path::new(rel))? {
+            node_items(&node, rel, &pkg, &content, &mut new_items);
         }
     }
     for item in &new_items {
@@ -264,16 +179,12 @@ pub fn update_index(
     let forward = forward_adjacency(registry)?;
     let graph = build_graph(forward.clone());
 
-    // 5. Meta: refresh/remove the changed files' records.
+    // 5. Meta: refresh/remove the changed code files' records (non-code isn't indexed).
     let mut files = data.meta.files.clone();
     for rel in &changed_set {
         let abs = root.join(rel);
-        if abs.exists() {
-            let pkg = if matches!(Lang::of(Path::new(rel)), Lang::Markdown) {
-                "docs".to_string()
-            } else {
-                ws.package_for(Path::new(rel)).map(|p| p.name.clone()).unwrap_or_else(|| "root".into())
-            };
+        if abs.exists() && Lang::of(Path::new(rel)).is_code() {
+            let pkg = ws.package_for(Path::new(rel)).map(|p| p.name.clone()).unwrap_or_else(|| "root".into());
             files.insert(rel.clone(), FileRecord { mtime_ms: mtime_ms(&abs), pkg });
         } else {
             files.remove(rel);
@@ -354,7 +265,7 @@ fn node_items(node: &ci_core::Node, rel: &str, pkg: &str, content: &str, out: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ci_core::{Granularity, ImportGraph, LanguageProvider, Node, NodeKind, Range};
+    use ci_core::{Granularity, ImportGraph, LanguageProvider, Node, NodeKind, Range, SymbolKind};
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -421,7 +332,7 @@ mod tests {
         graph.insert(PathBuf::from("src/app.ts"), vec![PathBuf::from("src/math.ts")]);
         let provider = MockProvider { by_file, graph };
 
-        let config = Config { index_docs: false, ..Default::default() };
+        let config = Config::default();
         let registry = ProviderRegistry::single(Arc::new(provider));
         let index = build_index(root, &config, &registry, toy_embed).unwrap();
 
@@ -471,7 +382,7 @@ mod tests {
         registry.register(vec![Lang::Ts, Lang::Tsx], Arc::new(ts));
         registry.register(vec![Lang::Rust], Arc::new(rs));
 
-        let config = Config { index_docs: false, include: vec!["**/*.ts".into(), "**/*.rs".into()], ..Default::default() };
+        let config = Config { include: vec!["**/*.ts".into(), "**/*.rs".into()], ..Default::default() };
         let index = build_index(root, &config, &registry, toy_embed).unwrap();
 
         // Every language's symbols are indexed into the one unified index.
@@ -497,7 +408,7 @@ mod tests {
         by_file.insert("src/b.ts".into(), vec![sym_node("src/b.ts#bee", "bee", 1, 3)]);
         let v1 = MockProvider { by_file, graph: ImportGraph::new() };
 
-        let config = Config { index_docs: false, ..Default::default() };
+        let config = Config::default();
         let r1 = ProviderRegistry::single(Arc::new(v1));
         let initial = build_index(root, &config, &r1, toy_embed).unwrap();
         assert!(initial.bm25.search(&tokenize("alpha"), 5).iter().any(|(id, _)| id == "src/a.ts#alpha"));
@@ -527,7 +438,7 @@ mod tests {
         // A crate that depends on axum → backend role persisted in PackageMeta (from Cargo deps).
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let config = Config { index_docs: false, ..Default::default() };
+        let config = Config::default();
         fs::create_dir_all(root.join("svc/src")).unwrap();
         fs::write(
             root.join("svc/Cargo.toml"),
@@ -550,7 +461,7 @@ mod tests {
         // post-edit reindex the MCP server now runs actually survives a round-trip.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let config = Config { index_docs: false, ..Default::default() };
+        let config = Config::default();
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/a.ts"), "export function alpha() {\n  return 1;\n}\n").unwrap();
 

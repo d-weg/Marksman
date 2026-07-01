@@ -49,8 +49,6 @@ pub struct Config {
     pub include: Vec<String>,
     pub exclude: Vec<String>,
     pub languages: Vec<String>,
-    pub index_docs: bool,
-    pub doc_globs: Vec<String>,
     pub adjacency_bonus: f32,
     pub rrf_k: f32,
     /// Additive final-score bonus for a file whose symbol name the query matches, scaled by
@@ -95,8 +93,6 @@ impl Default for Config {
                 "**/.codeindex/**".into(),
             ],
             languages: vec!["ts".into(), "tsx".into()],
-            index_docs: true,
-            doc_globs: vec!["**/*.md".into(), "**/*.mdx".into()],
             adjacency_bonus: 0.4,
             rrf_k: 60.0,
             symbol_match_bonus: default_symbol_match_bonus(),
