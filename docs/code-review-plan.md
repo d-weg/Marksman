@@ -93,13 +93,20 @@ a later pass rather than widening Batch 2.
 would panic rather than error. dims always match in practice; harden with a guard in a later pass
 rather than churn the ranking hot path without a repro.
 
-### Batch 4 — language providers (shrinks a lot after the cross-cutting refactor)
-- [ ] `langs/lang-ts/src/{ast,lib,tsmorph,sidecar,outline}.rs` (880) — SCIP+tree-sitter merge,
-      `decl_with_fields` climb guard, field-range widening, the warm-engine lifecycle, sidecar.
-- [ ] `langs/lang-rust/src/{lib,sidecar}.rs` (601) — item/`:doc` collection, `mod` resolution,
-      rust-analyzer warm/retry, sidecar.
-- [ ] `langs/lang-fallback/src/lib.rs` (683) — Python structure/imports/outline, the `NoGate`
-      within-file rename, `gated:false` semantics.
+### Batch 4 — language providers  ✅
+- [x] `langs/lang-ts/*` — SCIP+tree-sitter merge, `decl_with_fields` climb guard + field-range
+      widening (sound, with the `sym_start` guard against climbing into the enclosing class), warm
+      engine lifecycle + sidecar (deadlines, stderr capture, Drop kill/wait) all correct. Fixed a
+      stray double blank line (extraction leftover); deduped intra-crate `npm_cache` into one
+      `pub(crate)` fn shared by `lib.rs`/`tsmorph.rs`.
+- [x] `langs/lang-rust/*` — item/`:doc` collection, `mod` resolution, the opt-in SCIP graph with
+      instant `mod`-graph fallback, warm/retry: all sound. No change beyond the cross-cutting dedup.
+- [x] `langs/lang-fallback/*` — Python structure/imports/outline, `NoGate` within-file textual
+      rename (honest `gated:false`), no-op gate semantics: correct. No change beyond the dedup.
+
+**Cross-cutting dedup:** the reverse-import-map construction was byte-identical in all three
+providers' `apply_edits`. Extracted `ci_core::reverse_import_map(&ImportGraph)` (language-blind,
+operates on the core type) with a unit test; each provider now calls it. ~21 dup lines removed.
 
 ### Batch 5 — surface + protocol
 - [ ] `ci-mcp/src/main.rs` (679) — tool schemas, resolution (`resolve_symbol`/`resolve_query`),

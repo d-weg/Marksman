@@ -17,8 +17,9 @@ mod tsmorph;
 
 pub use outline::outline;
 
-/// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`.
-fn npm_cache() -> PathBuf {
+/// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`. Shared with the
+/// ts-morph sidecar (`tsmorph.rs`) so both TS tooling paths use the same cache location.
+pub(crate) fn npm_cache() -> PathBuf {
     std::env::var("CI_NPM_CACHE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
 }
 
@@ -195,13 +196,7 @@ impl LanguageProvider for TsProvider {
         let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
 
         // Reverse import map (file -> who imports it) for the delete-safety check.
-        let mut reverse: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-        for (from, tos) in self.scip.import_graph().unwrap_or_default() {
-            let f = from.to_string_lossy().replace('\\', "/");
-            for to in tos {
-                reverse.entry(to.to_string_lossy().replace('\\', "/")).or_default().push(f.clone());
-            }
-        }
+        let reverse = ci_core::reverse_import_map(&self.scip.import_graph().unwrap_or_default());
         let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
 
         let r = ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);

@@ -1,6 +1,6 @@
 //! Language-blind contract types. Drivers speak these; the core never sees syntax.
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 /// Symbol categories, normalized across languages. The TS driver maps ts-morph
@@ -97,6 +97,20 @@ impl Node {
 
 /// file (repo-relative) -> the files it imports (repo-relative).
 pub type ImportGraph = BTreeMap<PathBuf, Vec<PathBuf>>;
+
+/// Invert an [`ImportGraph`] (file → files it imports) into a reverse map (file → the files that
+/// import it), keyed by repo-relative posix strings. Every tree-sitter/SCIP provider builds this
+/// identically to feed the edit layer's delete-safety + blast-radius check (`reverse_imports`).
+pub fn reverse_import_map(graph: &ImportGraph) -> HashMap<String, Vec<String>> {
+    let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+    for (from, tos) in graph {
+        let f = from.to_string_lossy().replace('\\', "/");
+        for to in tos {
+            reverse.entry(to.to_string_lossy().replace('\\', "/")).or_default().push(f.clone());
+        }
+    }
+    reverse
+}
 
 // ---------------------------------------------------------------------------
 // Edit protocol — mirrors src/edit/types.ts `AgentOp` in the TS implementation.
@@ -235,6 +249,18 @@ mod tests {
         assert!(j.contains("\"type\":\"RENAME\""));
         let back: EditOp = serde_json::from_str(&j).unwrap();
         assert!(matches!(back, EditOp::Rename { .. }));
+    }
+
+    #[test]
+    fn reverse_import_map_inverts_edges() {
+        let mut g: ImportGraph = BTreeMap::new();
+        g.insert(PathBuf::from("a.ts"), vec![PathBuf::from("c.ts")]);
+        g.insert(PathBuf::from("b.ts"), vec![PathBuf::from("c.ts")]);
+        let rev = reverse_import_map(&g);
+        let mut importers = rev.get("c.ts").cloned().unwrap_or_default();
+        importers.sort();
+        assert_eq!(importers, vec!["a.ts".to_string(), "b.ts".to_string()]);
+        assert!(!rev.contains_key("a.ts"), "a.ts has no importers");
     }
 
     #[test]

@@ -23,11 +23,7 @@ fn ts_morph_home() -> PathBuf {
         .unwrap_or_else(|_| std::env::temp_dir().join("ci-tsmorph"))
 }
 
-fn npm_cache() -> PathBuf {
-    std::env::var("CI_NPM_CACHE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
-}
+use crate::npm_cache;
 
 /// Ensure ts-morph is installed in `home` (one-time `npm install --prefix`), then drop the
 /// bundled sidecar next to its `node_modules` so `require('ts-morph')` resolves.

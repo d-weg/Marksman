@@ -138,7 +138,6 @@ fn decl_with_fields(mut n: TsNode) -> TsNode {
     }
 }
 
-
 /// Byte offset of (1-based line, 0-based char). ASCII-accurate (code is ~ASCII).
 fn point_byte(content: &str, line_1: u32, char_0: u32) -> Option<usize> {
     if line_1 == 0 {

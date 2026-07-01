@@ -139,13 +139,7 @@ impl LanguageProvider for FallbackProvider {
         let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
 
         // Reverse import map (file -> who imports it) for the delete-safety check.
-        let mut reverse: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-        for (from, tos) in self.import_graph().unwrap_or_default() {
-            let f = from.to_string_lossy().replace('\\', "/");
-            for to in tos {
-                reverse.entry(to.to_string_lossy().replace('\\', "/")).or_default().push(f.clone());
-            }
-        }
+        let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
         let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
 
         ci_edit::commit_edits(&self.root, ops, &structure_of, &mut engine, opts, &reverse_imports)

@@ -10,7 +10,7 @@ use ci_core::{
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
 use ci_treesitter::{syntax_node, ts_range};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -192,13 +192,7 @@ impl LanguageProvider for RustProvider {
 
         // Reverse import map (file -> who `mod`-includes it) for the blast-radius gate + delete
         // safety, derived from the tree-sitter mod graph.
-        let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
-        for (from, tos) in self.import_graph().unwrap_or_default() {
-            let f = from.to_string_lossy().replace('\\', "/");
-            for to in tos {
-                reverse.entry(to.to_string_lossy().replace('\\', "/")).or_default().push(f.clone());
-            }
-        }
+        let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
         let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
 
         ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
