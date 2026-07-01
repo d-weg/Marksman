@@ -74,13 +74,24 @@ near-identical (1-based line / 0-based char → byte offset). A shared `ci_core`
 them, but both already depend on `ci-core`, and it's unrelated to the edit-path audit — noting for
 a later pass rather than widening Batch 2.
 
-### Batch 3 — retrieval + index
-- [ ] `ci-retrieve/src/retrieve.rs` (553) — RRF, `contains_word`, symbol bonus, graph expansion;
-      the char-boundary advance + exact-flag preservation (past bug sites).
-- [ ] `ci-index/src/*` (514, 6 files) — BM25, vector store, graph store, persistence/snapshot.
-- [ ] `ci-embed/src/*` (218) — Model2Vec tokenize + safetensors; parity invariants.
-- [ ] `ci-scip/src/lib.rs` (244) — SCIP reader → `Node` tree + import graph.
-- [ ] `ci-build/src/lib.rs` (452) — the walk→structure→embed→persist pipeline; incremental keys.
+### Batch 3 — retrieval + index  ✅
+- [x] `ci-retrieve/src/{retrieve,rrf}.rs` — RRF, `contains_word` (multibyte advance), symbol bonus,
+      exact-flag survival, graph expansion: all correct, and the two past bug sites have explicit
+      regression tests. No change.
+- [x] `ci-index/src/*` (6 files) — BM25 (df bookkeeping), vector rank, graph reverse-derivation,
+      JSON+f32 persistence, types: faithful ports, well-tested. No change.
+- [x] `ci-embed/src/*` — Model2Vec embedder is a bit-exact, parity-tested port (worst cosine
+      > 0.99999); unchecked indexing is all against trusted on-disk tensors. No change.
+- [x] `ci-scip/src/lib.rs` — SCIP symbol-grammar parse → `Node` tree + reference-based import
+      graph: correct, well-tested. No change.
+- [x] `ci-build/src/lib.rs` — walk→structure→embed→persist + incremental refresh audited (row
+      alignment, incremental keys sound). Extracted `forward_adjacency` (the provider-import-graph
+      → string-adjacency block was verbatim in `build_index` and `update_index`). No behavior change.
+
+**Deferred note (latent, not a live bug):** `ci-index::cosine_normalized` indexes the matrix by
+`query.len()`, so a query whose length exceeds `dims` (e.g. an index built with a different model)
+would panic rather than error. dims always match in practice; harden with a guard in a later pass
+rather than churn the ranking hot path without a repro.
 
 ### Batch 4 — language providers (shrinks a lot after the cross-cutting refactor)
 - [ ] `langs/lang-ts/src/{ast,lib,tsmorph,sidecar,outline}.rs` (880) — SCIP+tree-sitter merge,

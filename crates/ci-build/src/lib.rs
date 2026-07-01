@@ -168,14 +168,7 @@ pub fn build_index(
     }
 
     // Import graph (provider-derived) -> string adjacency.
-    let mut forward = Adjacency::new();
-    for (from, tos) in provider.import_graph()? {
-        let from_s = from.to_string_lossy().replace('\\', "/");
-        let tos_s: Vec<String> = tos.iter().map(|t| t.to_string_lossy().replace('\\', "/")).collect();
-        if !tos_s.is_empty() {
-            forward.insert(from_s, tos_s);
-        }
-    }
+    let forward = forward_adjacency(provider)?;
 
     let meta = IndexMeta {
         version: 1,
@@ -263,14 +256,7 @@ pub fn update_index(
     }
 
     // 4. Import graph: SCIP is whole-project, so take the fresh full graph.
-    let mut forward = Adjacency::new();
-    for (from, tos) in provider.import_graph()? {
-        let f = from.to_string_lossy().replace('\\', "/");
-        let ts: Vec<String> = tos.iter().map(|t| t.to_string_lossy().replace('\\', "/")).collect();
-        if !ts.is_empty() {
-            forward.insert(f, ts);
-        }
-    }
+    let forward = forward_adjacency(provider)?;
     let graph = build_graph(forward.clone());
 
     // 5. Meta: refresh/remove the changed files' records.
@@ -295,6 +281,21 @@ pub fn update_index(
     meta.files = files;
 
     Ok(IndexData { meta, symbols, chunks, vectors, forward, graph, bm25 })
+}
+
+/// The provider's import graph as string adjacency (repo-relative posix paths), dropping any
+/// file with no outgoing edges. Both the full build and the incremental refresh take the whole
+/// graph from the provider (SCIP is whole-project), so this is shared.
+fn forward_adjacency(provider: &dyn LanguageProvider) -> Result<Adjacency> {
+    let mut forward = Adjacency::new();
+    for (from, tos) in provider.import_graph()? {
+        let from_s = from.to_string_lossy().replace('\\', "/");
+        let tos_s: Vec<String> = tos.iter().map(|t| t.to_string_lossy().replace('\\', "/")).collect();
+        if !tos_s.is_empty() {
+            forward.insert(from_s, tos_s);
+        }
+    }
+    Ok(forward)
 }
 
 /// Walk a structure node, emitting an Item for every NAMED symbol (any depth).
