@@ -173,7 +173,7 @@ per-file dispatch at index time.
       (highest-priority in `sidecar_command_with` — the offline/air-gapped path); `version` pins a
       tool version. Env override `CI_PROVIDER_<LANG>_ENABLED`.
 
-### Batch 7 — Deeper edits + structured non-code providers
+### Batch 7 — Deeper edits + structured non-code providers  ✅ done
 **Why:** extend surgical editing to single statements and to the config/data/docs files agents touch
 alongside code.
 - [x] Statement-level body edits: `insert_in_body` (append, or after a unique body line) /
@@ -191,15 +191,15 @@ alongside code.
       sub-node edit on a line with a multi-byte char before it mis-resolved. The `Range` column
       contract is now documented as 0-based UTF-8 bytes (matches tree-sitter + the VFS); non-ASCII
       tests in `ci-core` and `ci-vfs`. (SCIP/LSP UTF-16 boundaries convert at their own edges.)
-- [x] Structured edits **TOML + Markdown**: `set_key` / `delete_key` in `ci-edit::structured` —
-      edit by structural **key** (dotted TOML path, format-preserving via `toml_edit`) or **heading
-      path** (`/`-nested Markdown section). No reformatting (only the addressed value/section
-      changes), **ungated** (the gate excludes structured files; a structured-only batch never boots
-      a language server), and applied in the **same atomic batch** as the code edit via
-      `commit_edits` — proven end-to-end (a `Cargo.toml` dep beside a Python `set_body`, one commit).
-- [ ] Structured edits **JSON + YAML** (follow-up): JSON format-preserving needs a span-aware editor
-      (`serde_json` reformats on re-serialize); YAML lacks a maintained format-preserving crate. Same
-      `set_key`/`delete_key` seam — a new `Format` arm each.
+- [x] Structured providers (**TOML / JSON / YAML / Markdown**): `set_key` / `delete_key` in
+      `ci-edit::structured`, edit by structural **key** (dotted path for TOML/JSON/YAML) or **heading
+      path** (`/`-nested Markdown section). No reformatting — TOML via `toml_edit`; JSON via a small
+      byte-span scanner (no dependency; `serde_json` validates the result so a splice can never write
+      corrupt JSON); YAML line-based (block mappings only — the common config shape; flow style /
+      anchors out of scope); Markdown by section. **Ungated** (the gate excludes structured files; a
+      structured-only batch never boots a language server) and applied in the **same atomic batch**
+      as the code edit via `commit_edits` — proven end-to-end (a `Cargo.toml` dep beside a Python
+      `set_body`, one commit).
 
 ### Batch 8 — Breadth: more languages + retrieval scale
 **Why:** last, once the lifecycle / safety / quality floor is in.
