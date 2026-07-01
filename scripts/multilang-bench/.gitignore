@@ -1,1 +1,3 @@
+# Generated at index time — never commit the fixture's indexes / scip caches.
 fixture/.codeindex-rs/
+fixture/.codeindex/
