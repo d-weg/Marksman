@@ -663,6 +663,29 @@ mod tests {
     }
 
     #[test]
+    fn structured_edit_rides_the_same_atomic_batch_as_code() {
+        // The headline of item 4: a Cargo.toml dep change lands in the SAME apply_edits batch as the
+        // code edit that needs it — one atomic commit, the structured file format-preserving/ungated.
+        let dir = py_project();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[dependencies]\nserde = \"1.0\"\n").unwrap();
+        let p = FallbackProvider::new(root, FbLang::Python);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let res = p
+            .apply_edits(
+                &[
+                    EditOp::SetBody { node_id: "pkg/math_utils.py#add".into(), body: "return a * b".into() },
+                    EditOp::SetKey { path: "Cargo.toml".into(), key: "dependencies.serde".into(), value: "\"1.2\"".into() },
+                ],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "mixed code+config batch commits: {res:?}");
+        assert!(fs::read_to_string(root.join("pkg/math_utils.py")).unwrap().contains("return a * b"), "code edit landed");
+        assert!(fs::read_to_string(root.join("Cargo.toml")).unwrap().contains("serde = \"1.2\""), "config edit landed");
+    }
+
+    #[test]
     fn ungated_insert_in_body_python_suite() {
         let dir = py_project();
         let root = dir.path();

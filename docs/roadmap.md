@@ -191,9 +191,15 @@ alongside code.
       sub-node edit on a line with a multi-byte char before it mis-resolved. The `Range` column
       contract is now documented as 0-based UTF-8 bytes (matches tree-sitter + the VFS); non-ASCII
       tests in `ci-core` and `ci-vfs`. (SCIP/LSP UTF-16 boundaries convert at their own edges.)
-- [ ] Structured providers (JSON/YAML/TOML/Markdown): edit by structural **key** / heading path — no
-      reformatting, no gate (no type-check) — in the **same atomic batch** as the code edit that
-      needs them (e.g. a `package.json`/`Cargo.toml` dep beside the import that uses it).
+- [x] Structured edits **TOML + Markdown**: `set_key` / `delete_key` in `ci-edit::structured` —
+      edit by structural **key** (dotted TOML path, format-preserving via `toml_edit`) or **heading
+      path** (`/`-nested Markdown section). No reformatting (only the addressed value/section
+      changes), **ungated** (the gate excludes structured files; a structured-only batch never boots
+      a language server), and applied in the **same atomic batch** as the code edit via
+      `commit_edits` — proven end-to-end (a `Cargo.toml` dep beside a Python `set_body`, one commit).
+- [ ] Structured edits **JSON + YAML** (follow-up): JSON format-preserving needs a span-aware editor
+      (`serde_json` reformats on re-serialize); YAML lacks a maintained format-preserving crate. Same
+      `set_key`/`delete_key` seam — a new `Format` arm each.
 
 ### Batch 8 — Breadth: more languages + retrieval scale
 **Why:** last, once the lifecycle / safety / quality floor is in.

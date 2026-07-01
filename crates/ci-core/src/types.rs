@@ -177,6 +177,15 @@ pub enum EditOp {
     SetReturnType { node_id: String, ty: String },
     #[serde(rename = "RENAME")]
     Rename { node_id: String, new_name: String },
+    /// Set a value in a structured non-code file (TOML / Markdown) by structural path — a dotted
+    /// key (`dependencies.serde`) for TOML, a `/`-separated heading path for Markdown. Ungated and
+    /// format-preserving (only the addressed value/section changes), so it can ride in the same
+    /// atomic batch as the code edit that needs it (e.g. a `Cargo.toml` dep beside a new `use`).
+    #[serde(rename = "SET_KEY")]
+    SetKey { path: PathBuf, key: String, value: String },
+    /// Delete a key / heading-section from a structured non-code file (see [`EditOp::SetKey`]).
+    #[serde(rename = "DELETE_KEY")]
+    DeleteKey { path: PathBuf, key: String },
     #[serde(rename = "MOVE_FILE")]
     MoveFile { from: PathBuf, to: PathBuf },
     #[serde(rename = "CREATE_FILE")]
