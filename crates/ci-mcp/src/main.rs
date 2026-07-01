@@ -455,14 +455,17 @@ impl Server {
             ops.push(action_to_op(&action, resolve).map_err(|e| e.to_string())?);
         }
 
-        // Dispatch to the edit engine for the target file's language (fall back to any registered
-        // provider for an empty batch). A cross-language batch isn't a real scenario — the gate is
-        // per-language — so one engine handles the batch.
-        let provider = target_file
-            .as_deref()
-            .and_then(|f| registry.provider_for(Path::new(f)))
-            .or_else(|| registry.providers().next())
-            .ok_or("no language provider available for this repo")?;
+        // Dispatch to the edit engine for the TARGET FILE's language — strictly. Never fall back to
+        // another language's provider: a `.ts` edit handled by, say, the Python fallback would apply
+        // garbage structurally + ungated. If the target's language has no active provider (e.g. its
+        // toolchain didn't come up), say so loudly instead. Only a truly path-less batch uses the
+        // first provider.
+        let provider = match target_file.as_deref() {
+            Some(f) => registry.provider_for(Path::new(f)).ok_or_else(|| {
+                format!("no language provider for '{f}' — its language isn't active in this repo (is its toolchain available?)")
+            })?,
+            None => registry.providers().next().ok_or("no language provider available for this repo")?,
+        };
 
         let opts = EditOpts { write: !dry_run, dry_run, tsconfig: None };
         let res = provider.apply_edits(&ops, &opts).map_err(|e| e.to_string())?;
