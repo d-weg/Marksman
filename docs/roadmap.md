@@ -145,12 +145,25 @@ or Python repo gets degraded weighting even once indexing is multi-language.
       follow-up.)
 - [ ] (ref) the three-way + agent A/B benchmark design lives in [benchmarks.md](benchmarks.md).
 
-### Batch 6 — Provider registry (multi-language repos)
+### Batch 6 — Provider registry (multi-language repos)  ← next
 **Why:** indexing/editing still bind **one** provider per repo, so a mixed Rust+TS+Python repo can't
 be fully indexed, and tooling isn't fetched per-language.
-- [ ] `extension → provider` registry; `index` derives the active set from files present and routes
-      each file through its owning provider (multi-language repos work; Node touched only if `.ts*`).
-- [ ] Lazy per-language tooling fetch, cached per provider; nothing fetched for absent languages.
+
+**Scope note (settled — don't re-litigate):** this is *smaller* than "an architecture rework." BM25,
+embeddings, RRF, symbol search, and graph expansion all already operate on ONE unified index and are
+language-blind — so once every file is indexed, cross-language retrieval fuses for free; retrieval
+needs **zero changes**. Import edges are essentially always *within*-language (a TS↔Rust call is a
+network boundary, not a syntactic import, and no provider emits an edge for it), and each provider
+already scopes its graph to its own files — so combining graphs is a trivial **union**
+(`forward_adjacency` per provider, extend into one map), NOT a cross-language merge. The real work is
+per-file dispatch at index time.
+- [ ] `extension → provider` registry; `build_index` picks the provider by file extension (today it
+      loops every code file through one `provider.structure`) so a multi-language repo indexes fully;
+      Node touched only if `.ts*` are present.
+- [ ] Union the per-provider `import_graph()`s (each already scoped to its own files).
+- [ ] Lazy per-language tooling fetch, cached per provider; nothing fetched for absent languages
+      (mostly already true — each provider fetches its own tooling; the registry just gates which
+      providers activate).
 - [ ] Provider manifest: enable/disable a language, pin a tool version, point at a vendored binary
       (offline/air-gapped).
 
