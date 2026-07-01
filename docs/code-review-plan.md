@@ -41,11 +41,16 @@ get much smaller.
 - [x] Clear the **16 existing `cargo clippy --workspace` warnings** (sort_by_key, map_or, manual
       find/iterator, loop-index, doc-indentation, etc.). Pure cleanup, no behavior change.
 
-### Batch 1 — core seams (everything depends on these)
-- [ ] `ci-core/src/types.rs` (278) — `Node`/`EditOp`/`CommitResult`/`Range`/`SymbolKind` contracts.
-- [ ] `ci-core/src/driver.rs` — the `LanguageProvider` trait + docs.
-- [ ] `ci-core/src/weight.rs` (376) — path-role + layer weighting; check the role inference table.
-- [ ] `ci-core/src/{config,outline,error,lib}.rs` — config defaults, `elide_bodies*`, error enum.
+### Batch 1 — core seams (everything depends on these)  ✅
+Done before the cross-cutting ts extraction (reversed from plan): the extracted helpers must
+produce these `Node`/`Range` contracts, so review + lock them first.
+- [x] `ci-core/src/types.rs` (278) — contracts sound; fixed a roundtrip test that discarded its
+      `matches!` bool (asserted nothing).
+- [x] `ci-core/src/driver.rs` — trait + docs clean, no change.
+- [x] `ci-core/src/weight.rs` (376) — role table sound; de-duplicated the layer-score computation
+      and multiplier formula (were copied verbatim across `layer_multipliers` /
+      `compute_package_weights`) into `score_layers` + `layer_mult`. Behavior-identical.
+- [x] `ci-core/src/{config,outline,error,lib}.rs` — reviewed, clean, no change.
 
 ### Batch 2 — the edit path (correctness-critical; largest file)
 - [ ] `ci-edit/src/lib.rs` (788) — `action_to_op` / `commit_edits` / gate diff / `apply_*`. Audit

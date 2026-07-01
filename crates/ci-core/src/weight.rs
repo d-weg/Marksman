@@ -196,6 +196,32 @@ fn term_hits(qset: &HashSet<&str>, term: &str) -> bool {
     qset.iter().any(|qt| *qt == term || (term.len() >= 4 && qt.starts_with(term)))
 }
 
+/// Per-role count of how many of that role's layer terms the query fires, plus the max across
+/// roles (the normalizer). Empty/zero when layer weighting is disabled. Shared so the two public
+/// entry points (`layer_multipliers`, `compute_package_weights`) score layers identically.
+fn score_layers(qset: &HashSet<&str>, enabled: bool) -> (HashMap<&'static str, usize>, usize) {
+    let mut scores: HashMap<&'static str, usize> = HashMap::new();
+    let mut max_layer = 0usize;
+    if enabled {
+        for role in KNOWN_ROLES {
+            let hits = default_layer_terms(role).iter().filter(|t| term_hits(qset, t)).count();
+            scores.insert(role.as_str(), hits);
+            max_layer = max_layer.max(hits);
+        }
+    }
+    (scores, max_layer)
+}
+
+/// The layer multiplier for a role that fired `ls` of its terms: `1 + boost·(ls/max_layer)`, or
+/// `1.0` (no boost) when weighting is off, no layer fired, or this role didn't fire.
+fn layer_mult(ls: usize, max_layer: usize, boost: f64, enabled: bool) -> f64 {
+    if enabled && max_layer > 0 && ls > 0 {
+        1.0 + boost * (ls as f64 / max_layer as f64)
+    } else {
+        1.0
+    }
+}
+
 /// A package as seen by the weighter (role precomputed at index time when available).
 #[derive(Debug, Clone, Default)]
 pub struct WeightedPackage {
@@ -238,30 +264,12 @@ pub fn layer_multipliers(query_tokens: &[String], config: &Config) -> HashMap<&'
     let enabled = config.query_layer_weighting.enabled;
     let boost = config.query_layer_weighting.boost as f64;
 
-    let mut layer_scores: HashMap<&'static str, usize> = HashMap::new();
-    let mut max_layer = 0usize;
-    if enabled {
-        for role in KNOWN_ROLES {
-            let mut hits = 0;
-            for &t in default_layer_terms(role) {
-                if term_hits(&qset, t) {
-                    hits += 1;
-                }
-            }
-            layer_scores.insert(role.as_str(), hits);
-            max_layer = max_layer.max(hits);
-        }
-    }
+    let (layer_scores, max_layer) = score_layers(&qset, enabled);
 
     let mut mult: HashMap<&'static str, f64> = HashMap::new();
     for role in KNOWN_ROLES {
         let ls = *layer_scores.get(role.as_str()).unwrap_or(&0);
-        let m = if enabled && max_layer > 0 && ls > 0 {
-            1.0 + boost * (ls as f64 / max_layer as f64)
-        } else {
-            1.0
-        };
-        mult.insert(role.as_str(), m);
+        mult.insert(role.as_str(), layer_mult(ls, max_layer, boost, enabled));
     }
     mult.insert("unknown", 1.0);
     mult
@@ -284,20 +292,7 @@ pub fn compute_package_weights(
     let enabled = config.query_layer_weighting.enabled;
     let boost = config.query_layer_weighting.boost as f64;
 
-    let mut layer_scores: HashMap<&'static str, usize> = HashMap::new();
-    let mut max_layer = 0usize;
-    if enabled {
-        for role in KNOWN_ROLES {
-            let mut hits = 0;
-            for &t in default_layer_terms(role) {
-                if term_hits(&qset, t) {
-                    hits += 1;
-                }
-            }
-            layer_scores.insert(role.as_str(), hits);
-            max_layer = max_layer.max(hits);
-        }
-    }
+    let (layer_scores, max_layer) = score_layers(&qset, enabled);
     let fired_layers: Vec<PackageRole> = KNOWN_ROLES
         .into_iter()
         .filter(|r| *layer_scores.get(r.as_str()).unwrap_or(&0) > 0)
@@ -312,14 +307,8 @@ pub fn compute_package_weights(
             .or_else(|| config.package_weights.get(role.as_str()))
             .map(|w| *w as f64)
             .unwrap_or(1.0);
-        let mut mult = 1.0;
-        if enabled && max_layer > 0 {
-            let ls = *layer_scores.get(role.as_str()).unwrap_or(&0);
-            if ls > 0 {
-                mult = 1.0 + boost * (ls as f64 / max_layer as f64);
-            }
-        }
-        weight.insert(p.name.clone(), static_w * mult);
+        let ls = *layer_scores.get(role.as_str()).unwrap_or(&0);
+        weight.insert(p.name.clone(), static_w * layer_mult(ls, max_layer, boost, enabled));
     }
 
     (weight, WeightDebug { roles, layer_scores, fired_layers })

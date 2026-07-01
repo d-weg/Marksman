@@ -234,7 +234,7 @@ mod tests {
         let j = serde_json::to_string(&op).unwrap();
         assert!(j.contains("\"type\":\"RENAME\""));
         let back: EditOp = serde_json::from_str(&j).unwrap();
-        matches!(back, EditOp::Rename { .. });
+        assert!(matches!(back, EditOp::Rename { .. }));
     }
 
     #[test]
