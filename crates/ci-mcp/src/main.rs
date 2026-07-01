@@ -215,7 +215,9 @@ impl Server {
 
     fn embedder(&mut self) -> Result<&StaticEmbedder, String> {
         if self.embedder.is_none() {
-            self.embedder = Some(StaticEmbedder::load(&model_dir()).map_err(|e| e.to_string())?);
+            let dir = model_dir();
+            ci_embed::ensure_model(&dir, &self.config.embedding_model)?;
+            self.embedder = Some(StaticEmbedder::load(&dir).map_err(|e| e.to_string())?);
         }
         Ok(self.embedder.as_ref().unwrap())
     }
@@ -226,7 +228,10 @@ impl Server {
             return Err("no index — run `codeindex-rs index <root>` first".into());
         }
         let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
-        let qvec = self.embedder()?.embed(&task).map_err(|e| e.to_string())?;
+        let model = self.config.embedding_model.clone();
+        let embedder = self.embedder()?;
+        ensure_index_matches(&index.meta.model, index.meta.dims, &model, embedder.dim())?;
+        let qvec = embedder.embed(&task).map_err(|e| e.to_string())?;
         let opts = RetrieveOptions {
             top_n: args["topN"].as_u64().map(|n| n as usize),
             hops: args["hops"].as_u64().map(|n| n as usize),
@@ -353,7 +358,10 @@ impl Server {
             };
         }
         // 2) retrieval fallback — only auto-resolve when unambiguous.
-        let qvec = self.embedder()?.embed(query).map_err(|e| e.to_string())?;
+        let model = self.config.embedding_model.clone();
+        let embedder = self.embedder()?;
+        ensure_index_matches(&index.meta.model, index.meta.dims, &model, embedder.dim())?;
+        let qvec = embedder.embed(query).map_err(|e| e.to_string())?;
         let manifest = retrieve(&self.root, query, &index, &qvec, &self.config, &RetrieveOptions { top_n: Some(3), ..Default::default() });
         let mut ids: Vec<String> = manifest
             .entries
@@ -642,6 +650,19 @@ fn tools_list() -> Value {
     ])
 }
 
+/// The loaded index must have been built with the model + dims the server now embeds with; a
+/// mismatch means ranking is meaningless (and a differing dim would panic `cosine_normalized`).
+/// Clear error → "re-run index", never a silent mis-rank or crash.
+fn ensure_index_matches(meta_model: &str, meta_dims: usize, model: &str, dim: usize) -> Result<(), String> {
+    if meta_model != model || meta_dims != dim {
+        return Err(format!(
+            "index was built with model {meta_model:?} (dim {meta_dims}) but this server uses \
+             {model:?} (dim {dim}) — re-run `codeindex-rs index`"
+        ));
+    }
+    Ok(())
+}
+
 fn resp(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
 }
@@ -698,5 +719,20 @@ fn main() {
             let _ = writeln!(stdout, "{out}");
             let _ = stdout.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_index_matches;
+
+    #[test]
+    fn index_compat_guard() {
+        assert!(ensure_index_matches("potion", 256, "potion", 256).is_ok());
+        // dim mismatch (the cosine-panic guard) and model mismatch both error clearly.
+        let dim_err = ensure_index_matches("potion", 256, "potion", 128).unwrap_err();
+        assert!(dim_err.contains("re-run"), "dim mismatch: {dim_err}");
+        let model_err = ensure_index_matches("bge", 256, "potion", 256).unwrap_err();
+        assert!(model_err.contains("re-run"), "model mismatch: {model_err}");
     }
 }

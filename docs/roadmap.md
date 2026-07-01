@@ -89,14 +89,20 @@ against the pre-edit world.
       retrieve) stays an `#[ignore]` integration concern — it needs the embedding model + a live
       provider; the wiring is a straight compose of these component-tested pieces.
 
-### Batch 3 — Provisioning parity (embedder + schema)
-**Why:** the lazy-fetch invariant applies to provider tooling but **not** the embedding model, which
-is a manual `git clone … ~/.marksman/models`. Make the embedder obey the same rule.
-- [ ] Lazy-fetch + cache the Model2Vec model on first index (per the provider lazy-tooling model);
-      `CI_MODEL_DIR` still overrides; a clear error + one-line fetch hint when offline.
-- [ ] Record model id + dims in `IndexMeta`; a query embedded with a different model/dim is a clear
-      error (ties into Batch 2's version check) — never a silent mis-rank or an out-of-bounds panic
-      in `cosine_normalized` (see code-review-plan deferred notes).
+### Batch 3 — Provisioning parity (embedder + schema)  ✅
+**Why:** the lazy-fetch invariant applied to provider tooling but **not** the embedding model, which
+was a manual `git clone … ~/.marksman/models`; and a query embedded with the wrong dim could panic
+`cosine_normalized`.
+- [x] `ci_embed::ensure_model` — lazy-fetches the Model2Vec files from HuggingFace via `curl` on
+      first use (same lazy-tooling model as the providers), no-op when present; `CI_MODEL_DIR` still
+      overrides; on failure/offline (or `CI_NO_MODEL_FETCH`) returns a precise error with the manual
+      command. Called by the CLI (`index`/`retrieve`) and the MCP `embedder()`.
+- [x] `ensure_index_matches` guard (ci-mcp `retrieve_context`/`resolve_query`, and ci-cli
+      `retrieve`): the index's `meta.model`/`meta.dims` must match the active embedder, else a clear
+      "re-run index" error — closes the `cosine_normalized` out-of-bounds panic from the review
+      notes and prevents a silent cross-model mis-rank. (`IndexMeta` already records model + dims.)
+- [x] Tests: `ensure_model` no-op when present / actionable error when absent+`CI_NO_MODEL_FETCH`;
+      `ensure_index_matches` accepts a match and rejects dim/model mismatch.
 
 ### Batch 4 — `find_symbols`: keyword/symbol search that returns handles
 **Why:** fills the gap between `retrieve_context` (fuzzy, concept→files) and grep (literal, but

@@ -10,3 +10,6 @@ ci-core = { path = "../ci-core" }
 tokenizers = "0.20"
 safetensors = "0.4"
 serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

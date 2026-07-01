@@ -130,6 +130,7 @@ dependencies = [
  "ci-core",
  "safetensors",
  "serde_json",
+ "tempfile",
  "tokenizers",
 ]
 

@@ -106,6 +106,7 @@ fn choose_lang(root: &Path) -> &'static str {
 
 fn cmd_index(root: &Path) {
     let mut config = rust_config(root);
+    ci_embed::ensure_model(&model_dir(), &config.embedding_model).unwrap_or_else(|e| die(e));
     let embedder = StaticEmbedder::load(&model_dir()).unwrap_or_else(|e| die(e));
     let dim = embedder.dim();
 
@@ -143,7 +144,14 @@ fn cmd_retrieve(root: &Path, task: &str, top: Option<usize>, json: bool) {
         die(format!("no index at {}/{} — run `index` first", root.display(), config.index_dir));
     }
     let index = load_index(root, &config).unwrap_or_else(|e| die(e));
+    ci_embed::ensure_model(&model_dir(), &config.embedding_model).unwrap_or_else(|e| die(e));
     let embedder = StaticEmbedder::load(&model_dir()).unwrap_or_else(|e| die(e));
+    if embedder.dim() != index.meta.dims || index.meta.model != config.embedding_model {
+        die(format!(
+            "index was built with model {:?} (dim {}) but this run uses {:?} (dim {}) — re-run `index`",
+            index.meta.model, index.meta.dims, config.embedding_model, embedder.dim()
+        ));
+    }
     // Model2Vec is symmetric: embed the query the same way as chunks (no bge prefix).
     let qvec = embedder.embed(task).unwrap_or_else(|e| die(e));
 
