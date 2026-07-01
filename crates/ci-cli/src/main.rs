@@ -178,7 +178,7 @@ fn render_summary(m: &Manifest) -> String {
         for s in &e.matched_symbols {
             out.push_str(&format!(
                 "                 ↳ {} {}  L{}-{}\n",
-                kind_str(s.kind),
+                s.kind.as_str(),
                 s.name,
                 s.line_range[0],
                 s.line_range[1]
@@ -186,21 +186,6 @@ fn render_summary(m: &Manifest) -> String {
         }
     }
     out
-}
-
-fn kind_str(k: ci_core::SymbolKind) -> &'static str {
-    use ci_core::SymbolKind::*;
-    match k {
-        Function => "function",
-        Class => "class",
-        Interface => "interface",
-        Enum => "enum",
-        TypeAlias => "type",
-        Variable => "var",
-        Method => "method",
-        Struct => "struct",
-        Doc => "doc",
-    }
 }
 
 fn main() {

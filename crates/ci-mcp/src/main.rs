@@ -6,7 +6,7 @@
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
-use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind, SymbolKind};
+use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index};
@@ -400,7 +400,7 @@ impl Server {
         let content = std::fs::read_to_string(self.root.join(&file)).map_err(|e| e.to_string())?;
         let text = slice_lines(&content, node.range.start_line, node.range.end_line);
         let kind = match &node.kind {
-            NodeKind::Symbol(k) => kind_str(*k).to_string(),
+            NodeKind::Symbol(k) => k.as_str().to_string(),
             NodeKind::Syntax(s) => s.clone(),
         };
         Ok(format!(
@@ -520,7 +520,7 @@ fn render_summary(m: &Manifest) -> String {
             if e.whole_file == Some(true) { "  (whole file)" } else { "" }
         ));
         for s in &e.matched_symbols {
-            out.push_str(&format!("                 ↳ {} {}  L{}-{}\n", kind_str(s.kind), s.name, s.line_range[0], s.line_range[1]));
+            out.push_str(&format!("                 ↳ {} {}  L{}-{}\n", s.kind.as_str(), s.name, s.line_range[0], s.line_range[1]));
         }
     }
     out
@@ -571,21 +571,6 @@ fn outline_for(file: &str, content: &str) -> String {
         lang_fallback::outline(FbLang::Python, content)
     } else {
         content.to_string()
-    }
-}
-
-fn kind_str(k: SymbolKind) -> &'static str {
-    use SymbolKind::*;
-    match k {
-        Function => "function",
-        Class => "class",
-        Interface => "interface",
-        Enum => "enum",
-        TypeAlias => "type",
-        Variable => "var",
-        Method => "method",
-        Struct => "struct",
-        Doc => "doc",
     }
 }
 

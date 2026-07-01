@@ -22,6 +22,24 @@ pub enum SymbolKind {
     Doc,
 }
 
+impl SymbolKind {
+    /// The lowercase protocol/display name — matches the serde representation (`type`/`var` for
+    /// TypeAlias/Variable). Shared by the CLI and MCP surfaces so both render kinds identically.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SymbolKind::Function => "function",
+            SymbolKind::Class => "class",
+            SymbolKind::Interface => "interface",
+            SymbolKind::Enum => "enum",
+            SymbolKind::TypeAlias => "type",
+            SymbolKind::Variable => "var",
+            SymbolKind::Method => "method",
+            SymbolKind::Struct => "struct",
+            SymbolKind::Doc => "doc",
+        }
+    }
+}
+
 /// 1-based line range (matches the TS manifest); char offsets are 0-based and
 /// optional (drivers that only know lines may leave them 0).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +286,18 @@ mod tests {
         assert_eq!(serde_json::to_string(&SymbolKind::TypeAlias).unwrap(), "\"type\"");
         assert_eq!(serde_json::to_string(&SymbolKind::Variable).unwrap(), "\"var\"");
         assert_eq!(serde_json::to_string(&SymbolKind::Function).unwrap(), "\"function\"");
+    }
+
+    #[test]
+    fn as_str_matches_serde_name() {
+        for k in [
+            SymbolKind::Function, SymbolKind::Class, SymbolKind::Interface, SymbolKind::Enum,
+            SymbolKind::TypeAlias, SymbolKind::Variable, SymbolKind::Method, SymbolKind::Struct,
+            SymbolKind::Doc,
+        ] {
+            let serde_name = serde_json::to_string(&k).unwrap();
+            assert_eq!(format!("\"{}\"", k.as_str()), serde_name, "as_str vs serde for {k:?}");
+        }
     }
 
     fn leaf(id: &str, kind: NodeKind) -> Node {

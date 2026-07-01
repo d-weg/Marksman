@@ -108,12 +108,45 @@ rather than churn the ranking hot path without a repro.
 providers' `apply_edits`. Extracted `ci_core::reverse_import_map(&ImportGraph)` (language-blind,
 operates on the core type) with a unit test; each provider now calls it. ~21 dup lines removed.
 
-### Batch 5 — surface + protocol
-- [ ] `ci-mcp/src/main.rs` (679) — tool schemas, resolution (`resolve_symbol`/`resolve_query`),
-      apply_edits messaging; consider splitting tool handlers into a module.
-- [ ] `ci-proto/src/lib.rs` (517) — wire conversions, framing robustness (partial reads, oversized
-      length), the `Drop` kill/wait.
-- [ ] `ci-cli/src/main.rs` (231), `ci-arch/src/lib.rs` (240), `ci-walk/src/*` (243).
+### Batch 5 — surface + protocol  ✅
+- [x] `ci-mcp/src/main.rs` — tool schemas, `resolve_symbol`/`resolve_query` addressing (conservative,
+      well-documented), gated/ungated apply_edits messaging, JSON-RPC loop: all sound. No change
+      beyond the shared `kind_str` dedup below.
+- [x] `ci-proto/src/lib.rs` — wire conversions are complete + symmetric; framing uses `read_exact`
+      (handles partial reads); `Drop` kills+waits the child. Oversized-length is moot for a trusted
+      spawned sidecar. No change.
+- [x] `ci-cli/src/main.rs` — index/retrieve commands clean. `ci-arch/src/lib.rs` — language-blind
+      `file_suffix`, module-template detection, well-tested. `ci-walk/*` (lang/discover/workspace) —
+      clean, well-tested. No change beyond the dedup.
 
-## Done = every box checked, suite green, clippy clean, and a short notes section here recording
-any behavior questions deferred to the roadmap.
+**Cross-cutting dedup:** the `kind_str(SymbolKind) -> &'static str` mapping was duplicated verbatim
+in `ci-cli` and `ci-mcp`. Added `SymbolKind::as_str()` on the core type (mirrors the existing
+`PackageRole::as_str`), with a test asserting it matches the serde name; both surfaces now use it.
+
+**Deferred (cross-binary, would need a shared home):** `choose_lang` and `model_dir` are duplicated
+between `ci-cli` and `ci-mcp`. Sharing them needs a small app-support lib (they pull `FbLang` from
+lang-fallback), which is a structural change beyond this quality pass — noted for later.
+
+## Done ✅ — every box checked, `cargo test --workspace` green, `cargo clippy --workspace
+## --all-targets` clean.
+
+### Notes / deferred (no behavior change was made for these — candidates for a later pass)
+- **`ci-index::cosine_normalized`** indexes the matrix by `query.len()`, so a query longer than
+  `dims` (e.g. an index built with a different model) panics instead of erroring. dims match in
+  practice; add a guard rather than churn the ranking hot path without a repro.
+- **`byte_offset` (ci-vfs) vs `point_byte` (lang-ts)** are near-identical (1-based line / 0-based
+  char → byte). A shared `ci-core` util would dedupe them; both already depend on ci-core.
+- **`choose_lang` / `model_dir`** are duplicated between the `ci-cli` and `ci-mcp` binaries; sharing
+  needs a small app-support lib (they reference `FbLang`).
+- **What was NOT touched:** all numeric/parity-sensitive paths (RRF, BM25, the Model2Vec embedder,
+  cosine) were reviewed and left byte-for-byte — they're faithful, parity-tested ports.
+
+### Summary of changes (one commit per batch)
+- B0 — cleared 16 clippy warnings (no behavior change).
+- B1 — `ci-core`: deduped layer weighting (`score_layers`/`layer_mult`); fixed a no-op roundtrip test.
+- Cross-cut — new `ci-treesitter` crate: `ts_range`/`syntax_node`/`leading_comment_range`/`body_ranges`
+  shared by all three tree-sitter providers; centralized the `tree-sitter` dep.
+- B2 — `ci-edit`: `is_transient_lsp_error` + `node_by_id` dedups (edit path verified correct).
+- B3 — `ci-build`: `forward_adjacency` dedup (retrieval/index/embed/scip verified correct).
+- B4 — `ci_core::reverse_import_map` shared by all providers; consolidated lang-ts `npm_cache`.
+- B5 — `SymbolKind::as_str()` on the core type, shared by both binaries.
