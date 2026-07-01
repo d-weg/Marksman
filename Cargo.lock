@@ -121,7 +121,6 @@ dependencies = [
  "ci-vfs",
  "serde_json",
  "tempfile",
- "toml_edit",
 ]
 
 [[package]]

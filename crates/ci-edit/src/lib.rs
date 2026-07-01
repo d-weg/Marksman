@@ -11,8 +11,6 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 
-pub mod structured;
-
 /// The type-check engine behind the gate. Abstracts over *how* a language computes
 /// diagnostics and cross-file rename/move edits, so the provider can pick the lightest
 /// available option (a TS provider drives ts-morph in-process; the generic fallback is an
@@ -180,16 +178,6 @@ pub fn action_to_op(
         // parameter / return type.
         "add_parameter" => EditOp::AddParameter { node_id: node()?, param: value()? },
         "set_return_type" => EditOp::SetReturnType { node_id: node()?, ty: value()? },
-        // Structured non-code edits: `name` is the key / heading path, `value` the new value/body.
-        "set_key" => EditOp::SetKey {
-            path: a.path.clone().into(),
-            key: a.name.clone().ok_or_else(|| Error::Other("set_key needs name (the key or heading path)".into()))?,
-            value: value()?,
-        },
-        "delete_key" => EditOp::DeleteKey {
-            path: a.path.clone().into(),
-            key: a.name.clone().ok_or_else(|| Error::Other("delete_key needs name (the key or heading path)".into()))?,
-        },
         "create_file" => EditOp::CreateFile { path: a.path.clone().into(), code: value()? },
         "move_file" => EditOp::MoveFile { from: a.path.clone().into(), to: value()?.into() },
         "delete_file" => EditOp::DeleteFile { path: a.path.clone().into() },
@@ -239,10 +227,7 @@ fn file_of(node_id: &str) -> &str {
 /// The repo-relative paths an op reads/writes — checked for root-containment before it runs.
 fn op_paths(op: &EditOp) -> Vec<PathBuf> {
     match op {
-        EditOp::CreateFile { path, .. }
-        | EditOp::DeleteFile { path }
-        | EditOp::SetKey { path, .. }
-        | EditOp::DeleteKey { path, .. } => vec![path.clone()],
+        EditOp::CreateFile { path, .. } | EditOp::DeleteFile { path } => vec![path.clone()],
         EditOp::MoveFile { from, to } => vec![from.clone(), to.clone()],
         EditOp::ReplaceNode { node_id, .. }
         | EditOp::InsertBefore { node_id, .. }
@@ -444,28 +429,6 @@ pub fn apply_structural(
                 end_char: params.range.end_char,
             };
             vfs.insert_before(Path::new(file), &at, &format!("{}{ty}", return_delim(file)))
-        }
-        // Structured non-code edits (TOML / Markdown): format-preserving, ungated. Rewrite the
-        // whole file with only the addressed value/section changed.
-        EditOp::SetKey { path, key, value } => {
-            let rel = path.to_string_lossy();
-            let fmt = structured::format_of(&rel).ok_or_else(|| {
-                Error::Other(format!("SET_KEY: {rel} is not an editable structured file (TOML/Markdown)"))
-            })?;
-            let content = vfs.read(path).ok_or_else(|| Error::Other(format!("SET_KEY: {rel} missing")))?;
-            let new = structured::set_key(&content, fmt, key, value)?;
-            vfs.write(path, new);
-            Ok(())
-        }
-        EditOp::DeleteKey { path, key } => {
-            let rel = path.to_string_lossy();
-            let fmt = structured::format_of(&rel).ok_or_else(|| {
-                Error::Other(format!("DELETE_KEY: {rel} is not an editable structured file (TOML/Markdown)"))
-            })?;
-            let content = vfs.read(path).ok_or_else(|| Error::Other(format!("DELETE_KEY: {rel} missing")))?;
-            let new = structured::delete_key(&content, fmt, key)?;
-            vfs.write(path, new);
-            Ok(())
         }
         EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } => {
             Err(Error::Driver("file ops (move/delete) land in P3".into()))
@@ -771,19 +734,6 @@ pub fn commit_edits(
             }
         }
     }
-    // Structured non-code files (TOML / Markdown) are never type-checked — drop them from the gate
-    // scope, so a `Cargo.toml`/docs edit rides the atomic batch ungated.
-    affected.retain(|f| !structured::is_structured(f));
-
-    // A structured-only batch has nothing to gate: commit without ever touching the type-checker
-    // (don't boot a language server just to check nothing).
-    if affected.is_empty() {
-        if opts.write && !opts.dry_run {
-            vfs.commit()?;
-        }
-        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0 });
-    }
-
     // Baseline = disk state of every affected file (disk is untouched until commit).
     let baseline_files: Vec<(String, String)> = affected
         .iter()
@@ -1002,36 +952,6 @@ mod tests {
         fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
             Ok(json!({}))
         }
-    }
-
-    #[test]
-    fn structured_toml_edit_commits_through_the_batch_ungated() {
-        // A Cargo.toml dep edit rides commit_edits like any op: staged in the VFS, committed on
-        // success — and never sent to the type-checker (it's structured, format-preserving).
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n\n[dependencies]\nserde = \"1.0\"\n").unwrap();
-        let structure_of = |_f: &str| Vec::<Node>::new();
-        let no_imports = |_: &str| Vec::<String>::new();
-        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
-        let mut engine = NoopEngine;
-        let res = commit_edits(
-            root,
-            &[
-                EditOp::SetKey { path: "Cargo.toml".into(), key: "dependencies.serde".into(), value: "\"1.2\"".into() },
-                EditOp::SetKey { path: "Cargo.toml".into(), key: "dependencies.anyhow".into(), value: "\"1\"".into() },
-            ],
-            &structure_of,
-            &mut engine,
-            &opts,
-            &no_imports,
-        )
-        .unwrap();
-        assert!(matches!(res, CommitResult::Ok { .. }), "structured edit commits: {res:?}");
-        let after = fs::read_to_string(root.join("Cargo.toml")).unwrap();
-        assert!(after.contains("serde = \"1.2\""), "value updated: {after}");
-        assert!(after.contains("anyhow = \"1\""), "new dep added: {after}");
-        assert!(after.contains("name = \"x\""), "rest of the file preserved");
     }
 
     #[test]

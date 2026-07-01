@@ -191,15 +191,13 @@ alongside code.
       sub-node edit on a line with a multi-byte char before it mis-resolved. The `Range` column
       contract is now documented as 0-based UTF-8 bytes (matches tree-sitter + the VFS); non-ASCII
       tests in `ci-core` and `ci-vfs`. (SCIP/LSP UTF-16 boundaries convert at their own edges.)
-- [x] Structured providers (**TOML / JSON / YAML / Markdown**): `set_key` / `delete_key` in
-      `ci-edit::structured`, edit by structural **key** (dotted path for TOML/JSON/YAML) or **heading
-      path** (`/`-nested Markdown section). No reformatting — TOML via `toml_edit`; JSON via a small
-      byte-span scanner (no dependency; `serde_json` validates the result so a splice can never write
-      corrupt JSON); YAML line-based (block mappings only — the common config shape; flow style /
-      anchors out of scope); Markdown by section. **Ungated** (the gate excludes structured files; a
-      structured-only batch never boots a language server) and applied in the **same atomic batch**
-      as the code edit via `commit_edits` — proven end-to-end (a `Cargo.toml` dep beside a Python
-      `set_body`, one commit).
+- ~~Structured providers (TOML/JSON/YAML/Markdown): edit config/docs by key / heading path in the
+      same atomic batch as code.~~ **Cut — deliberately descoped.** Marksman is a **code-only** tool:
+      non-code files aren't code, and code already has richer structural editing (AST-anchored,
+      gated `apply_edits`). `set_key`/`delete_key` added surface area (a parser module, two edit ops,
+      MCP-schema tokens paid every turn) for a niche "edit a `Cargo.toml` dep atomically with the
+      code" workflow agents handle fine with plain text edits. Removed; the `set_key` machinery is
+      not useful for code (code's "path" is the node id, with type-checking on top).
 
 ### Batch 8 — Breadth: more languages + retrieval scale
 **Why:** last, once the lifecycle / safety / quality floor is in.
