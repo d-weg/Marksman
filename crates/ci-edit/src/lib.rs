@@ -26,6 +26,19 @@ pub trait GateEngine {
     fn will_rename(&mut self, from: &str, to: &str) -> Result<Value>;
 }
 
+/// LSP request errors that mean "the server is still loading the project" rather than a real
+/// failure — worth retrying with backoff. rust-analyzer mid-index returns these transiently
+/// (JSON-RPC `-32602`/`-32801`, "content modified", "still loading", …).
+fn is_transient_lsp_error(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("-32602")
+        || m.contains("-32801")
+        || m.contains("content modified")
+        || m.contains("not ready")
+        || m.contains("loading")
+        || m.contains("waiting")
+}
+
 /// The generic LSP engine: any language with a language server.
 impl GateEngine for LspClient {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
@@ -50,15 +63,11 @@ impl GateEngine for LspClient {
             match self.request("textDocument/rename", params.clone()) {
                 Ok(we) => return Ok(we),
                 Err(e) => {
-                    let m = e.to_string().to_lowercase();
+                    // Rename also treats "no references found" as transient (a cold server
+                    // hasn't indexed references yet) — willRename handles empties separately.
+                    let m = e.to_string();
                     let transient = attempt < 7
-                        && (m.contains("-32602")
-                            || m.contains("-32801")
-                            || m.contains("references")
-                            || m.contains("content modified")
-                            || m.contains("not ready")
-                            || m.contains("loading")
-                            || m.contains("waiting"));
+                        && (is_transient_lsp_error(&m) || m.to_lowercase().contains("references"));
                     if !transient {
                         return Err(e);
                     }
@@ -84,14 +93,7 @@ impl GateEngine for LspClient {
                 Ok(we) if !workspace_edit_is_empty(&we) => return Ok(we),
                 Ok(we) => last = we,
                 Err(e) => {
-                    let m = e.to_string().to_lowercase();
-                    let transient = m.contains("-32602")
-                        || m.contains("-32801")
-                        || m.contains("content modified")
-                        || m.contains("loading")
-                        || m.contains("waiting")
-                        || m.contains("not ready");
-                    if !transient {
+                    if !is_transient_lsp_error(&e.to_string()) {
                         return Err(e);
                     }
                 }
@@ -196,6 +198,13 @@ fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
     None
 }
 
+/// Resolve a node id to its structure node (owned), or an `Anchor` error naming the id. The
+/// structure tree is rebuilt per call (`structure_of`), so the returned `Node` is cloned out.
+fn node_by_id(node_id: &str, structure_of: &impl Fn(&str) -> Vec<Node>) -> Result<Node> {
+    let nodes = structure_of(file_of(node_id));
+    find(&nodes, node_id).cloned().ok_or_else(|| Error::Anchor(node_id.to_string()))
+}
+
 fn file_of(node_id: &str) -> &str {
     node_id.split('#').next().unwrap_or(node_id)
 }
@@ -244,21 +253,16 @@ pub fn apply_structural(
 ) -> Result<()> {
     match op {
         EditOp::ReplaceNode { node_id, code } => {
-            let file = file_of(node_id);
-            let nodes = structure_of(file);
-            let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.clone()))?;
-            vfs.replace_range(Path::new(file), &node.range, code)
+            let node = node_by_id(node_id, structure_of)?;
+            vfs.replace_range(Path::new(file_of(node_id)), &node.range, code)
         }
         EditOp::InsertBefore { node_id, code } => {
-            let file = file_of(node_id);
-            let nodes = structure_of(file);
-            let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.clone()))?;
-            vfs.insert_before(Path::new(file), &node.range, &format!("{code}\n\n"))
+            let node = node_by_id(node_id, structure_of)?;
+            vfs.insert_before(Path::new(file_of(node_id)), &node.range, &format!("{code}\n\n"))
         }
         EditOp::ReplaceText { node_id, old_text, new_text } => {
             let file = file_of(node_id);
-            let nodes = structure_of(file);
-            let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.clone()))?;
+            let node = node_by_id(node_id, structure_of)?;
             let text = vfs
                 .read_range(Path::new(file), &node.range)
                 .ok_or_else(|| Error::Other("node text unavailable".into()))?;

@@ -58,12 +58,21 @@ produce these `Node`/`Range` contracts, so review + lock them first.
       `compute_package_weights`) into `score_layers` + `layer_mult`. Behavior-identical.
 - [x] `ci-core/src/{config,outline,error,lib}.rs` — reviewed, clean, no change.
 
-### Batch 2 — the edit path (correctness-critical; largest file)
-- [ ] `ci-edit/src/lib.rs` (788) — `action_to_op` / `commit_edits` / gate diff / `apply_*`. Audit
-      the blast-radius set, `diag_key` (line intentionally omitted), the rename/move retry loops,
-      `replace_text` uniqueness, byte/char handling. Split into modules if it eases review.
-- [ ] `ci-vfs/src/lib.rs` (251) — overlay + commit/rollback; range→byte mapping; atomicity.
-- [ ] `ci-lsp/src/lib.rs` (347) — JSON-RPC framing, the settle/idle-quiet logic, `root()`.
+### Batch 2 — the edit path (correctness-critical; largest file)  ✅
+- [x] `ci-edit/src/lib.rs` (788) — audited blast-radius, `diag_key` (line-omission is deliberate,
+      correct), the rename/move retry loops, `replace_text` uniqueness, byte/char handling: all
+      sound. Two behavior-preserving dedups: extracted `is_transient_lsp_error` (the retry
+      taxonomy was copied across `rename`/`will_rename`) and `node_by_id` (the id→node→Anchor
+      resolve was repeated in three `apply_structural` arms). No behavior change.
+- [x] `ci-vfs/src/lib.rs` (251) — overlay/commit/rollback and `byte_offset` (incl. the EOF
+      position) correct; atomic by construction. No change.
+- [x] `ci-lsp/src/lib.rs` (347) — JSON-RPC framing, settle/idle-quiet, `diagnostics` line = LSP
+      0-based +1 (1-based, matches `anchor`/feedback), `root()`: all correct. No change.
+
+**Deferred (out of this batch's scope):** `ci-vfs::byte_offset` and `lang-ts::point_byte` are
+near-identical (1-based line / 0-based char → byte offset). A shared `ci_core` util would dedupe
+them, but both already depend on `ci-core`, and it's unrelated to the edit-path audit — noting for
+a later pass rather than widening Batch 2.
 
 ### Batch 3 — retrieval + index
 - [ ] `ci-retrieve/src/retrieve.rs` (553) — RRF, `contains_word`, symbol bonus, graph expansion;
