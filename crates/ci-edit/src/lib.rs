@@ -9,7 +9,7 @@ use ci_lsp::LspClient;
 use ci_vfs::Vfs;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// The type-check engine behind the gate. Abstracts over *how* a language computes
 /// diagnostics and cross-file rename/move edits, so the provider can pick the lightest
@@ -207,6 +207,63 @@ fn node_by_id(node_id: &str, structure_of: &impl Fn(&str) -> Vec<Node>) -> Resul
 
 fn file_of(node_id: &str) -> &str {
     node_id.split('#').next().unwrap_or(node_id)
+}
+
+/// The repo-relative paths an op reads/writes — checked for root-containment before it runs.
+fn op_paths(op: &EditOp) -> Vec<PathBuf> {
+    match op {
+        EditOp::CreateFile { path, .. } | EditOp::DeleteFile { path } => vec![path.clone()],
+        EditOp::MoveFile { from, to } => vec![from.clone(), to.clone()],
+        EditOp::ReplaceNode { node_id, .. }
+        | EditOp::InsertBefore { node_id, .. }
+        | EditOp::ReplaceText { node_id, .. }
+        | EditOp::SetBody { node_id, .. }
+        | EditOp::Rename { node_id, .. } => vec![PathBuf::from(file_of(node_id))],
+    }
+}
+
+/// Reject a write whose path escapes `root` — the edit-layer trust boundary. An agent (or content
+/// it was injected with) must not create/move/delete outside the repo. Two layers:
+///   1. lexical — no absolute path, no `..` that climbs above root (catches `../../etc/x`);
+///   2. symlink — the target's nearest existing ancestor must canonicalize under root (catches a
+///      symlinked dir pointing out). Best-effort: skipped only if `root` itself can't canonicalize.
+fn ensure_within_root(root: &Path, rel: &Path) -> Result<()> {
+    let escaped = |why: &str| Err(Error::Driver(format!("path escapes repo root ({why}): {}", rel.display())));
+    let mut depth: i32 = 0;
+    for comp in rel.components() {
+        match comp {
+            Component::Prefix(_) | Component::RootDir => return escaped("absolute"),
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    return escaped("..");
+                }
+            }
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+        }
+    }
+    if let Ok(root_c) = root.canonicalize() {
+        // Walk up to the first ancestor that exists on disk and canonicalize it (a not-yet-created
+        // file has no canonical form of its own); it must still live under the canonical root.
+        let abs = root.join(rel);
+        let mut probe = abs.as_path();
+        loop {
+            match probe.canonicalize() {
+                Ok(p) => {
+                    if !p.starts_with(&root_c) {
+                        return escaped("symlink");
+                    }
+                    break;
+                }
+                Err(_) => match probe.parent() {
+                    Some(par) => probe = par,
+                    None => break,
+                },
+            }
+        }
+    }
+    Ok(())
 }
 
 fn op_node_id(op: &EditOp) -> Option<&str> {
@@ -447,6 +504,12 @@ pub fn commit_edits(
     let mut vfs = Vfs::new(root);
 
     for (i, op) in ops.iter().enumerate() {
+        // Trust boundary: reject before any VFS mutation if the op targets a path outside the repo.
+        for p in op_paths(op) {
+            if let Err(e) = ensure_within_root(root, &p) {
+                return Ok(CommitResult::Rejected { failed_op_index: i as i64, feedback: e.to_string() });
+            }
+        }
         let res = match op {
             EditOp::Rename { node_id, new_name } => {
                 apply_rename(&mut vfs, node_id, new_name, root, structure_of, engine)
@@ -649,6 +712,60 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(del, EditOp::DeleteFile { .. }));
+    }
+
+    #[test]
+    fn write_outside_root_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let structure_of = |_f: &str| Vec::<Node>::new();
+        let no_imports = |_: &str| Vec::<String>::new();
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let mut engine = NoopEngine;
+
+        for path in ["../evil.ts", "../../etc/x.ts", "/etc/passwd"] {
+            let res = commit_edits(
+                root,
+                &[EditOp::CreateFile { path: path.into(), code: "x".into() }],
+                &structure_of,
+                &mut engine,
+                &opts,
+                &no_imports,
+            )
+            .unwrap();
+            match res {
+                CommitResult::Rejected { feedback, .. } => {
+                    assert!(feedback.contains("escapes repo root"), "unexpected feedback: {feedback}");
+                }
+                other => panic!("expected rejection for {path:?}, got {other:?}"),
+            }
+        }
+        // A legitimate in-repo create still succeeds (guard doesn't over-reject).
+        let ok = commit_edits(
+            root,
+            &[EditOp::CreateFile { path: "src/new.ts".into(), code: "export const x = 1;\n".into() }],
+            &structure_of,
+            &mut engine,
+            &opts,
+            &no_imports,
+        )
+        .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "in-repo create should commit: {ok:?}");
+        assert!(root.join("src/new.ts").exists(), "in-repo file written");
+    }
+
+    // A gate engine that reports no diagnostics — for path-guard tests that must reach commit.
+    struct NoopEngine;
+    impl GateEngine for NoopEngine {
+        fn diagnostics(&mut self, _files: &[(String, String)]) -> Result<Vec<Diag>> {
+            Ok(vec![])
+        }
+        fn rename(&mut self, _f: &str, _l: u32, _c: u32, _n: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
     }
 
     #[test]

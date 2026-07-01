@@ -58,17 +58,20 @@ reason (a slim core, or externally-published providers).
 
 ## Batches (priority order — correctness & safety first, then value, then breadth)
 
-### Batch 1 — Write & index safety (the trust boundary)
+### Batch 1 — Write & index safety (the trust boundary)  ✅
 **Why:** an autonomous, possibly prompt-injected agent drives this. `create_file`/`move_file`/
-`delete_file` take arbitrary paths joined to root with **no containment check**; `save_index` writes
-six files **in place, sequentially** (a crash or concurrent read yields a torn index whose vectors
+`delete_file` took arbitrary paths joined to root with **no containment check**; `save_index` wrote
+six files **in place, sequentially** (a crash or concurrent read yielded a torn index whose vectors
 no longer align with chunks).
-- [ ] Root-containment guard: reject any create/move/delete whose resolved path escapes root
-      (`..`, absolute, symlink-out). One check in `ci-edit` before the VFS mutates.
-- [ ] Atomic index write: write into a temp dir under the index dir, then rename into place, so a
-      reader never sees a half-written index.
-- [ ] Single-writer lock (lockfile in the index dir) so a reindex can't race a read or another writer.
-- [ ] Tests: `create_file path:"../x"` rejected; an interrupted save leaves the prior index intact.
+- [x] Root-containment guard (`ci_edit::ensure_within_root`): rejects any op whose path escapes root
+      — lexical (`..`/absolute) + symlink (canonical-ancestor under root). Checked in `commit_edits`
+      before the VFS mutates; returns `Rejected`, never writes.
+- [x] Atomic index write: `save_index` serializes into a sibling temp dir then `rename`s into place,
+      so a reader never sees a half-written index (previous index restored on swap failure).
+- [x] Single-writer `IndexLock` (self-healing `.<name>.lock`, stolen after 15 min stale) so a CLI
+      `index` can't interleave with the server's reindex.
+- [x] Tests: `create_file path:"../x"|"/etc/passwd"` rejected (in-repo create still commits); save
+      leaves no temp/lock artifacts and reloads; lock is exclusive then released on drop.
 
 ### Batch 2 — Index lifecycle: keep the index true after edits
 **Why:** `apply_edits` commits to disk but nothing reindexes — `ci_build::update_index` is defined
