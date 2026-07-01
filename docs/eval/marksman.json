@@ -1,0 +1,12 @@
+[
+  { "task": "reciprocal rank fusion of search results", "expectFiles": ["crates/ci-retrieve/src/rrf.rs"] },
+  { "task": "bm25 lexical scoring and camelCase tokenizer", "expectFiles": ["crates/ci-index/src/bm25.rs"] },
+  { "task": "atomic index write with temp dir and rename", "expectFiles": ["crates/ci-index/src/store.rs"] },
+  { "task": "reject edits whose path escapes the repo root", "expectFiles": ["crates/ci-edit/src/lib.rs"] },
+  { "task": "fold function bodies for a skeletal outline", "expectFiles": ["crates/ci-core/src/outline.rs"] },
+  { "task": "keyword symbol search returning node id handles", "expectFiles": ["crates/ci-retrieve/src/retrieve.rs"] },
+  { "task": "package role and layer weighting from dependencies", "expectFiles": ["crates/ci-core/src/weight.rs"] },
+  { "task": "virtual file system overlay commit and rollback", "expectFiles": ["crates/ci-vfs/src/lib.rs"] },
+  { "task": "language server client json-rpc diagnostics gate", "expectFiles": ["crates/ci-lsp/src/lib.rs"] },
+  { "task": "read a scip index into the structure tree", "expectFiles": ["crates/ci-scip/src/lib.rs"] }
+]

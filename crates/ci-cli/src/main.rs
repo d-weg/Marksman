@@ -197,6 +197,77 @@ fn render_summary(m: &Manifest) -> String {
     out
 }
 
+/// One labeled retrieval case: a task and the repo-relative files that SHOULD surface for it.
+struct EvalCase {
+    task: String,
+    expect_files: Vec<String>,
+}
+
+/// Reciprocal rank of the first expected file in `ranked` (0 if none), and whether that rank is
+/// within `k` (hit@k). Pure — the scoreable heart of the eval, independent of embedding/retrieval.
+fn score_case(ranked: &[String], expect: &[String], k: usize) -> (bool, f64) {
+    for (i, f) in ranked.iter().enumerate() {
+        if expect.iter().any(|e| e == f) {
+            let rank = i + 1;
+            return (rank <= k, 1.0 / rank as f64);
+        }
+    }
+    (false, 0.0)
+}
+
+/// Run a labeled eval set against the index and report overlap@k + MRR — the gate for any future
+/// ranking-weight change (roadmap Invariants). The eval file is a JSON array of
+/// `{ "task": "...", "expectFiles": ["path", ...] }`.
+fn cmd_eval(root: &Path, eval_path: &Path, k: usize) {
+    let config = rust_config(root);
+    if !index_exists(root, &config) {
+        die(format!("no index at {}/{} — run `index` first", root.display(), config.index_dir));
+    }
+    let index = load_index(root, &config).unwrap_or_else(|e| die(e));
+    ci_embed::ensure_model(&model_dir(), &config.embedding_model).unwrap_or_else(|e| die(e));
+    let embedder = StaticEmbedder::load(&model_dir()).unwrap_or_else(|e| die(e));
+    if embedder.dim() != index.meta.dims || index.meta.model != config.embedding_model {
+        die("index model/dim differs from the embedder — re-run `index`");
+    }
+
+    let raw = std::fs::read_to_string(eval_path).unwrap_or_else(|e| die(format!("reading {}: {e}", eval_path.display())));
+    let json: serde_json::Value = serde_json::from_str(&raw).unwrap_or_else(|e| die(format!("parsing eval json: {e}")));
+    let cases: Vec<EvalCase> = json
+        .as_array()
+        .unwrap_or_else(|| die("eval json must be an array"))
+        .iter()
+        .map(|c| EvalCase {
+            task: c["task"].as_str().unwrap_or_default().to_string(),
+            expect_files: c["expectFiles"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+        })
+        .collect();
+
+    let (mut hits, mut rr_sum) = (0usize, 0.0f64);
+    for case in &cases {
+        let qvec = embedder.embed(&case.task).unwrap_or_else(|e| die(e));
+        let manifest = retrieve(root, &case.task, &index, &qvec, &config, &RetrieveOptions { top_n: Some(k), ..Default::default() });
+        let ranked: Vec<String> = manifest.entries.iter().map(|e| e.file.clone()).collect();
+        let (hit, rr) = score_case(&ranked, &case.expect_files, k);
+        if hit {
+            hits += 1;
+        }
+        rr_sum += rr;
+        println!("{} rr={rr:.2}  {}", if hit { "✓" } else { "✗" }, case.task);
+    }
+    let n = cases.len().max(1) as f64;
+    println!(
+        "\n{} cases · overlap@{k}: {:.1}% ({}/{}) · MRR: {:.3}",
+        cases.len(),
+        100.0 * hits as f64 / n,
+        hits,
+        cases.len(),
+        rr_sum / n
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -227,9 +298,39 @@ fn main() {
             }
             cmd_retrieve(Path::new(&root), &task, top, json);
         }
+        Some("eval") => {
+            let root = args.get(1).cloned().unwrap_or_else(|| die("usage: eval <root> <eval.json> [--top N]"));
+            let eval = args.get(2).cloned().unwrap_or_else(|| die("usage: eval <root> <eval.json> [--top N]"));
+            let mut k = 8usize;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--top" {
+                    i += 1;
+                    k = args.get(i).and_then(|v| v.parse().ok()).unwrap_or(k);
+                }
+                i += 1;
+            }
+            cmd_eval(Path::new(&root), Path::new(&eval), k);
+        }
         _ => {
-            eprintln!("usage:\n  codeindex-rs index <root>\n  codeindex-rs retrieve <root> \"<task>\" [--top N] [--json]");
+            eprintln!("usage:\n  codeindex-rs index <root>\n  codeindex-rs retrieve <root> \"<task>\" [--top N] [--json]\n  codeindex-rs eval <root> <eval.json> [--top N]");
             exit(2);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::score_case;
+
+    #[test]
+    fn score_case_rank_and_hit() {
+        let ranked = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        // first expected file is at rank 2 → rr = 0.5, hit@k for k>=2.
+        assert_eq!(score_case(&ranked, &["b.rs".into()], 8), (true, 0.5));
+        // hit@k is false when the match falls outside k, but the reciprocal rank still reflects it.
+        assert_eq!(score_case(&ranked, &["c.rs".into()], 2), (false, 1.0 / 3.0));
+        // no expected file present → miss.
+        assert_eq!(score_case(&ranked, &["z.rs".into()], 8), (false, 0.0));
     }
 }

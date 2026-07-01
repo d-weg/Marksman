@@ -119,7 +119,7 @@ step is `read_node id=…` / `apply_edits name=…` with no re-derivation.
       duplicated. Tests: exact→one handle, substring→all (docs excluded), cap truncates but total
       still counts every match.
 
-### Batch 5 — Ranking evaluation + multi-language retrieval weighting  ◐ (5a done)
+### Batch 5 — Ranking evaluation + multi-language retrieval weighting  ✅
 **Why:** retrieval weights (`rrf_k`, `symbol_match_bonus`, the layer boost) are hand-tuned with **no
 labeled eval** to catch a regression, and role/layer signals are **npm/tsconfig-centric** — a Rust
 or Python repo gets degraded weighting even once indexing is multi-language.
@@ -137,9 +137,12 @@ or Python repo gets degraded weighting even once indexing is multi-language.
       Rust (axum/actix/rocket/sqlx/diesel/sea-orm, leptos/yew) and Python (django/flask/fastapi/
       sqlalchemy/celery/…). Tested: Cargo+pyproject dep parsing, `[workspace]`-root skip, and a
       crate with an `axum` dep persisting `role: "backend"`.
-- [ ] **5c — labeled eval harness.** A small hand-labeled set (task → expected files/symbols) run
-      against `retrieve`, reporting overlap@k + MRR — the gate for any future weight change (see the
-      Invariants) and the home for `scripts/agent-bench`. Seed it on Marksman's own repo.
+- [x] **5c — labeled eval harness (done).** `codeindex-rs eval <root> <eval.json> [--top N]` runs a
+      labeled set (`{task, expectFiles}`) against `retrieve` and reports overlap@k + MRR — the gate
+      for any future weight change (see Invariants). Scoring (`score_case`: reciprocal rank + hit@k)
+      is a pure, unit-tested function; a seed set on Marksman's own crates lives at
+      [docs/eval/marksman.json](eval/marksman.json). (Wiring `scripts/agent-bench` to consume it is
+      follow-up.)
 - [ ] (ref) the three-way + agent A/B benchmark design lives in [benchmarks.md](benchmarks.md).
 
 ### Batch 6 — Provider registry (multi-language repos)
