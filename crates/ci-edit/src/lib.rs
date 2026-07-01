@@ -395,7 +395,7 @@ fn apply_workspace_edit(vfs: &mut Vfs, root: &Path, we: &Value) -> Result<()> {
     for (uri, mut edits) in groups {
         let rel = uri_to_rel(&uri, root).ok_or_else(|| Error::Other(format!("uri outside root: {uri}")))?;
         // Descending by start so earlier edits don't shift later offsets.
-        edits.sort_by(|a, b| edit_start(b).cmp(&edit_start(a)));
+        edits.sort_by_key(|e| std::cmp::Reverse(edit_start(e)));
         for e in &edits {
             let range = lsp_range(e.get("range"))?;
             let new_text = e.get("newText").and_then(Value::as_str).unwrap_or("");
@@ -561,7 +561,7 @@ mod tests {
                     value: Some("v".into()),
                     ..Default::default()
                 },
-                &resolve,
+                resolve,
             )
         };
 
@@ -598,7 +598,7 @@ mod tests {
                 new_text: Some("bar".into()),
                 ..Default::default()
             },
-            &resolve,
+            resolve,
         )
         .unwrap();
         match rt {
@@ -635,13 +635,13 @@ mod tests {
         let resolve = |_p: &str, _t: Option<&str>, _n: Option<&str>| None;
         let mv = action_to_op(
             &Action { path: "a.ts".into(), action: "move_file".into(), target: None, name: None, value: Some("b/a.ts".into()), ..Default::default() },
-            &resolve,
+            resolve,
         )
         .unwrap();
         assert!(matches!(mv, EditOp::MoveFile { .. }));
         let del = action_to_op(
             &Action { path: "a.ts".into(), action: "delete_file".into(), target: None, name: None, value: None, ..Default::default() },
-            &resolve,
+            resolve,
         )
         .unwrap();
         assert!(matches!(del, EditOp::DeleteFile { .. }));

@@ -93,8 +93,8 @@ impl StaticEmbedder {
             let row = self.mapping[idu] as usize;
             let w = self.weights[idu];
             let base = row * self.dim;
-            for d in 0..self.dim {
-                acc[d] += self.embedding[base + d] as f64 * w;
+            for (d, a) in acc.iter_mut().enumerate() {
+                *a += self.embedding[base + d] as f64 * w;
             }
         }
         let inv = 1.0 / ids.len() as f64;

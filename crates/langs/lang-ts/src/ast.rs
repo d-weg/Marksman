@@ -179,15 +179,14 @@ fn point_byte(content: &str, line_1: u32, char_0: u32) -> Option<usize> {
     if line_1 == 0 {
         return None;
     }
+    // `line_1` is 1-based, so start the counter at 1; `off` tracks the byte start of each line.
     let mut off = 0;
-    let mut ln = 1u32;
-    for l in content.split_inclusive('\n') {
+    for (ln, l) in (1u32..).zip(content.split_inclusive('\n')) {
         if ln == line_1 {
             let add: usize = l.chars().take(char_0 as usize).map(char::len_utf8).sum();
             return Some(off + add);
         }
         off += l.len();
-        ln += 1;
     }
     None
 }

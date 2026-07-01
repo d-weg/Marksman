@@ -203,7 +203,7 @@ pub fn build_index(
 
 /// Incrementally refresh an existing index for a set of changed files (the
 /// reindex-on-commit path). Keeps every unaffected chunk/vector/symbol, re-extracts
-/// + re-embeds only the changed files, and takes the fresh whole-project import
+/// and re-embeds only the changed files, and takes the fresh whole-project import
 /// graph from the (already-refreshed) provider. Deleted files are dropped.
 pub fn update_index(
     root: &Path,
@@ -372,7 +372,7 @@ mod tests {
 
     /// Trivial deterministic embedder (dim 4), so the test needs no model.
     fn toy_embed(text: &str) -> Vec<f32> {
-        let mut v = vec![0f32; 4];
+        let mut v = [0f32; 4];
         for (i, b) in text.bytes().enumerate() {
             v[i % 4] += b as f32;
         }
@@ -395,8 +395,7 @@ mod tests {
         graph.insert(PathBuf::from("src/app.ts"), vec![PathBuf::from("src/math.ts")]);
         let provider = MockProvider { by_file, graph };
 
-        let mut config = Config::default();
-        config.index_docs = false;
+        let config = Config { index_docs: false, ..Default::default() };
         let index = build_index(root, &config, &provider, toy_embed).unwrap();
 
         // Two code symbols chunked; vectors row-aligned at dim 4.
@@ -426,8 +425,7 @@ mod tests {
         by_file.insert("src/b.ts".into(), vec![sym_node("src/b.ts#bee", "bee", 1, 3)]);
         let v1 = MockProvider { by_file, graph: ImportGraph::new() };
 
-        let mut config = Config::default();
-        config.index_docs = false;
+        let config = Config { index_docs: false, ..Default::default() };
         let initial = build_index(root, &config, &v1, toy_embed).unwrap();
         assert!(initial.bm25.search(&tokenize("alpha"), 5).iter().any(|(id, _)| id == "src/a.ts#alpha"));
 

@@ -36,7 +36,7 @@ pub fn discover(root: &Path, config: &Config) -> Result<Vec<DiscoveredFile>> {
     let mut out = Vec::new();
     for result in WalkBuilder::new(root).build() {
         let entry = result.map_err(|e| Error::Other(e.to_string()))?;
-        if !entry.file_type().map_or(false, |t| t.is_file()) {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let abs = entry.path().to_path_buf();

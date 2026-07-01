@@ -38,7 +38,7 @@ get much smaller.
 ## Batches (priority order — central + correctness-critical first)
 
 ### Batch 0 — clippy baseline (mechanical, ~1 sitting)
-- [ ] Clear the **16 existing `cargo clippy --workspace` warnings** (sort_by_key, map_or, manual
+- [x] Clear the **16 existing `cargo clippy --workspace` warnings** (sort_by_key, map_or, manual
       find/iterator, loop-index, doc-indentation, etc.). Pure cleanup, no behavior change.
 
 ### Batch 1 — core seams (everything depends on these)

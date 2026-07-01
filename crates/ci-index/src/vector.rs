@@ -13,7 +13,7 @@ pub fn cosine_normalized(query: &[f32], matrix: &[f32], offset: usize) -> f64 {
 
 /// Rank rows of `matrix` (length n*dim) against `query`; descending (row, score).
 pub fn rank_matrix(matrix: &[f32], dim: usize, query: &[f32], top_k: usize) -> Vec<(usize, f64)> {
-    let n = if dim > 0 { matrix.len() / dim } else { 0 };
+    let n = matrix.len().checked_div(dim).unwrap_or(0);
     let mut scored: Vec<(usize, f64)> =
         (0..n).map(|r| (r, cosine_normalized(query, matrix, r * dim))).collect();
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));

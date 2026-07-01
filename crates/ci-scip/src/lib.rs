@@ -231,7 +231,7 @@ mod tests {
         let scip = ScipIndex::from_bytes(&fixture()).unwrap();
         let g = scip.import_graph().unwrap();
         assert_eq!(g.get(&PathBuf::from("app.ts")).unwrap(), &vec![PathBuf::from("math.ts")]);
-        assert!(g.get(&PathBuf::from("math.ts")).is_none());
+        assert!(!g.contains_key(&PathBuf::from("math.ts")));
     }
 
     #[test]

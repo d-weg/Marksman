@@ -382,12 +382,10 @@ fn resolve_mod(root: &Path, from: &str, module: &str) -> Option<PathBuf> {
     } else {
         parent.join(stem)
     };
-    for cand in [base.join(format!("{module}.rs")), base.join(module).join("mod.rs")] {
-        if root.join(&cand).is_file() {
-            return Some(cand);
-        }
-    }
-    None
+    // Resolve `mod module;` to either `<base>/module.rs` or `<base>/module/mod.rs`.
+    [base.join(format!("{module}.rs")), base.join(module).join("mod.rs")]
+        .into_iter()
+        .find(|cand| root.join(cand).is_file())
 }
 
 /// Repo-relative `.rs` files, gitignore-aware, skipping `target/`.
