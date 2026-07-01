@@ -129,10 +129,14 @@ or Python repo gets degraded weighting even once indexing is multi-language.
       django/flask/fastapi/sqlalchemy/celery/…). This is the **active** signal (path-role + query
       layer boost already work cross-language), so Rust/Python repos now get real layer weighting.
       Tested (path roles + layer firing across languages).
-- [ ] **5b — dep-based persisted roles.** Extract deps from `Cargo.toml`/`pyproject.toml`/
-      `package.json` at index time and persist each package's `infer_role` in `PackageMeta`, so the
-      static/package-role signal is real (not name/dir-only). Needs a `toml` parser + a
-      `detect_workspace` rework (today it only discovers `package.json`). **Decision: add `toml`.**
+- [x] **5b — dep-based persisted roles (done).** `detect_workspace` now discovers `package.json`,
+      `Cargo.toml`, and `pyproject.toml` (a bare Cargo `[workspace]` root is not a package) and
+      extracts each manifest's dep names (via `toml` + serde_json). `build_index` runs `infer_role`
+      over those deps and persists the result in `PackageMeta.role`; `retrieve`'s `file_weighter`
+      feeds it to `resolve_role` (which prefers a persisted role). Dep fingerprints extended with
+      Rust (axum/actix/rocket/sqlx/diesel/sea-orm, leptos/yew) and Python (django/flask/fastapi/
+      sqlalchemy/celery/…). Tested: Cargo+pyproject dep parsing, `[workspace]`-root skip, and a
+      crate with an `axum` dep persisting `role: "backend"`.
 - [ ] **5c — labeled eval harness.** A small hand-labeled set (task → expected files/symbols) run
       against `retrieve`, reporting overlap@k + MRR — the gate for any future weight change (see the
       Invariants) and the home for `scripts/agent-bench`. Seed it on Marksman's own repo.

@@ -68,6 +68,8 @@ const DEP_FINGERPRINTS: &[(PackageRole, &[&str])] = &[
         &[
             "next", "nuxt", "vite", "@vitejs/", "vue", "svelte", "@sveltejs/", "@angular/",
             "react-dom", "react-router-dom", "gatsby", "@remix-run/", "astro",
+            // Rust web-frontend (WASM) frameworks:
+            "leptos", "yew", "dioxus", "sycamore",
         ],
     ),
     (
@@ -77,6 +79,11 @@ const DEP_FINGERPRINTS: &[(PackageRole, &[&str])] = &[
             "drizzle-kit", "prisma", "@prisma/", "mongoose", "typeorm", "sequelize", "knex", "pg",
             "postgres", "mysql", "mysql2", "@aws-sdk/", "firebase-admin", "ioredis", "bullmq",
             "kafkajs", "@trpc/server", "apollo-server", "graphql-yoga",
+            // Rust backend (web/db) crates — `starts_with` also catches `actix-web`, `sea-orm-*`:
+            "axum", "actix", "rocket", "warp", "tonic", "sqlx", "diesel", "sea-orm", "sea_orm",
+            // Python backend (web/db/task) packages:
+            "django", "flask", "fastapi", "starlette", "sqlalchemy", "alembic", "celery",
+            "aiohttp", "tornado", "psycopg2", "asyncpg",
         ],
     ),
 ];

@@ -35,6 +35,7 @@ thiserror = "2"
 ignore = "0.4"
 globset = "0.4"
 tempfile = "3"
+toml = "0.8"
 # Shared so ci-treesitter and every lang-* crate compile against ONE tree-sitter (a
 # `tree_sitter::Node` crosses the ci-treesitter ↔ provider boundary, so the ABI must match).
 tree-sitter = "0.26.10"

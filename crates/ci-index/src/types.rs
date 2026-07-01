@@ -37,6 +37,10 @@ pub struct ChunkMeta {
 pub struct PackageMeta {
     pub name: String,
     pub dir: String,
+    /// Role inferred from the manifest deps at index time (`backend`/`frontend`/…), so retrieval
+    /// weighting uses the real dependency signal rather than re-guessing from name/dir at query time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

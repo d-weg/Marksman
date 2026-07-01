@@ -347,7 +347,13 @@ pub fn file_weighter<'a>(
         .meta
         .packages
         .iter()
-        .map(|p| WeightedPackage { name: p.name.clone(), dir: p.dir.clone(), ..Default::default() })
+        .map(|p| WeightedPackage {
+            name: p.name.clone(),
+            dir: p.dir.clone(),
+            // The role inferred from manifest deps at index time (resolve_role prefers it).
+            role: p.role.clone(),
+            ..Default::default()
+        })
         .collect();
     let pkg_role: HashMap<String, PackageRole> =
         packages.iter().map(|p| (p.name.clone(), resolve_role(p))).collect();

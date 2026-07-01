@@ -178,11 +178,7 @@ pub fn build_index(
         dims,
         root: root.display().to_string(),
         is_monorepo: ws.is_monorepo,
-        packages: ws
-            .packages
-            .iter()
-            .map(|p| PackageMeta { name: p.name.clone(), dir: p.dir.to_string_lossy().replace('\\', "/") })
-            .collect(),
+        packages: ws.packages.iter().map(package_meta).collect(),
         package_names: ws.packages.iter().map(|p| p.name.clone()).collect(),
         files: file_records,
     };
@@ -281,6 +277,20 @@ pub fn update_index(
     meta.files = files;
 
     Ok(IndexData { meta, symbols, chunks, vectors, forward, graph, bm25 })
+}
+
+/// Build a `PackageMeta`, inferring the package's role from its manifest deps at index time (so
+/// retrieval weighting uses the real dependency signal, not a name/dir guess). `Unknown` → `None`.
+fn package_meta(p: &ci_walk::Package) -> PackageMeta {
+    let dir = p.dir.to_string_lossy().replace('\\', "/");
+    let role = ci_core::weight::infer_role(&ci_core::weight::RoleSignals {
+        name: p.name.clone(),
+        dir: dir.clone(),
+        deps: p.deps.clone(),
+        ..Default::default()
+    });
+    let role = (role != ci_core::weight::PackageRole::Unknown).then(|| role.as_str().to_string());
+    PackageMeta { name: p.name.clone(), dir, role }
 }
 
 /// The provider's import graph as string adjacency (repo-relative posix paths), dropping any
@@ -447,6 +457,26 @@ mod tests {
         assert!(updated.bm25.search(&tokenize("alpha"), 5).is_empty());
         // vectors stay row-aligned with chunks.
         assert_eq!(updated.vectors.len(), updated.chunks.len() * updated.meta.dims);
+    }
+
+    #[test]
+    fn package_role_inferred_from_manifest_deps() {
+        // A crate that depends on axum → backend role persisted in PackageMeta (from Cargo deps).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = Config { index_docs: false, ..Default::default() };
+        fs::create_dir_all(root.join("svc/src")).unwrap();
+        fs::write(
+            root.join("svc/Cargo.toml"),
+            "[package]\nname = \"svc\"\n[dependencies]\naxum = \"0.7\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("svc/src/lib.rs"), "pub fn handler() {}\n").unwrap();
+
+        let provider = MockProvider { by_file: HashMap::new(), graph: ImportGraph::new() };
+        let index = build_index(root, &config, &provider, toy_embed).unwrap();
+        let svc = index.meta.packages.iter().find(|p| p.name == "svc").expect("svc package");
+        assert_eq!(svc.role.as_deref(), Some("backend"), "axum dep → backend role persisted");
     }
 
     #[test]
