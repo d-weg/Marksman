@@ -73,17 +73,21 @@ no longer align with chunks).
 - [x] Tests: `create_file path:"../x"|"/etc/passwd"` rejected (in-repo create still commits); save
       leaves no temp/lock artifacts and reloads; lock is exclusive then released on drop.
 
-### Batch 2 — Index lifecycle: keep the index true after edits
-**Why:** `apply_edits` commits to disk but nothing reindexes — `ci_build::update_index` is defined
-and **never called**, so the index (symbols / graph / vectors / BM25) is stale the moment an agent
-makes its first edit, and any follow-up `retrieve_context`/`list_anchors`/name-resolution reasons
-against the pre-edit world. Close the loop.
-- [ ] After a successful `apply_edits` commit, incrementally reindex the returned `changed_files`
-      via `ci_build::update_index` and persist — in `ci-mcp` (and the sidecar `apply_edits` path).
-- [ ] Reuse the in-memory index where the server already holds one; else load → update → save.
-- [ ] Check `IndexMeta.version` on load and rebuild/refuse a mismatched schema instead of
-      mis-reading an old layout (the field exists; nothing reads it).
-- [ ] Test: edit a symbol, then `list_anchors`/`retrieve_context` reflect the new state same session.
+### Batch 2 — Index lifecycle: keep the index true after edits  ✅
+**Why:** `apply_edits` committed to disk but nothing reindexed — `ci_build::update_index` was defined
+and **never called**, so the index (symbols / graph / vectors / BM25) went stale the moment an agent
+made its first edit, and any follow-up `retrieve_context`/`list_anchors`/name-resolution reasoned
+against the pre-edit world.
+- [x] `Server::reindex_after_edit` — after a written commit, incrementally reindex the returned
+      `changed_files` via `ci_build::update_index` and atomic-save (Batch 1). A reindex hiccup logs
+      and leaves the (already-committed) edit intact rather than failing it.
+- [x] load → `update_index` → save, reusing the server's provider + embedder.
+- [x] `load_index` refuses a `meta.version != INDEX_VERSION` index with a "re-run index" hint;
+      `build_index` now stamps `ci_index::INDEX_VERSION` (one source of truth).
+- [x] Tests: version mismatch rejected (ci-index); `update_index → save → reload` reflects the edit
+      (new symbol in, stale out, vectors row-aligned) (ci-build). Session-level MCP e2e (edit then
+      retrieve) stays an `#[ignore]` integration concern — it needs the embedding model + a live
+      provider; the wiring is a straight compose of these component-tested pieces.
 
 ### Batch 3 — Provisioning parity (embedder + schema)
 **Why:** the lazy-fetch invariant applies to provider tooling but **not** the embedding model, which

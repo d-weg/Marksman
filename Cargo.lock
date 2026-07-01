@@ -157,6 +157,7 @@ name = "ci-mcp"
 version = "0.1.0"
 dependencies = [
  "ci-arch",
+ "ci-build",
  "ci-core",
  "ci-edit",
  "ci-embed",

@@ -6,6 +6,10 @@ use crate::types::{ChunkMeta, IndexMeta, SymbolEntry};
 use ci_core::{Config, Error, Result};
 use std::path::{Path, PathBuf};
 
+/// On-disk index schema version. Bump when a persisted shape changes; `load_index` refuses a
+/// mismatched index (with a "re-run index" hint) rather than silently mis-reading an old layout.
+pub const INDEX_VERSION: u32 = 1;
+
 pub struct IndexData {
     pub meta: IndexMeta,
     pub symbols: Vec<SymbolEntry>,
@@ -130,6 +134,12 @@ impl Drop for IndexLock {
 pub fn load_index(root: &Path, config: &Config) -> Result<IndexData> {
     let dir = index_dir(root, config);
     let meta: IndexMeta = read_json(&dir.join("meta.json"))?;
+    if meta.version != INDEX_VERSION {
+        return Err(Error::Other(format!(
+            "index schema v{} is not supported (this build expects v{INDEX_VERSION}) — re-run `index`",
+            meta.version
+        )));
+    }
     let symbols: Vec<SymbolEntry> = read_json(&dir.join("symbols.json"))?;
     let chunks: Vec<ChunkMeta> = read_json(&dir.join("chunks.json"))?;
     let forward: Adjacency = read_json(&dir.join("graph.json"))?;
@@ -250,6 +260,22 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp/lock artifacts left behind: {leftovers:?}");
         assert!(load_index(root, &config).is_ok(), "index still loads after atomic overwrite");
+    }
+
+    #[test]
+    fn load_refuses_mismatched_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = Config::default();
+        let mut data = tiny_index(root);
+        data.meta.version = INDEX_VERSION + 1; // a future/incompatible schema
+        save_index(root, &config, &data).unwrap();
+
+        let err = match load_index(root, &config) {
+            Ok(_) => panic!("expected a schema-version error, but load succeeded"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("schema"), "expected a schema-version error, got: {err}");
     }
 
     #[test]

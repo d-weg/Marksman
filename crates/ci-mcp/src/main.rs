@@ -9,7 +9,7 @@ use ci_arch::{build_architecture, format_architecture};
 use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_in, Action};
 use ci_embed::StaticEmbedder;
-use ci_index::{index_exists, load_index};
+use ci_index::{index_exists, load_index, save_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
 use ci_proto::ProcessProvider;
 use lang_fallback::{FallbackProvider, FbLang};
@@ -464,6 +464,16 @@ impl Server {
 
         let opts = EditOpts { write: !dry_run, dry_run, tsconfig: None };
         let res = provider.apply_edits(&ops, &opts).map_err(|e| e.to_string())?;
+        // Keep the index true: after a real (written) commit, incrementally reindex the changed
+        // files so the same session's next retrieve_context/list_anchors sees the new state. A
+        // reindex hiccup must NOT fail the (already-committed) edit — log and carry on stale.
+        if let ci_core::CommitResult::Ok { changed_files, .. } = &res {
+            if !dry_run && !changed_files.is_empty() {
+                if let Err(e) = self.reindex_after_edit(changed_files) {
+                    eprintln!("[codeindex-rs-mcp] post-edit reindex failed (index may be stale until next `index`): {e}");
+                }
+            }
+        }
         match res {
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if changed_files.is_empty() => {
                 Ok(format!(
@@ -493,6 +503,33 @@ impl Server {
                 Err(format!("rejected — nothing written:\n{feedback}"))
             }
         }
+    }
+
+    /// Incrementally reindex `changed` after a committed edit and persist, so the same session's
+    /// next retrieve_context/list_anchors/name-resolution sees the new state. Reuses the on-disk
+    /// index (load → `update_index` → atomic save). No-op when there's no index yet or nothing
+    /// changed; `root`/`config` are cloned so the embedder borrow doesn't alias `self`.
+    fn reindex_after_edit(&mut self, changed: &[PathBuf]) -> Result<(), String> {
+        let root = self.root.clone();
+        let config = self.config.clone();
+        if changed.is_empty() || !index_exists(&root, &config) {
+            return Ok(());
+        }
+        let provider = self.provider()?;
+        let data = load_index(&root, &config).map_err(|e| e.to_string())?;
+        let changed_rel: Vec<String> =
+            changed.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
+        let embedder = self.embedder()?;
+        let dim = embedder.dim();
+        let updated = ci_build::update_index(
+            &root,
+            &provider,
+            |t| embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim]),
+            data,
+            &changed_rel,
+        )
+        .map_err(|e| e.to_string())?;
+        save_index(&root, &config, &updated).map_err(|e| e.to_string())
     }
 }
 

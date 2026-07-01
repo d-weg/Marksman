@@ -171,7 +171,7 @@ pub fn build_index(
     let forward = forward_adjacency(provider)?;
 
     let meta = IndexMeta {
-        version: 1,
+        version: ci_index::INDEX_VERSION,
         created_at: now_millis(),
         updated_at: now_millis(),
         model: config.embedding_model.clone(),
@@ -447,5 +447,37 @@ mod tests {
         assert!(updated.bm25.search(&tokenize("alpha"), 5).is_empty());
         // vectors stay row-aligned with chunks.
         assert_eq!(updated.vectors.len(), updated.chunks.len() * updated.meta.dims);
+    }
+
+    #[test]
+    fn update_then_persist_reload_reflects_the_edit() {
+        // The Batch 2 loop's persist half: build → edit → update_index → SAVE → reload from disk.
+        // The reloaded index must reflect the edit (new symbol in, stale out), proving the
+        // post-edit reindex the MCP server now runs actually survives a round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = Config { index_docs: false, ..Default::default() };
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/a.ts"), "export function alpha() {\n  return 1;\n}\n").unwrap();
+
+        let mut by_file = HashMap::new();
+        by_file.insert("src/a.ts".into(), vec![sym_node("src/a.ts#alpha", "alpha", 1, 3)]);
+        let v1 = MockProvider { by_file, graph: ImportGraph::new() };
+        let initial = build_index(root, &config, &v1, toy_embed).unwrap();
+        ci_index::save_index(root, &config, &initial).unwrap();
+
+        // Edit a.ts on disk + provider reports the new structure; incrementally update, then persist.
+        fs::write(root.join("src/a.ts"), "export function beta() {\n  return 2;\n}\n").unwrap();
+        let mut by_file2 = HashMap::new();
+        by_file2.insert("src/a.ts".into(), vec![sym_node("src/a.ts#beta", "beta", 1, 3)]);
+        let v2 = MockProvider { by_file: by_file2, graph: ImportGraph::new() };
+        let updated = update_index(root, &v2, toy_embed, initial, &["src/a.ts".into()]).unwrap();
+        ci_index::save_index(root, &config, &updated).unwrap();
+
+        // Reload from disk — the edit is durable.
+        let reloaded = ci_index::load_index(root, &config).unwrap();
+        assert!(reloaded.chunks.iter().any(|c| c.id == "src/a.ts#beta"), "new symbol persisted");
+        assert!(!reloaded.chunks.iter().any(|c| c.id == "src/a.ts#alpha"), "stale symbol gone");
+        assert_eq!(reloaded.vectors.len(), reloaded.chunks.len() * reloaded.meta.dims);
     }
 }
