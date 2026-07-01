@@ -23,6 +23,50 @@ pub(crate) fn npm_cache() -> PathBuf {
     std::env::var("CI_NPM_CACHE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
 }
 
+/// A best-effort cross-process advisory lock so concurrent `npx` invocations don't corrupt the
+/// SHARED npm cache. `npx --yes` stages packages into `<cache>/_npx/<hash>` with atomic renames;
+/// two invocations racing there produce `ENOTEMPTY` / half-installed packages (`Cannot find module
+/// './Counter'`), so scip-typescript fails intermittently whenever several MCP instances start at
+/// once (an agent benchmark, or a few editor sessions). Held for the npx run, released on drop.
+/// Best-effort: a stale lock (crashed holder) is stolen after 5 min, and we give up waiting after
+/// 3 min and proceed unlocked rather than ever hang the tool.
+pub(crate) struct NpxCacheLock(PathBuf);
+
+impl NpxCacheLock {
+    pub(crate) fn acquire() -> Option<Self> {
+        let dir = npm_cache();
+        let _ = std::fs::create_dir_all(&dir);
+        let lock = dir.join(".npx.lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => return Some(NpxCacheLock(lock)),
+                Err(_) => {
+                    let stale = std::fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|e| e.as_secs() > 300);
+                    if stale {
+                        let _ = std::fs::remove_file(&lock);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for NpxCacheLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// A persistent, warmed-once gate engine (ts-morph sidecar or LSP server), reused across
 /// edits. The whole reason rust `apply_edits` was 68s was a COLD engine per call (project
 /// typecheck from scratch); keeping one warm here is the fix. Behind a Mutex so [`prewarm`]
@@ -60,6 +104,9 @@ impl TsProvider {
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Serialize the npx invocation against other MCP instances sharing this npm cache, so a
+        // concurrent `npx` staging can't corrupt the scip-typescript install out from under us.
+        let _cache_lock = NpxCacheLock::acquire();
         let status = Command::new("npx")
             .args([
                 "--yes",
@@ -76,6 +123,7 @@ impl TsProvider {
             .stdout(Stdio::null())
             .status()
             .map_err(|e| Error::Driver(format!("launching scip-typescript via npx failed: {e}")))?;
+        drop(_cache_lock);
         if !status.success() {
             return Err(Error::Driver(format!("scip-typescript index failed ({status})")));
         }

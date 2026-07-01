@@ -214,6 +214,58 @@ alongside code.
       plus a file cap — BM25 search and vector ranking are both O(n) per query today (fine now,
       unbounded on a large monorepo; `ci-arch` already caps at 20k files, the index doesn't).
 
+### Batch 9 — Graph-centrality retrieval prior (PageRank over the import graph)
+**Why:** retrieval fuses three *query-relevance* signals (vector · BM25 · symbol) and then multiplies
+by a *static* prior (`file_weighter`: package weight × query-conditioned layer boost). It has **no
+signal for structural importance** — that a file is a foundational, widely-imported module vs. a
+leaf. The import graph already encodes this (it's in `index.graph` at query time), but today it's
+only used *reactively* (1-hop `adjacency_to_seeds` bonus, N-hop `expand_graph`), never as a global
+prior on the file itself. Adding graph centrality as a second multiplicative prior lets a file that
+is *both query-relevant and structurally central* outrank an equally-relevant leaf — the same
+PageRank-ranked-repo-map idea aider and AGF (graph-flow.cloud) use, but fused into our existing RRF
+pipeline and **gated by the labeled eval** (Batch 5c), not shipped by feel.
+
+**Design note (settled — don't re-litigate):** centrality is a **multiplicative prior on the fused
+score, NOT a fourth RRF list.** A standalone centrality list would seed pure hub files (a barrel /
+`types.ts` everything imports) on *every* query regardless of relevance — the exact failure the
+`exact_symbol_match_outranks_adjacency_hub` test guards against. Multiplying `weighted_fused`
+(which only contains files RRF already surfaced from a query-relevance search) means a file with
+**zero** query signal is absent from `fused` and can never be lifted into seeds by centrality alone;
+centrality only re-ranks *among already-relevant files*. The large additive `symbol_match_bonus`
+(step 6) still applies on top, so a named leaf **definition** stays ahead of a central hub. The two
+existing hub/expansion tests plus the eval are the gate.
+
+- [ ] **9a — PageRank kernel (pure, in `ci-index`).** New `ci_index::centrality` module: PageRank
+      over `Adjacency` (forward edges = "imports"; a file with many *incoming* forward edges is
+      widely-imported → high score). Standard `d=0.85`, dangling-mass redistribution, ~30 iters or
+      L1 Δ < 1e-6; node set = every file in `meta.files` (isolated files get the `(1-d)/N` floor).
+      Language-blind (operates on the unioned per-provider graph from Batch 6). Returns
+      `BTreeMap<String, f32>` (sums≈1). Tests: a file imported by 3 others outranks a leaf; isolated
+      node gets the floor; deterministic; mass conserved.
+- [ ] **9b — persist at index time.** Compute centrality in `ci_build::build_index` after the graph
+      is assembled, store on `IndexData` (+ atomic-save/load, Batch 1); recompute in `update_index`
+      after an edit changes the graph (Batch 2). Bump `INDEX_VERSION` (stale indexes already refuse
+      with a re-index hint — Batch 2/3). *Rationale for persist-vs-recompute:* centrality is a global
+      property that only changes on an edit (which already triggers reindex), so precompute once and
+      cache it (matches the "input is cacheable" ethos) instead of recomputing every query; it also
+      makes the values reusable by `describe_architecture` (9d). Alternative (query-time compute in
+      `ci-retrieve`, no format bump) is smaller but recomputes per query — rejected as the primary.
+- [ ] **9c — fuse as a prior + eval-gated default.** New `Config.centrality_weight: f32`
+      (`#[serde(default)]`). In `retrieve`, fold a bounded, **rank-normalized** centrality multiplier
+      (`1.0 + centrality_weight · normrank(pr[file])`, `normrank`∈[0,1] over the candidate set — rank
+      is robust to one hub dominating raw PR) into the same `weighted_fused` multiply that applies
+      `weight_for`. **Per the "no ranking change without an eval" invariant:** run `codeindex-rs eval
+      <root> docs/eval/marksman.json` at weight ∈ {0, 0.1, 0.2, 0.3}; commit the default that
+      maximizes overlap@k + MRR **without regressing** baseline. If nothing beats weight=0, ship the
+      mechanism with default `0.0` (off) + a note — the knob still helps hub-heavy repos and the
+      invariant (no regression) holds. Tests: hub/expansion tests stay green; a synthetic case where
+      two equally query-relevant files differ *only* in centrality ranks the central one first when
+      `centrality_weight > 0`.
+- [ ] **9d — (stretch) surface core modules in `describe_architecture`.** Reuse the persisted
+      centrality to tag/sort each directory's top files as the repo's "core modules" — a token-budgeted
+      ranked map (AGF's ~1k-token repo map), reusing 9b, no recompute. Keep it a data addition to the
+      `ci-arch` output; defer if it grows the schema.
+
 ## Capability checklist for ANY new language provider (definition-of-done)
 The bar TS and Rust meet — every new provider should target all of it. The seams
 (`LanguageProvider`, `GateEngine`, per-crate `outline`) make most of it *wiring*, not core work.

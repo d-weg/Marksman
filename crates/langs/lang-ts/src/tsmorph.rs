@@ -31,17 +31,22 @@ fn ensure_sidecar(home: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(home)?;
     let installed = home.join("node_modules/ts-morph/package.json");
     if !installed.exists() {
-        let status = Command::new("npm")
-            .args(["install", "--silent", "--no-audit", "--no-fund", "--prefix"])
-            .arg(home)
-            .arg("ts-morph")
-            .env("npm_config_cache", npm_cache())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|e| Error::Driver(format!("npm install ts-morph failed to launch: {e}")))?;
-        if !status.success() {
-            return Err(Error::Driver(format!("npm install ts-morph failed ({status})")));
+        // Serialize against concurrent MCP instances installing into the shared npm cache (same
+        // race as scip-typescript). Re-check after the lock: another holder may have just installed.
+        let _cache_lock = crate::NpxCacheLock::acquire();
+        if !installed.exists() {
+            let status = Command::new("npm")
+                .args(["install", "--silent", "--no-audit", "--no-fund", "--prefix"])
+                .arg(home)
+                .arg("ts-morph")
+                .env("npm_config_cache", npm_cache())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|e| Error::Driver(format!("npm install ts-morph failed to launch: {e}")))?;
+            if !status.success() {
+                return Err(Error::Driver(format!("npm install ts-morph failed ({status})")));
+            }
         }
     }
     let sidecar = home.join("sidecar.cjs");
