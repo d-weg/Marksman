@@ -1,300 +1,175 @@
 # Marksman — roadmap
 
-Directions, not commitments.
+Directions **with a delivery plan.** The open work is organized into **batches** you execute one at
+a time — same rhythm as [code-review-plan.md](code-review-plan.md): read the seams, make the
+smallest safe change, keep the suite green, one commit per batch, tick the boxes here.
 
-## North star: a pure-Rust core; languages as modular, on-demand providers
+## How to run a batch
+1. Read the files/seams the batch names; jot the concrete change.
+2. Implement the smallest change that satisfies each item; add a test for every new branch.
+3. `cargo test --workspace` green + `cargo clippy --workspace --all-targets` clean.
+4. One commit per batch (`feat(<area>): …` / `fix(<area>): …`); update the checkboxes + a one-line
+   note here. Optionally `/code-review` the diff first.
 
-**The core needs nothing but Rust to run.** Indexing, the native Model2Vec embedder, BM25,
-RRF, retrieval, the VFS, and the edit-gate *orchestration* are all pure Rust today. Any
-external or runtime dependency (Node, an indexer, a language server) belongs to a **language
-provider**, never to the core. This is the load-bearing invariant.
+## Invariants (the bar every batch holds)
+- **Pure-Rust core.** Indexing, the Model2Vec embedder, BM25, RRF, retrieval, the VFS, and the
+  edit-gate *orchestration* need nothing but Rust. Any runtime dependency (Node, an indexer, a
+  language server) belongs to a **language provider**, never the core. Load-bearing.
+- **Gated edits stay gated.** Every code edit is type-checked over the blast radius before it lands;
+  the tree-sitter fallback applies edits **ungated** and must report `gated: false`.
+- **Address by handle.** A node id (`file#Scope.name`, optionally `:body`/`:doc`/`:param.N`) is
+  unique AND self-locating — resolve cheapest-precision first, never make the agent re-locate.
+- **No ranking change without an eval.** Once the labeled eval lands (Batch 5), any change to a
+  retrieval weight must show a non-regression against it — no more tuning by feel.
 
-**Providers are modular and loaded on demand.** Indexing a repo should *detect which languages
-are present* (by extension) and activate only those providers. A Rust-only repo must never
-invoke Node; a repo with no TypeScript must never fetch `scip-typescript` or `ts-morph`. Each
-provider declares its own toolchain and **fetches it lazily, the first time a file of that
-language is indexed** — you download only what the repo actually needs.
+## North star: pure-Rust core; languages as modular, on-demand providers
+The core runs on Rust alone; each language provider declares its own toolchain and **fetches it
+lazily, only when a file of that language is indexed**. A Rust-only repo never invokes Node; a repo
+with no TypeScript never fetches `scip-typescript`/`ts-morph`. `build_index` is already generic over
+`LanguageProvider` and Node is confined to `lang-ts` — the gap is that entry points still pick **one
+provider per repo** (Batch 6) and the embedder model isn't lazily fetched (Batch 3).
 
-**Where we are vs. that goal.** `build_index` is already generic over the `LanguageProvider`
-trait, and Node is confined to `lang-ts`. But the CLI/MCP entry points still **hardcode
-`TsProvider`** (`ci-cli/src/main.rs`, `ci-mcp/src/main.rs`), so the TS indexer (Node) runs even
-on a non-TS repo. Closing that is the next structural step.
+**Chosen distribution model:** providers live in-repo under `crates/langs/`, each with a
+`marksman-provider-<lang>` bin; one `cargo build` produces them all, and `CI_PROVIDER=sidecar`
+spawns the one a repo needs (resolved next to the exe). Adding a language is a new folder in
+`langs/` — no download system. Downloadable/third-party providers stay deferred until there's a
+reason (a slim core, or externally-published providers).
 
-### Work items
-1. **Provider registry + extension dispatch.** A map `extension → provider`; `index` derives
-   the active provider set from the files actually present and routes each file through its
-   owning provider (so multi-language repos work). Node is touched *only* if `.ts/.tsx` exist.
-2. **Lazy, on-demand tooling.** Each provider fetches its toolchain on first use and caches it
-   under a per-provider dir (TS: `scip-typescript` / `ts-morph` via npm; Rust: a pinned
-   `rust-analyzer`/scip binary or the `ra_ap_*` crates). No global installs; nothing fetched
-   for languages the repo doesn't contain.
-3. **Provider manifest** so the set is discoverable and configurable — enable/disable a
-   language, pin a tool version, point at a vendored binary for offline/air-gapped use.
+## Shipped ✅ (the baseline these batches build on)
+- **Rust provider** — read (structure + sub-nodes + `mod`/`use` graph, in-process `tree-sitter-rust`)
+  and write (rename / replace_node / move_file, type-checked via rust-analyzer). Opt-in
+  compiler-accurate `use` graph from cached `rust-analyzer scip` (`scip.rust` / `CI_SCIP_RUST`).
+- **TypeScript provider** — SCIP (`scip-typescript`) read + ts-morph/LSP gated write.
+- **Tree-sitter fallback (Python)** — read + outline + **ungated** structural edits (`gated: false`).
+- **Provider selection v0** — manifest/extension pick (Cargo.toml vs package.json; `CI_LANG`); Node
+  only for a TS repo.
+- **Sidecar protocol** — `ci-proto` (protobuf wire + framing), `ProcessProvider` host, and
+  `marksman-provider-{rust,ts}` sidecars; `CI_PROVIDER=sidecar` routes CLI/MCP over the wire.
+- **Skeletal context** — `retrieve_context detailLevel` (`pointers`/`outline`/`full`), secondary
+  import-graph files auto-fold to outline, plus the `read_node` drill-down tool.
+- **Surgical sub-node edits** — `set_body`, `replace_node target:body|return|param.N|doc`,
+  `replace_text` (unique substring), and `:doc` comment/docstring edits — all through the gate.
+- **Addressing model** — id ≫ name-in-file ≫ name-in-index ≫ free-text `query`; collisions return
+  candidate ids. `retrieve_and_edit` (query→edit in one gated call).
+- **Shared internals** — `ci-treesitter` (ts_range / syntax_node / leading_comment / body_ranges),
+  `reverse_import_map`, `forward_adjacency` (from the code-quality pass).
 
-## Addressing model — intent over location (token-minimal editing)
+---
 
-The cost of an agent run is **turns × ~fixed-per-turn-context** (the harness re-sends everything
-each turn; caching discounts but the metric/cost still scale with turns). So the lever is *fewer
-turns* — and a big source of wasted turns is the agent **locating** things the index already knows
-and **reading** context it doesn't need. Two principles fix this:
+## Batches (priority order — correctness & safety first, then value, then breadth)
 
-1. **The type-check gate licenses minimal context.** Because every edit is verified over the blast
-   radius, the agent can edit *locally and blind* and trust the gate — it never needs to read
-   call sites defensively. That's the real reason gated editing is cheap (not just atomicity).
-2. **Address by handle, not by hand.** A node id (`file#Scope.name`, optionally `:body`/`:doc`/…)
-   is unique AND self-locating. `apply_edits`/`read_node` resolve a reference cheapest-precision
-   first (**done**): a node id is used as-is (no `path`/`file`, no retrieve); a bare name is
-   resolved in a given file, else **across the index** (so the agent edits by name with no prior
-   retrieve — the index supplies the file); a same-name collision returns the **candidate ids** to
-   re-issue with (one cheap round-trip, never a full retrieve). Local variables (not indexed) stay
-   position-addressed via the LSP. Verified: rename `reciprocalRankFusion`→`fuseRanks` by name with
-   no path (2 files, gated); `read_node` by id with no file; ambiguous `freshProject` → 2 candidates.
-   - [ ] Surface the qualified node id in `retrieve_context`'s matched-symbol lines so the handle
-         propagates directly (today the agent reconstructs `file#name` or uses bare-name resolution).
-   - [ ] `read just the sub-node`: encourage `read_node id=…:body`/`:doc` so a body edit loads only
-         the body, not the whole symbol.
-   - [x] **Resolve-by-query (`retrieve_and_edit`) — done.** A fourth, fuzziest addressing mode: an
-         `apply_edits` action with `query` (free text) instead of `name`/`id`. The server resolves
-         it — an exact symbol-name token in the query when unique, else the retrieval top hit —
-         and applies the edit (gated) when unambiguous, else returns candidate ids. Fuses
-         locate+edit into ONE call, closing the T3 discovery turn. Safe by construction: the gate +
-         `replace_text` uniqueness reject a wrong/ill-fitting target rather than silently editing
-         it. (Honest limit: a descriptive query rides retrieval ranking; a mismatched edit is
-         rejected, not misapplied.)
+### Batch 1 — Write & index safety (the trust boundary)
+**Why:** an autonomous, possibly prompt-injected agent drives this. `create_file`/`move_file`/
+`delete_file` take arbitrary paths joined to root with **no containment check**; `save_index` writes
+six files **in place, sequentially** (a crash or concurrent read yields a torn index whose vectors
+no longer align with chunks).
+- [ ] Root-containment guard: reject any create/move/delete whose resolved path escapes root
+      (`..`, absolute, symlink-out). One check in `ci-edit` before the VFS mutates.
+- [ ] Atomic index write: write into a temp dir under the index dir, then rename into place, so a
+      reader never sees a half-written index.
+- [ ] Single-writer lock (lockfile in the index dir) so a reindex can't race a read or another writer.
+- [ ] Tests: `create_file path:"../x"` rejected; an interrupted save leaves the prior index intact.
 
-## Backlog (actionable, in dependency order)
+### Batch 2 — Index lifecycle: keep the index true after edits
+**Why:** `apply_edits` commits to disk but nothing reindexes — `ci_build::update_index` is defined
+and **never called**, so the index (symbols / graph / vectors / BM25) is stale the moment an agent
+makes its first edit, and any follow-up `retrieve_context`/`list_anchors`/name-resolution reasons
+against the pre-edit world. Close the loop.
+- [ ] After a successful `apply_edits` commit, incrementally reindex the returned `changed_files`
+      via `ci_build::update_index` and persist — in `ci-mcp` (and the sidecar `apply_edits` path).
+- [ ] Reuse the in-memory index where the server already holds one; else load → update → save.
+- [ ] Check `IndexMeta.version` on load and rebuild/refuse a mismatched schema instead of
+      mis-reading an old layout (the field exists; nothing reads it).
+- [ ] Test: edit a symbol, then `list_anchors`/`retrieve_context` reflect the new state same session.
 
-- [x] **Rust provider — read path (done).** `lang-rust` crate: `structure()` (fns/structs/
-      impls/methods + `#sym:body`/`:param.N`/`:return`), `import_graph()` (`mod` resolution),
-      `granularity()→Ast`, all in-process `tree-sitter-rust` (no Node). Indexes + retrieves Rust
-      (incl. Marksman itself) via CLI and MCP.
-      - [x] **Rust write path (done).** Full structural-edit coverage — **rename, replace_node,
-            move_file** — type-checked via rust-analyzer, reusing the `GateEngine`/`LspClient`/
-            `commit_edits` blast-radius gate (all three verified end-to-end). Needs
-            `rustup component add rust-analyzer` (`CI_RUST_ANALYZER` overrides). Next: faster
-            cold-start than the ~10s rename/move retry (a "rust-analyzer ready" signal).
-      - [x] **Better Rust graph (done, opt-in).** The `scip: { rust: true }` config setting (or
-            `CI_SCIP_RUST` env override) swaps the `mod`-only graph for a
-            **compiler-accurate `use`/reference graph** from `rust-analyzer scip` — read by the
-            existing `ci-scip` (no reader changes; validated). Latency-safe: `lang_rust::refresh_scip`
-            generates `<root>/.codeindex-rs/rust.scip` at **index time** (a batch step, ≈ a
-            `cargo check`); `import_graph()` only *reads* the cache and **falls back to the instant
-            tree-sitter `mod` graph** when it's absent — SCIP never sits on the live path. Off by
-            default (the analysis latency); flip on per repo. tree-sitter still owns structure +
-            sub-nodes, so Rust now mirrors TS: tree-sitter for AST, SCIP for the semantic graph.
-- [x] **Provider selection (done, v0).** `build_provider`/`select_provider` keyed on manifests
-      (Cargo.toml vs package.json; `CI_LANG` override) in `ci-cli` + `ci-mcp` — **Node only for a
-      TS repo now.**
-      - [ ] **Full registry** — multi-language repos (per-file dispatch), lazy per-language
-            tooling fetch, a provider manifest (enable/disable, pin versions).
-- [ ] **Dynamically-fetched modular providers (sidecar processes).** Today the provider glue
-      crates (`langs/lang-ts`, `langs/lang-rust`) are compiled into the core binary, even though
-      their *tooling* (scip-typescript, ts-morph, rust-analyzer) is already fetched on demand. To
-      make a provider itself downloadable: ship each as its own small executable, fetch it on
-      demand (release/registry), and have the core spawn it and talk over a **stdio JSON protocol**
-      (serialize `LanguageProvider`: structure / import_graph / apply_edits). Core stays tiny +
-      language-agnostic; providers can be third-party / any language. NOT dlopen — Rust has no
-      stable ABI, so in-process plugins are unsafe/undistributable; separate processes (the model
-      rust-analyzer / the ts-morph sidecar already use) are the correct seam.
-      - [x] **Protocol + host + both sidecars + dispatch (done) — protobuf over JSON for speed.**
-            `ci-proto` (prost messages + ci-core↔proto conversions + `[u32-len][bytes]` framing)
-            defines the wire; `ProcessProvider` (host) spawns a provider binary and implements
-            `LanguageProvider` over it; **`marksman-provider-rust`** (serves `RustProvider`) and
-            **`marksman-provider-ts`** (runs scip-typescript, then serves `TsProvider`) are the
-            sidecars — the gate (rust-analyzer / ts-morph) runs *inside* the sidecar, so
-            `apply_edits` travels the wire too. `CI_PROVIDER=sidecar` routes the CLI `index` and the
-            MCP server through a sidecar (binary resolved via `$CI_PROVIDER_<LANG>` or next to the
-            exe; falls back to in-process if absent). Tested: read path + `apply_edits` over the wire
-            (gate in-sidecar); dogfooded end-to-end (`index` + `list_anchors` over the wire).
-            Protobuf is compact + cheap to decode at indexing volume — it speeds the provider RPC /
-            `sec` axis, NOT the agent token count (that's turns).
-      - **Default model: providers live in-repo under `crates/langs/`, built + shipped together.**
-            Each is a crate with a `marksman-provider-<lang>` bin; one `cargo build` produces them
-            all next to the core, and `CI_PROVIDER=sidecar` spawns the one the repo needs (resolved
-            next to the exe). Adding a language is a new folder in `langs/` — no registry. You still
-            get the runtime modularity (out-of-process, language-agnostic wire) without a download
-            system. **This is the chosen model.**
-      - [ ] *(optional, future)* **Downloadable providers** — only if you want a *slim core* that
-            doesn't bundle every provider binary, or *third-party* providers published independently:
-            fetch `marksman-provider-<lang>` on demand from a release/registry + cache + version-pin.
-            Not needed for a repo you control; deferred until there's a reason.
-- [x] **Skeletal context (done).** `detailLevel` (`pointers`/`outline`/`full`) on
-      `retrieve_context` inlines the top files with fn/method bodies folded to `{ /* … */ }`
-      (`ci-core::elide_bodies` + tree-sitter `outline` in each provider). TS + Rust.
-      - [x] `read_node` drill-down tool (done) — full source + metadata of ONE anchor by `id`
-            or `name`, incl. `:body`/`:param`/`:return` sub-nodes.
-      - [x] **secondary import-graph files auto-default to `outline` (done)** even when the call
-            asks for `full` on the primaries — they're labeled "(outline — imported context)" so
-            the agent knows to `read_node` if it needs a body. Inline caps tightened (4×100) so a
-            big retrieve isn't re-read every turn.
-- [x] **Surgical sub-node edits (done, v0).** Edit part of a function without re-emitting it,
-      still type-checked. `set_body` (new verb) replaces just the `:body` block; `replace_node`
-      takes a `target` to narrow onto a sub-node anchor — `body`, `return`, or `param.N`; and
-      **`replace_text`** swaps an exact substring inside a symbol (`oldText`→`newText`, unique
-      within it) — the cheapest precise edit: no read, no body re-emit, and a not-found error now
-      echoes the node's text so the agent self-corrects. Wired in `ci-edit::action_to_op` +
-      the MCP `apply_edits` schema. All ride the blast-radius gate (verified on Rust + Python).
-      The agent-benchmark T4 win (rust −27% vs ts +25%) comes from `replace_text`.
-      - [ ] **Statement-level body edits** — `insert_in_body`/`delete_in_body` targeting ONE
-            statement inside a block (replace-in-body is already covered by `replace_text` +
-            `target:"body"`; insert/delete still need statement addressing).
-      - [ ] **`add_parameter` / `set_return_type` where absent** — insert `-> T` / a new param
-            when there's no existing anchor (needs the params-end insertion point; the
-            anchor punctuation differs per language — TS `: T` vs Rust `-> T`).
-      - [x] **Comment / docstring edits (done).** Each symbol carries a `:doc` sub-node anchor —
-            the leading comment / JSDoc (TS), `///`/`/** */` doc comments (Rust), or the docstring
-            (Python). Edit it with the existing verbs: `replace_node target:"doc"` (rewrite),
-            `replace_text target:"doc"` (tweak), or `insert_before` (add where none exists). Safe
-            by construction (comment edits introduce no type errors, so the gate passes trivially).
-            Follow-up: Rust line-comment `:doc` ranges include the trailing newline (replacement
-            should include one); doc separated from the item by an attribute isn't captured yet.
-- [ ] **Config providers (JSON/YAML/TOML)** — tree-sitter providers for surgical key edits
-      (package.json, compose, *.toml); no gate needed. Rides on the provider registry.
-- [x] **Tree-sitter fallback edit provider (done, v0 — Python).** `lang-fallback` crate: a
-      tree-sitter `LanguageProvider` for languages without a SCIP/LSP integration yet. Read path
-      — `structure()` (functions/classes/methods + fn sub-nodes), `import_graph()`
-      (`import` / `from … import` resolution incl. relative dots), skeletal `outline()` (bodies
-      folded to `...`) — all in-process, no external tooling. **Ungated** structural edits
-      (`replace_node` / `insert_before` / `create` / `move` / `delete`, plus a best-effort
-      within-file `rename`) through the same VFS/blast-radius/atomic-commit path as the gated
-      providers, behind a no-op `GateEngine`. The MCP success message reports **`gated: false`**
-      so the agent knows the edit is structural, not type-checked. Dispatched by `FbLang::detect`
-      (`.py` present) / `CI_LANG=python`; indexes + retrieves a Python repo end-to-end.
-      - [ ] **Go** (and Ruby/…) — a data addition to `FbLang` (grammar + the few node-kind names);
-            the provider, dispatch, outline, and ungated edit path are already language-generic.
-      - [ ] Per-language **upgrade to the gated path** as each LSP/indexer lands (pyright + a
-            SCIP-python indexer for Python; gopls + scip-go for Go) — swap the no-op gate for the
-            real `GateEngine`, reaching capability parity with TS/Rust.
-### Requirements for ANY new language provider (the capability checklist)
+### Batch 3 — Provisioning parity (embedder + schema)
+**Why:** the lazy-fetch invariant applies to provider tooling but **not** the embedding model, which
+is a manual `git clone … ~/.marksman/models`. Make the embedder obey the same rule.
+- [ ] Lazy-fetch + cache the Model2Vec model on first index (per the provider lazy-tooling model);
+      `CI_MODEL_DIR` still overrides; a clear error + one-line fetch hint when offline.
+- [ ] Record model id + dims in `IndexMeta`; a query embedded with a different model/dim is a clear
+      error (ties into Batch 2's version check) — never a silent mis-rank or an out-of-bounds panic
+      in `cosine_normalized` (see code-review-plan deferred notes).
 
-This is the bar TS and Rust now meet — **every new provider should target all of it.** The seams
+### Batch 4 — `find_symbols`: keyword/symbol search that returns handles
+**Why:** fills the gap between `retrieve_context` (fuzzy, concept→files) and grep (literal, but
+returns lines the agent must map back to symbols). Every hit is a self-locating handle, so the next
+step is `read_node id=…` / `apply_edits name=…` with no re-derivation. Pays off even for a lean
+single-server agent — the handle-return is the point.
+- [ ] `find_symbols` MCP tool: exact/substring match over indexed symbol names (opt. comments),
+      returning `{node_id, kind, range, weight}` ranked by the path-role/layer weights — **not**
+      `file:line`. Exact + exhaustive by default (audits: "every impl of X"), not top-k; cap + note
+      when huge.
+- [ ] Surface the qualified node id in `retrieve_context` matched-symbol lines too, so the handle
+      propagates directly instead of being reconstructed.
+- [ ] Encourage sub-node reads (`read_node id=…:body`/`:doc`) so a body edit loads only the body.
+- [ ] Tests: unique name → one handle; ambiguous → all handles; substring mode.
+
+### Batch 5 — Ranking evaluation + multi-language retrieval weighting
+**Why:** retrieval weights (`rrf_k`, `symbol_match_bonus`, the layer boost) are hand-tuned with **no
+labeled eval** to catch a regression, and role/layer signals are **npm/tsconfig-centric** — a Rust
+or Python repo gets degraded weighting even once indexing is multi-language.
+- [ ] A labeled eval set (task → expected files/symbols) + a runner reporting manifest overlap +
+      rank; wire `scripts/agent-bench` as the harness. This becomes the gate for any weight change.
+- [ ] Role/layer fingerprints beyond npm: Cargo (`[dependencies]`, workspace members) and Python
+      (pyproject/requirements) so `infer_role` classifies non-TS packages.
+- [ ] Persisted package roles (deps-based `infer_role` at index time) for sharper query weighting.
+- [ ] (ref) the three-way + agent A/B benchmark design lives in [benchmarks.md](benchmarks.md).
+
+### Batch 6 — Provider registry (multi-language repos)
+**Why:** indexing/editing still bind **one** provider per repo, so a mixed Rust+TS+Python repo can't
+be fully indexed, and tooling isn't fetched per-language.
+- [ ] `extension → provider` registry; `index` derives the active set from files present and routes
+      each file through its owning provider (multi-language repos work; Node touched only if `.ts*`).
+- [ ] Lazy per-language tooling fetch, cached per provider; nothing fetched for absent languages.
+- [ ] Provider manifest: enable/disable a language, pin a tool version, point at a vendored binary
+      (offline/air-gapped).
+
+### Batch 7 — Deeper edits + structured non-code providers
+**Why:** extend surgical editing to single statements and to the config/data/docs files agents touch
+alongside code.
+- [ ] Statement-level body edits: `insert_in_body` / `delete_in_body` (one statement in a block;
+      replace-in-body is already covered by `replace_text target:"body"`).
+- [ ] `add_parameter` / `set_return_type` where **no** anchor exists (params-end / return insertion
+      point; TS `: T` vs Rust `-> T`).
+- [ ] Non-ASCII (byte-vs-char) column handling across the edit path; while here, dedupe the
+      near-identical `ci-vfs::byte_offset` / `lang-ts::point_byte` into a `ci-core` util.
+- [ ] Structured providers (JSON/YAML/TOML/Markdown): edit by structural **key** / heading path — no
+      reformatting, no gate (no type-check) — in the **same atomic batch** as the code edit that
+      needs them (e.g. a `package.json`/`Cargo.toml` dep beside the import that uses it).
+
+### Batch 8 — Breadth: more languages + retrieval scale
+**Why:** last, once the lifecycle / safety / quality floor is in.
+- [ ] Go / Ruby fallback: a data addition to `FbLang` (grammar + node-kind names); the provider,
+      dispatch, outline, and ungated-edit path are already language-generic.
+- [ ] Gated upgrades per language: pyright + scip-python (Python), gopls + scip-go (Go) — swap the
+      no-op gate for a real `GateEngine`, reaching TS/Rust parity.
+- [ ] Retrieval scale: decide an ANN/inverted index **or** an explicit "small/medium repos" non-goal
+      plus a file cap — BM25 search and vector ranking are both O(n) per query today (fine now,
+      unbounded on a large monorepo; `ci-arch` already caps at 20k files, the index doesn't).
+
+## Capability checklist for ANY new language provider (definition-of-done)
+The bar TS and Rust meet — every new provider should target all of it. The seams
 (`LanguageProvider`, `GateEngine`, per-crate `outline`) make most of it *wiring*, not core work.
-Treat this as the definition-of-done when adding a language; don't ship a read-only language
-without a path to its edit gate.
+Don't ship a read-only language without a path to its edit gate.
 
 **Read**
-- [ ] `structure()` — symbols (fns / methods / types / fields) AND their **sub-node anchors**:
-      `:param.N`, `:return`, `:body`, **`:doc`** (leading comment / docstring). Field/variable
-      ranges must span the full declaration, not just the name.
-- [ ] `import_graph()` — the language's real dependency edges (imports / `mod` / `use` / `from`).
+- [ ] `structure()` — symbols (fns / methods / types / fields) AND sub-node anchors `:param.N`,
+      `:return`, `:body`, `:doc`. Field/variable ranges span the full declaration, not just the name.
+- [ ] `import_graph()` — the language's real dependency edges (import / `mod` / `use` / `from`).
 - [ ] `outline()` — skeletal context: fold function/method bodies, keep signatures + structure.
 
 **Write** (all atomic + through the blast-radius gate)
 - [ ] Structural: `rename`, `replace_node`, `move_file` (+ create / delete / insert_before).
 - [ ] Surgical sub-node: `set_body`, `replace_node target:body|return|param.N|doc`, `replace_text`.
 - [ ] **Gate:** a real `GateEngine` (LSP/indexer) so edits are type-checked; until one exists, the
-      tree-sitter fallback path applies them **ungated** and the result says `gated: false`.
+      fallback applies them **ungated** and the result says `gated: false`.
 
 **Dispatch**
-- [ ] Manifest/extension detection in `build_provider`/`select_provider` (+ `CI_LANG` override);
-      a `.ext → outline` arm in the MCP `outline_for`.
+- [ ] Manifest/extension detection in the provider registry (+ `CI_LANG`); a `.ext → outline` arm
+      in the MCP `outline_for`.
 
 Per-language status: **TS ✅ · Rust ✅ · Python** (read + outline + ungated edits ✅; gated path
-pending — pyright/scip-python) · **Go/Ruby/…** (fallback is a data addition to `FbLang`).
+pending — Batch 8) · **Go/Ruby/…** (fallback is a data addition to `FbLang` — Batch 8).
 
-## Languages
-
-### 1. Rust — next, and the reason it's first
-Rust is the highest-leverage second language because **Rust's own tooling is Rust**, so a Rust
-provider gets far closer to the "single binary, no foreign runtime" ideal than TypeScript ever
-can (TS forces us out to Node):
-
-- **Structure / sub-symbol AST:** `tree-sitter-rust` — already a workspace dependency,
-  in-process, zero external deps.
-- **Compiler-accurate symbols + references (read):** `rust-analyzer scip` (a single static
-  Rust binary — bundle or download once, no Node/npm), or the `ra_ap_*` crates linked
-  in-process for a true zero-external-process build.
-- **Type-checked edits (write/gate):** rust-analyzer's rename / references / diagnostics,
-  slotting into the existing `GateEngine` trait exactly as the ts-morph engine does today.
-- **Dogfooding:** once Marksman can index and edit Rust, we use *it* to build the remaining
-  providers — the tool accelerates its own development (it's a Rust codebase).
-
-### Then, via the generic LSP `GateEngine` fallback (already built)
-- **Python** — pyright + a SCIP-python indexer.
-- **Go** — gopls + scip-go.
-- **Java / C# / …** — each a new crate implementing `LanguageProvider`, reusing the
-  language-blind core, retrieval, VFS, and blast-radius gate **unchanged**.
-
-The seams already exist: `LanguageProvider` (structure + import graph + edits), `Granularity`
-(Symbol vs Ast), and `GateEngine` (ts-morph or LSP). A new language is a new crate, not a core
-change.
-
-## Benchmarks (planned)
-
-### Three-way: read/edit backend — speed AND precision
-Same operations across three implementations on the same real repos:
-
-| Variant | Read | Edit granularity | Notes |
-|---|---|---|---|
-| **Rust + SCIP only** | SCIP (`scip-typescript`) | symbol-level (`replace_node`) | compiler-grade refs, no sub-symbol edits |
-| **Rust + SCIP + tree-sitter** (current) | SCIP + in-process tree-sitter | **sub-symbol** | `Granularity::Ast`, no external dep for the AST |
-| **Node** (original) | ts-morph | sub-symbol | the oracle |
-
-Measure: indexing speed (cold/warm, small vs monorepo); retrieval precision (manifest overlap +
-ranking vs a labeled set); edit precision/coverage per op class; end-to-end edit latency. The
-agent A/B benchmark (with vs without, vs the TS tool) lives in [benchmarks.md](benchmarks.md).
-
-## Other directions
-- **Fine verbs over the AST tree** — `set_body` + `replace_node target:body|return|param.N` are
-  mapped in `action_to_op` over the `#sym:body` / `:return` / `:param.N` anchors and shipped
-  (see the gated "Surgical sub-node edits" backlog item). Remaining: statement-level body edits,
-  `add_parameter`/`set_return_type`-where-absent, and non-ASCII (byte-based) column handling.
-- **Incremental index refresh** after a commit (reindex only changed files; `scip-typescript`
-  is largely whole-project — measure latency, consider a faster path).
-- **Persisted package roles** (deps-based `infer_role` at index time) for sharper query
-  weighting.
-- **TS-tool ranking parity** — port the retrieval fixes (path-role, symbol-match, the
-  `name`-in-`rename` word-boundary fix) into the original Node `codeindex` so the A/B isolates
-  read-vs-write mechanics.
-
-## Capabilities (planned)
-
-### Skeletal context — signature-level retrieval (`detail_level`)
-An agent rarely needs a 200-line function body just to know how to *call* it. Add a
-`detail_level` to `retrieve_context` — **`full` | `outline` | `signatures`** — and use the
-in-process tree-sitter we already have (`lang-ts/src/ast.rs` already locates each symbol's
-`#sym:body`) to **elide bodies**: replace a `statement_block` with `{ /* … elided */ }`, keeping
-the signature, params, and return type. A 200-line file collapses to ~15 lines of pure signal,
-with compiler-accurate types intact.
-- **Secondary files default to `outline`.** Files pulled in via the import graph are context,
-  not the target — you need their *signatures* to call them, not their bodies. The primary
-  matches can stay `full`.
-- **Node drill-down.** When the elided body *is* what's needed, a tool to fetch the precise full
-  text + metadata (kind, signature, exact range, refs) of a single anchor — reusing the existing
-  `#sym:body` / `:param.N` / `:return` anchors. Skeleton by default, expand on demand.
-- Pure tree-sitter, no SCIP/compiler needed for the fold → cheap, and works for any language
-  with a tree-sitter grammar.
-
-### Surgical sub-node edits (deeper `apply_edits` verbs)
-`replace_node` is sometimes too blunt — re-drafting a whole function to tweak one statement.
-Expand the edit suite to map directly onto AST anchors (the `#sym:body` / `:param.N` / `:return`
-targets already exist from the SCIP+tree-sitter merge):
-- **Body-level:** `insert_in_body` / `replace_in_body` / `delete_in_body` — inject or remove a
-  single statement inside a block/loop/conditional without reconstructing the parent.
-- **Targeted modifiers:** add/remove a **parameter**, set a **return type**, edit a call's
-  **arguments** — without re-emitting surrounding syntax.
-- **Comments / docstrings:** `edit_leading_comment` / docstring control — touch documentation
-  without touching executable code.
-- Remaining work: mapping these verbs in `action_to_op` + statement-level targeting within a
-  body + byte-vs-char column handling. **Marksman's edge over a pure-AST editor: these stay
-  type-checked** (the blast-radius gate) — surgical *and* safe.
-
-### Config files as first-class citizens (JSON / YAML / TOML)
-Agents constantly need to edit `package.json`, `docker-compose.yml`, `*.toml` alongside code
-(e.g. add a dependency when adding an import). Add tree-sitter providers for json/yaml/toml so a
-single **key** can be modified surgically — no reformatting, no clobbered comments. These need no
-compiler gate (config has no type-check), so they're pure tree-sitter and slot straight into the
-modular-provider model. High synergy: update `package.json` deps **in the same atomic batch** as
-the TS import that needs them.
-
-### Breadth vs. depth — a pure-tree-sitter fallback edit provider
-The real axis: **breadth** (tree-sitter — 11+ languages, no type safety) vs **depth**
-(SCIP/LSP — type-checked, few languages). Marksman can do *both* through the existing
-`Granularity` + `GateEngine` seams:
-- A **tree-sitter structural-edit provider with no blast-radius gate** is the *fallback* for any
-  language we don't yet have SCIP/LSP for (Python, Go, Ruby, …) — structural edits work
-  immediately, best-effort.
-- Per language, upgrade to the **gated** path as the SCIP/LSP integration lands (Rust first).
-- So a multi-language repo is *useful on day one*, and the type-checked guarantee is layered in
-  where the toolchain exists. **Honest tradeoff:** tree-sitter edits aren't type-checked — the
-  result must say so (e.g. `gated: false`) so the agent knows it's structural, not verified.
+## Done = every open box above checked, suite green, clippy clean, and this file's notes updated.
