@@ -251,6 +251,27 @@ fn op_to_pb(op: &EditOp) -> PbEditOp {
             p.node_id = node_id.clone();
             p.text = code.clone();
         }
+        EditOp::InsertInBody { node_id, code, after } => {
+            p.op = "insert_in_body".into();
+            p.node_id = node_id.clone();
+            p.text = code.clone();
+            p.old_text = after.clone().unwrap_or_default();
+        }
+        EditOp::DeleteInBody { node_id, text } => {
+            p.op = "delete_in_body".into();
+            p.node_id = node_id.clone();
+            p.text = text.clone();
+        }
+        EditOp::AddParameter { node_id, param } => {
+            p.op = "add_parameter".into();
+            p.node_id = node_id.clone();
+            p.text = param.clone();
+        }
+        EditOp::SetReturnType { node_id, ty } => {
+            p.op = "set_return_type".into();
+            p.node_id = node_id.clone();
+            p.text = ty.clone();
+        }
         EditOp::Rename { node_id, new_name } => {
             p.op = "rename".into();
             p.node_id = node_id.clone();
@@ -280,6 +301,14 @@ fn pb_to_op(p: &PbEditOp) -> Result<EditOp> {
         "replace_node" => EditOp::ReplaceNode { node_id: p.node_id.clone(), code: p.text.clone() },
         "replace_text" => EditOp::ReplaceText { node_id: p.node_id.clone(), old_text: p.old_text.clone(), new_text: p.new_text.clone() },
         "insert_before" => EditOp::InsertBefore { node_id: p.node_id.clone(), code: p.text.clone() },
+        "insert_in_body" => EditOp::InsertInBody {
+            node_id: p.node_id.clone(),
+            code: p.text.clone(),
+            after: (!p.old_text.is_empty()).then(|| p.old_text.clone()),
+        },
+        "delete_in_body" => EditOp::DeleteInBody { node_id: p.node_id.clone(), text: p.text.clone() },
+        "add_parameter" => EditOp::AddParameter { node_id: p.node_id.clone(), param: p.text.clone() },
+        "set_return_type" => EditOp::SetReturnType { node_id: p.node_id.clone(), ty: p.text.clone() },
         "rename" => EditOp::Rename { node_id: p.node_id.clone(), new_name: p.text.clone() },
         "move_file" => EditOp::MoveFile { from: PathBuf::from(&p.from), to: PathBuf::from(&p.to) },
         "create_file" => EditOp::CreateFile { path: PathBuf::from(&p.path), code: p.text.clone() },

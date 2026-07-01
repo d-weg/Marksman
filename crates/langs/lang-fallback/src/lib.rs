@@ -301,6 +301,8 @@ fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Op
 
 fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
     if let Some(params) = item.child_by_field_name("parameters") {
+        // The whole `(...)` list — the insertion anchor for `add_parameter` / a missing return type.
+        n.children.push(syntax_node(&format!("{}:params", n.id), None, "params", &params));
         let mut cursor = params.walk();
         for (i, p) in params.named_children(&mut cursor).enumerate() {
             // skip `self`/`cls` — they aren't meaningful edit targets
@@ -638,5 +640,51 @@ mod tests {
         assert!(matches!(res, CommitResult::Ok { .. }), "rename should commit: {res:?}");
         let after = fs::read_to_string(root.join("pkg/math_utils.py")).unwrap();
         assert!(after.contains("def plus(a, b):"), "definition renamed: {after}");
+    }
+
+    #[test]
+    fn ungated_add_parameter_and_return_type() {
+        let dir = py_project();
+        let root = dir.path();
+        let p = FallbackProvider::new(root, FbLang::Python);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        // Append a parameter, then (in a second batch, so structure re-parses the updated file)
+        // add a return type where none exists (`-> T` for Python).
+        let add = p
+            .apply_edits(&[EditOp::AddParameter { node_id: "pkg/math_utils.py#add".into(), param: "c".into() }], &opts)
+            .unwrap();
+        assert!(matches!(add, CommitResult::Ok { .. }), "add_parameter must commit: {add:?}");
+        let ret = p
+            .apply_edits(&[EditOp::SetReturnType { node_id: "pkg/math_utils.py#add".into(), ty: "int".into() }], &opts)
+            .unwrap();
+        assert!(matches!(ret, CommitResult::Ok { .. }), "set_return_type must commit: {ret:?}");
+        let after = fs::read_to_string(root.join("pkg/math_utils.py")).unwrap();
+        assert!(after.contains("def add(a, b, c) -> int:"), "param appended + return type added: {after}");
+    }
+
+    #[test]
+    fn ungated_insert_in_body_python_suite() {
+        let dir = py_project();
+        let root = dir.path();
+        let p = FallbackProvider::new(root, FbLang::Python);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        // A Python suite has no closing brace: the statement appends after the last body line,
+        // matching its indentation.
+        let res = p
+            .apply_edits(
+                &[EditOp::InsertInBody {
+                    node_id: "pkg/math_utils.py#Calc.total".into(),
+                    code: "print(xs)".into(),
+                    after: None,
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "insert_in_body must commit: {res:?}");
+        let after = fs::read_to_string(root.join("pkg/math_utils.py")).unwrap();
+        assert!(
+            after.contains("        return sum(xs)\n        print(xs)"),
+            "statement appended into the suite at the right indent: {after}"
+        );
     }
 }

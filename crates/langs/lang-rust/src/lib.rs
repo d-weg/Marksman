@@ -285,6 +285,8 @@ fn doc_range(item: &TsNode) -> Option<Range> {
 /// Attach params / return type / body as `Syntax` sub-nodes of a function/method.
 fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
     if let Some(params) = item.child_by_field_name("parameters") {
+        // The whole `(...)` list — the insertion anchor for `add_parameter` / a missing return type.
+        n.children.push(syntax_node(&format!("{}:params", n.id), None, "params", &params));
         let mut cursor = params.walk();
         for (i, p) in params.named_children(&mut cursor).enumerate() {
             let name = p.utf8_text(bytes).ok().map(str::to_string);

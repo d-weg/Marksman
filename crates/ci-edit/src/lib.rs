@@ -163,6 +163,21 @@ pub fn action_to_op(
         // without retyping its signature. Gated like any other structural edit.
         "set_body" => EditOp::SetBody { node_id: node()?, body: value()? },
         "insert_before" => EditOp::InsertBefore { node_id: targeted()?, code: value()? },
+        // Statement-level body edits. `value` is the statement; `oldText` locates a line inside the
+        // body (the `after` anchor for insert; the statement to remove for delete).
+        "insert_in_body" => {
+            EditOp::InsertInBody { node_id: node()?, code: value()?, after: a.old_text.clone() }
+        }
+        "delete_in_body" => EditOp::DeleteInBody {
+            node_id: node()?,
+            text: a.old_text.clone().or_else(|| a.value.clone()).ok_or_else(|| {
+                Error::Other("delete_in_body needs oldText (the statement fragment to remove)".into())
+            })?,
+        },
+        // Signature edits at an insertion point (no existing sub-node anchor). `value` is the new
+        // parameter / return type.
+        "add_parameter" => EditOp::AddParameter { node_id: node()?, param: value()? },
+        "set_return_type" => EditOp::SetReturnType { node_id: node()?, ty: value()? },
         "create_file" => EditOp::CreateFile { path: a.path.clone().into(), code: value()? },
         "move_file" => EditOp::MoveFile { from: a.path.clone().into(), to: value()?.into() },
         "delete_file" => EditOp::DeleteFile { path: a.path.clone().into() },
@@ -218,6 +233,10 @@ fn op_paths(op: &EditOp) -> Vec<PathBuf> {
         | EditOp::InsertBefore { node_id, .. }
         | EditOp::ReplaceText { node_id, .. }
         | EditOp::SetBody { node_id, .. }
+        | EditOp::InsertInBody { node_id, .. }
+        | EditOp::DeleteInBody { node_id, .. }
+        | EditOp::AddParameter { node_id, .. }
+        | EditOp::SetReturnType { node_id, .. }
         | EditOp::Rename { node_id, .. } => vec![PathBuf::from(file_of(node_id))],
     }
 }
@@ -272,6 +291,10 @@ fn op_node_id(op: &EditOp) -> Option<&str> {
         | EditOp::InsertBefore { node_id, .. }
         | EditOp::ReplaceText { node_id, .. }
         | EditOp::SetBody { node_id, .. }
+        | EditOp::InsertInBody { node_id, .. }
+        | EditOp::DeleteInBody { node_id, .. }
+        | EditOp::AddParameter { node_id, .. }
+        | EditOp::SetReturnType { node_id, .. }
         | EditOp::Rename { node_id, .. } => Some(node_id),
         _ => None,
     }
@@ -354,10 +377,174 @@ pub fn apply_structural(
             })?;
             vfs.replace_range(Path::new(file), &node.range, body)
         }
+        // Statement-level body edits: transform the `:body` sub-node's text and write it back. Pure
+        // string surgery on the block, so it's language-generic (braces or a Python suite alike).
+        EditOp::InsertInBody { node_id, code, after } => {
+            let file = file_of(node_id);
+            let range = subnode_range(node_id, "body", structure_of, "no editable body")?;
+            let text = vfs
+                .read_range(Path::new(file), &range)
+                .ok_or_else(|| Error::Other("body text unavailable".into()))?;
+            // A Python-suite body starts mid-indent, so its first line's indentation isn't in the
+            // text; the body's start column supplies it. (Brace bodies keep indents in the text.)
+            let base_indent = " ".repeat(range.start_char as usize);
+            let new_body = insert_stmt_in_body(&text, code, after.as_deref(), &base_indent)?;
+            vfs.replace_range(Path::new(file), &range, &new_body)
+        }
+        EditOp::DeleteInBody { node_id, text: needle } => {
+            let file = file_of(node_id);
+            let range = subnode_range(node_id, "body", structure_of, "no editable body")?;
+            let text = vfs
+                .read_range(Path::new(file), &range)
+                .ok_or_else(|| Error::Other("body text unavailable".into()))?;
+            let new_body = delete_stmt_in_body(&text, needle)?;
+            vfs.replace_range(Path::new(file), &range, &new_body)
+        }
+        // Append a parameter: rewrite the `:params` `(...)` list, inserting before the `)`.
+        EditOp::AddParameter { node_id, param } => {
+            let file = file_of(node_id);
+            let range = subnode_range(node_id, "params", structure_of, "no parameter list")?;
+            let text = vfs
+                .read_range(Path::new(file), &range)
+                .ok_or_else(|| Error::Other("parameter list text unavailable".into()))?;
+            vfs.replace_range(Path::new(file), &range, &insert_param(&text, param)?)
+        }
+        // Add a return type where none exists, at the language's insertion point (right after the
+        // `)`). If one already exists we refuse — the agent should replace_node target:return.
+        EditOp::SetReturnType { node_id, ty } => {
+            let file = file_of(node_id);
+            let nodes = structure_of(file);
+            if find(&nodes, &format!("{node_id}:return")).is_some() {
+                return Err(Error::Other(format!(
+                    "SET_RETURN_TYPE: '{node_id}' already has a return type — use replace_node target:return to change it"
+                )));
+            }
+            let params = find(&nodes, &format!("{node_id}:params"))
+                .ok_or_else(|| Error::Anchor(format!("{node_id}:params — no parameter list to anchor a return type after")))?;
+            // Insert at the params' end position (immediately after `)`).
+            let at = Range {
+                start_line: params.range.end_line,
+                start_char: params.range.end_char,
+                end_line: params.range.end_line,
+                end_char: params.range.end_char,
+            };
+            vfs.insert_before(Path::new(file), &at, &format!("{}{ty}", return_delim(file)))
+        }
         EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } => {
             Err(Error::Driver("file ops (move/delete) land in P3".into()))
         }
         EditOp::Rename { .. } => Err(Error::Driver("rename must go through apply_rename".into())),
+    }
+}
+
+/// Resolve `{node_id}:{sub}` to its range, or an `Anchor` error carrying `why` (the symbol lacks
+/// that sub-node — no body/params, or the provider has no AST granularity).
+fn subnode_range(
+    node_id: &str,
+    sub: &str,
+    structure_of: &impl Fn(&str) -> Vec<Node>,
+    why: &str,
+) -> Result<Range> {
+    let nodes = structure_of(file_of(node_id));
+    let sub_id = format!("{node_id}:{sub}");
+    find(&nodes, &sub_id).map(|n| n.range.clone()).ok_or_else(|| {
+        Error::Anchor(format!(
+            "{sub_id} — {why} (symbol has no {sub} anchor, or this provider lacks AST granularity)"
+        ))
+    })
+}
+
+/// The leading whitespace (indent) of a line.
+fn indent_of(line: &str) -> String {
+    line.chars().take_while(|c| *c == ' ' || *c == '\t').collect()
+}
+
+/// Prefix every non-empty line of `code` with `indent`, preserving its own relative indentation —
+/// so a single- or multi-line insert aligns with the statements around it.
+fn reindent(code: &str, indent: &str) -> String {
+    code.split('\n')
+        .map(|l| if l.is_empty() { String::new() } else { format!("{indent}{l}") })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Insert `code` as a statement inside a body block's text. With `after`, it lands on the line
+/// after the unique line containing that fragment; without it, at the end of the body — before a
+/// trailing lone `}` for brace languages, else after the last statement (Python suite). A line
+/// whose leading whitespace isn't in the text (a suite's first line) falls back to `base_indent`.
+fn insert_stmt_in_body(body: &str, code: &str, after: Option<&str>, base_indent: &str) -> Result<String> {
+    // The indentation to align an insert with `line`, falling back to `base_indent` when the line
+    // carries none in the text (the first statement of a Python suite).
+    let line_indent = |line: &str| {
+        let i = indent_of(line);
+        if i.is_empty() { base_indent.to_string() } else { i }
+    };
+    let mut lines: Vec<String> = body.split('\n').map(String::from).collect();
+    if let Some(anchor) = after {
+        let hits: Vec<usize> =
+            lines.iter().enumerate().filter(|(_, l)| l.contains(anchor)).map(|(i, _)| i).collect();
+        if hits.len() != 1 {
+            return Err(Error::Other(format!(
+                "INSERT_IN_BODY: `after` {anchor:?} {} the body — give an exact, unique line fragment",
+                if hits.is_empty() { "was not found in" } else { "is not unique in" }
+            )));
+        }
+        let i = hits[0];
+        let indent = line_indent(&lines[i]);
+        lines.insert(i + 1, reindent(code, &indent));
+        return Ok(lines.join("\n"));
+    }
+    match lines.iter().rposition(|l| !l.trim().is_empty()) {
+        None => Ok(code.to_string()), // empty body — insert as-is
+        Some(i) if lines[i].trim() == "}" => {
+            // Insert before the closing brace, matching a sibling statement's indent (else one
+            // level past the brace).
+            let sib = lines[..i].iter().rev().find(|l| !l.trim().is_empty()).map(|l| line_indent(l));
+            let indent = sib.unwrap_or_else(|| format!("{}    ", indent_of(&lines[i])));
+            lines.insert(i, reindent(code, &indent));
+            Ok(lines.join("\n"))
+        }
+        Some(i) => {
+            let indent = line_indent(&lines[i]);
+            lines.insert(i + 1, reindent(code, &indent));
+            Ok(lines.join("\n"))
+        }
+    }
+}
+
+/// Delete the unique statement line containing `needle` from a body block's text.
+fn delete_stmt_in_body(body: &str, needle: &str) -> Result<String> {
+    let lines: Vec<String> = body.split('\n').map(String::from).collect();
+    let hits: Vec<usize> =
+        lines.iter().enumerate().filter(|(_, l)| l.contains(needle)).map(|(i, _)| i).collect();
+    if hits.len() != 1 {
+        return Err(Error::Other(format!(
+            "DELETE_IN_BODY: {needle:?} {} the body — give an exact, unique line fragment",
+            if hits.is_empty() { "was not found in" } else { "is not unique in" }
+        )));
+    }
+    let drop = hits[0];
+    Ok(lines.into_iter().enumerate().filter(|(j, _)| *j != drop).map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
+}
+
+/// Insert `param` into a `(...)` parameter-list text, before the closing `)`, prefixing `, ` when
+/// the list already has parameters.
+fn insert_param(params: &str, param: &str) -> Result<String> {
+    let open = params.find('(').ok_or_else(|| Error::Other("ADD_PARAMETER: no '(' in the parameter list".into()))?;
+    let close = params.rfind(')').ok_or_else(|| Error::Other("ADD_PARAMETER: no ')' in the parameter list".into()))?;
+    if close < open {
+        return Err(Error::Other("ADD_PARAMETER: malformed parameter list".into()));
+    }
+    let sep = if params[open + 1..close].trim().is_empty() { "" } else { ", " };
+    Ok(format!("{}{sep}{param}{}", &params[..close], &params[close..]))
+}
+
+/// The return-type delimiter for a file's language: `-> T` for Rust/Python, `: T` for TS.
+fn return_delim(file: &str) -> &'static str {
+    if file.ends_with(".rs") || file.ends_with(".py") || file.ends_with(".pyi") {
+        " -> "
+    } else {
+        ": "
     }
 }
 
@@ -889,6 +1076,148 @@ mod tests {
         .unwrap();
         assert!(matches!(ok, CommitResult::Ok { .. }), "clean edit must pass, got {ok:?}");
         assert!(fs::read_to_string(root.join("src/a.ts")).unwrap().contains("return 2;"));
+    }
+
+    fn rng(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
+        Range { start_line: sl, start_char: sc, end_line: el, end_char: ec }
+    }
+    fn sub(id: &str, r: Range) -> Node {
+        Node { id: id.into(), name: None, kind: NodeKind::Syntax("x".into()), range: r, name_range: None, children: vec![] }
+    }
+    /// A function symbol node carrying the given sub-node children (`:body`/`:params`/`:return`).
+    fn fn_with(id: &str, sym: Range, children: Vec<Node>) -> Node {
+        Node {
+            id: id.into(),
+            name: Some(id.split('#').nth(1).unwrap_or(id).into()),
+            kind: NodeKind::Symbol(SymbolKind::Function),
+            range: sym,
+            name_range: None,
+            children,
+        }
+    }
+
+    #[test]
+    fn insert_in_body_appends_before_closing_brace() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {\n    let x = 1;\n}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        // body spans `{ … }` (line1 col9 .. line3 col1).
+        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 3, 1), vec![sub("a.rs#foo:body", rng(1, 9, 3, 1))])];
+        apply_structural(
+            &mut vfs,
+            &EditOp::InsertInBody { node_id: "a.rs#foo".into(), code: "let y = 2;".into(), after: None },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n");
+    }
+
+    #[test]
+    fn insert_in_body_after_anchor_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 4, 1), vec![sub("a.rs#foo:body", rng(1, 9, 4, 1))])];
+        // insert after the `let a` line
+        apply_structural(
+            &mut vfs,
+            &EditOp::InsertInBody { node_id: "a.rs#foo".into(), code: "let mid = 0;".into(), after: Some("let a".into()) },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(
+            vfs.read(Path::new("a.rs")).unwrap(),
+            "fn foo() {\n    let a = 1;\n    let mid = 0;\n    let b = 2;\n}\n"
+        );
+    }
+
+    #[test]
+    fn delete_in_body_removes_matching_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 4, 1), vec![sub("a.rs#foo:body", rng(1, 9, 4, 1))])];
+        apply_structural(
+            &mut vfs,
+            &EditOp::DeleteInBody { node_id: "a.rs#foo".into(), text: "let b".into() },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    let a = 1;\n}\n");
+    }
+
+    #[test]
+    fn add_parameter_into_empty_and_nonempty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        // params `()` at line1 col6..col8.
+        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 1, 11), vec![sub("a.rs#foo:params", rng(1, 6, 1, 8))])];
+        apply_structural(
+            &mut vfs,
+            &EditOp::AddParameter { node_id: "a.rs#foo".into(), param: "x: i32".into() },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo(x: i32) {}\n");
+
+        // Now the list is non-empty: a second add prefixes ", ". params now span col6..col14.
+        let structure_of2 = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 1, 17), vec![sub("a.rs#foo:params", rng(1, 6, 1, 14))])];
+        apply_structural(
+            &mut vfs,
+            &EditOp::AddParameter { node_id: "a.rs#foo".into(), param: "y: i32".into() },
+            &structure_of2,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo(x: i32, y: i32) {}\n");
+    }
+
+    #[test]
+    fn set_return_type_inserts_after_params_and_refuses_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Rust: `-> T` after `)`.
+        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 1, 11), vec![sub("a.rs#foo:params", rng(1, 6, 1, 8))])];
+        apply_structural(
+            &mut vfs,
+            &EditOp::SetReturnType { node_id: "a.rs#foo".into(), ty: "i32".into() },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() -> i32 {}\n");
+
+        // TS: `: T` after `)`.
+        fs::write(root.join("b.ts"), "function bar() {}\n").unwrap();
+        let ts_struct = |_f: &str| vec![fn_with("b.ts#bar", rng(1, 0, 1, 17), vec![sub("b.ts#bar:params", rng(1, 12, 1, 14))])];
+        apply_structural(
+            &mut vfs,
+            &EditOp::SetReturnType { node_id: "b.ts#bar".into(), ty: "number".into() },
+            &ts_struct,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("b.ts")).unwrap(), "function bar(): number {}\n");
+
+        // Refused when a return type already exists (agent should replace_node target:return).
+        let with_ret = |_f: &str| {
+            vec![fn_with(
+                "a.rs#foo",
+                rng(1, 0, 1, 11),
+                vec![sub("a.rs#foo:params", rng(1, 6, 1, 8)), sub("a.rs#foo:return", rng(1, 12, 1, 15))],
+            )]
+        };
+        let err = apply_structural(
+            &mut vfs,
+            &EditOp::SetReturnType { node_id: "a.rs#foo".into(), ty: "u8".into() },
+            &with_ret,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("already has a return type"), "got: {err}");
     }
 
     #[test]

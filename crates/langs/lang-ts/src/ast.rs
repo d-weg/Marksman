@@ -90,6 +90,8 @@ fn subnodes(root: &TsNode, content: &str, bytes: &[u8], sym: &Node) -> Option<Ve
         });
     }
     if let Some(params) = decl.child_by_field_name("parameters") {
+        // The whole `(...)` list — the insertion anchor for `add_parameter` / a missing return type.
+        children.push(syntax_node(&format!("{}:params", sym.id), None, "params", &params));
         let mut cursor = params.walk();
         for (i, p) in params.named_children(&mut cursor).enumerate() {
             let name = p.utf8_text(bytes).ok().map(str::to_string);

@@ -153,6 +153,28 @@ pub enum EditOp {
     },
     #[serde(rename = "INSERT_BEFORE")]
     InsertBefore { node_id: String, code: String },
+    /// Insert `code` as a statement inside a function/method body (the `:body` sub-node). With
+    /// `after` set, it lands on a new line after the (unique) line containing that text; otherwise
+    /// it is appended at the end of the body. Statement-level — the block's other statements stay.
+    #[serde(rename = "INSERT_IN_BODY")]
+    InsertInBody {
+        node_id: String,
+        code: String,
+        #[serde(default)]
+        after: Option<String>,
+    },
+    /// Delete the statement line(s) containing `text` (unique within the body) from a `:body`.
+    #[serde(rename = "DELETE_IN_BODY")]
+    DeleteInBody { node_id: String, text: String },
+    /// Append a parameter to a function/method's parameter list (the `:params` sub-node), inserting
+    /// before the closing `)` and prefixing `, ` when the list is non-empty.
+    #[serde(rename = "ADD_PARAMETER")]
+    AddParameter { node_id: String, param: String },
+    /// Add a return type to a function/method that has none, at the language's insertion point
+    /// (after `)`: TS `: T`, Rust/Python `-> T`). Refused if a return type already exists — use
+    /// `replace_node target:return` for that.
+    #[serde(rename = "SET_RETURN_TYPE")]
+    SetReturnType { node_id: String, ty: String },
     #[serde(rename = "RENAME")]
     Rename { node_id: String, new_name: String },
     #[serde(rename = "MOVE_FILE")]

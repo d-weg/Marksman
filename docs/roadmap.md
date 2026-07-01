@@ -176,10 +176,15 @@ per-file dispatch at index time.
 ### Batch 7 — Deeper edits + structured non-code providers
 **Why:** extend surgical editing to single statements and to the config/data/docs files agents touch
 alongside code.
-- [ ] Statement-level body edits: `insert_in_body` / `delete_in_body` (one statement in a block;
-      replace-in-body is already covered by `replace_text target:"body"`).
-- [ ] `add_parameter` / `set_return_type` where **no** anchor exists (params-end / return insertion
-      point; TS `: T` vs Rust `-> T`).
+- [x] Statement-level body edits: `insert_in_body` (append, or after a unique body line) /
+      `delete_in_body` (remove a unique statement line) — pure text surgery on the `:body` sub-node
+      in `ci-edit::apply_structural`, so it's language-generic (brace block or Python suite; a
+      suite's missing first-line indent is supplied by the body's start column). Wired through
+      `action_to_op`, the protobuf sidecar, and the MCP `apply_edits` schema.
+- [x] `add_parameter` (append to the `:params` `(...)` list, before `)`) / `set_return_type` at the
+      language's insertion point where none exists (after `)`: TS `: T`, Rust/Python `-> T`; refused
+      when a return type already exists — use `replace_node target:return`). Providers now emit a
+      `:params` sub-node as the anchor. Tested end-to-end through the ungated Python provider.
 - [x] Non-ASCII (byte-vs-char) column handling across the edit path; deduped `ci-vfs::byte_offset`
       / `lang-ts::point_byte` into one `ci_core::text::byte_offset`. Fixed the real bug: tree-sitter
       `Point.column` is a UTF-8 *byte* offset, but the shared helper counted Unicode scalars — so a
