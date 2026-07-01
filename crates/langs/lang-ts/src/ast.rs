@@ -138,22 +138,9 @@ fn decl_with_fields(mut n: TsNode) -> TsNode {
     }
 }
 
-/// Byte offset of (1-based line, 0-based char). ASCII-accurate (code is ~ASCII).
-fn point_byte(content: &str, line_1: u32, char_0: u32) -> Option<usize> {
-    if line_1 == 0 {
-        return None;
-    }
-    // `line_1` is 1-based, so start the counter at 1; `off` tracks the byte start of each line.
-    let mut off = 0;
-    for (ln, l) in (1u32..).zip(content.split_inclusive('\n')) {
-        if ln == line_1 {
-            let add: usize = l.chars().take(char_0 as usize).map(char::len_utf8).sum();
-            return Some(off + add);
-        }
-        off += l.len();
-    }
-    None
-}
+/// Byte offset of a (1-based line, 0-based byte-column) position — the shared edit-path util.
+/// tree-sitter columns are byte offsets, so this round-trips tree-sitter ranges exactly.
+use ci_core::byte_offset as point_byte;
 
 #[cfg(test)]
 mod tests {

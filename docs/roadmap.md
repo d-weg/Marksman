@@ -180,8 +180,12 @@ alongside code.
       replace-in-body is already covered by `replace_text target:"body"`).
 - [ ] `add_parameter` / `set_return_type` where **no** anchor exists (params-end / return insertion
       point; TS `: T` vs Rust `-> T`).
-- [ ] Non-ASCII (byte-vs-char) column handling across the edit path; while here, dedupe the
-      near-identical `ci-vfs::byte_offset` / `lang-ts::point_byte` into a `ci-core` util.
+- [x] Non-ASCII (byte-vs-char) column handling across the edit path; deduped `ci-vfs::byte_offset`
+      / `lang-ts::point_byte` into one `ci_core::text::byte_offset`. Fixed the real bug: tree-sitter
+      `Point.column` is a UTF-8 *byte* offset, but the shared helper counted Unicode scalars — so a
+      sub-node edit on a line with a multi-byte char before it mis-resolved. The `Range` column
+      contract is now documented as 0-based UTF-8 bytes (matches tree-sitter + the VFS); non-ASCII
+      tests in `ci-core` and `ci-vfs`. (SCIP/LSP UTF-16 boundaries convert at their own edges.)
 - [ ] Structured providers (JSON/YAML/TOML/Markdown): edit by structural **key** / heading path — no
       reformatting, no gate (no type-check) — in the **same atomic batch** as the code edit that
       needs them (e.g. a `package.json`/`Cargo.toml` dep beside the import that uses it).

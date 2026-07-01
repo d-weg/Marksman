@@ -40,8 +40,9 @@ impl SymbolKind {
     }
 }
 
-/// 1-based line range (matches the TS manifest); char offsets are 0-based and
-/// optional (drivers that only know lines may leave them 0).
+/// 1-based line range (matches the TS manifest); column offsets are 0-based **UTF-8 byte**
+/// offsets within the line (the tree-sitter / VFS convention — see [`crate::text::byte_offset`])
+/// and optional (drivers that only know lines may leave them 0).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     pub start_line: u32,

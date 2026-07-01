@@ -4,6 +4,7 @@
 //! diagnostics over the overlay buffers) decides: [`Vfs::commit`] flushes the
 //! overlay to disk, or you simply drop the `Vfs` to roll back (nothing was written).
 //! This is the write-side spine: stage → gate → commit-or-discard, atomic.
+use ci_core::text::byte_offset;
 use ci_core::{Error, Range, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -62,9 +63,9 @@ impl Vfs {
         Ok(())
     }
 
-    /// Replace the precise span `range` with `new_text` (char-accurate via
-    /// 1-based line / 0-based char offsets — the form SCIP `enclosing_range` decodes
-    /// to). This is the primitive `replace_node` builds on.
+    /// Replace the precise span `range` with `new_text`, resolving the 1-based-line /
+    /// 0-based-byte-column bounds via [`ci_core::text::byte_offset`]. This is the primitive
+    /// `replace_node` builds on.
     pub fn replace_range(&mut self, rel: &Path, range: &Range, new_text: &str) -> Result<()> {
         let content =
             self.read(rel).ok_or_else(|| Error::Other(format!("replace: {} missing", rel.display())))?;
@@ -137,30 +138,6 @@ impl Vfs {
     }
 }
 
-/// Byte offset of (1-based line, 0-based char) in `content`. Char offsets count
-/// Unicode scalars (UTF-8 byte-accurate for ASCII, which code overwhelmingly is).
-fn byte_offset(content: &str, line_1: u32, char_0: u32) -> Option<usize> {
-    if line_1 == 0 {
-        return None;
-    }
-    let mut off = 0usize;
-    let mut line_no = 1u32;
-    for l in content.split_inclusive('\n') {
-        if line_no == line_1 {
-            let add: usize = l.chars().take(char_0 as usize).map(char::len_utf8).sum();
-            return Some(off + add);
-        }
-        off += l.len();
-        line_no += 1;
-    }
-    // Allow a position at EOF (one line past the last, char 0).
-    if line_no == line_1 && char_0 == 0 {
-        Some(off)
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +177,22 @@ mod tests {
             vfs.read(Path::new("m.ts")).unwrap(),
             "function add() {\n  return a + b + 1;\n}\n"
         );
+    }
+
+    #[test]
+    fn replace_range_on_a_line_with_multibyte_chars() {
+        // A line with a 2-byte char ("é") before the edit column: tree-sitter reports byte columns,
+        // so the range must resolve as bytes. Char-counting (the old bug) would slice mid-character
+        // and either panic or corrupt the "é". Here `const café = "x";` — replace the string.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("m.ts"), "const café = \"x\";\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        // byte columns: c=0..; "café" is 5 bytes (é=2), ` = ` then `"x"` at bytes 13..16.
+        let line = "const café = \"x\";";
+        let s = line.find("\"x\"").unwrap() as u32;
+        vfs.replace_range(Path::new("m.ts"), &r(1, s, 1, s + 3), "\"yy\"").unwrap();
+        assert_eq!(vfs.read(Path::new("m.ts")).unwrap(), "const café = \"yy\";\n");
     }
 
     #[test]
