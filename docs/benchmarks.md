@@ -37,6 +37,32 @@ Model2Vec** (the Node oracle here uses **bge-small**), and Rust's graph is **SCI
 references** vs the Node tool's **ts-morph import declarations**. Same embedder + same graph would
 converge further; the cores (BM25/RRF/weighting/expansion) are faithful ports.
 
+## Multi-language retrieval (Batch 6)
+
+Reproduce with `cargo build --release && python3 scripts/multilang-bench/run.py`. Self-contained —
+a small mixed Rust + TypeScript + Python fixture (`scripts/multilang-bench/fixture`) with six
+labeled tasks, two per language. A/B on the same fixture and tasks, one variable — which
+provider(s) index:
+
+- **single** — `CI_LANG=rust` forces one provider (the old one-language-per-repo behavior);
+- **multi** — auto-detect via the extension→provider registry, so every present language indexes.
+
+| language | single (rust only) | multi (all langs) |
+|---|--:|--:|
+| rust | 2/2 | 2/2 |
+| python | 0/2 | **2/2** |
+| ts | 0/2 | **2/2** |
+
+**single: 2/6 tasks retrieved · multi: 6/6** (hit@5).
+
+**Headline:** with one provider per repo, a mixed repo's non-Rust files are simply *never indexed*,
+so they can't be retrieved at any rank — recall is 0 for those languages. The registry indexes each
+file with its own language's provider, so cross-language recall goes **0 → 100%** here. Retrieval
+itself is unchanged (one language-blind BM25 + vector index); the gain is purely that every
+language's files now make it *into* that index. (TypeScript indexes only when Node / scip-typescript
+is available; the runner reports it as absent otherwise, and the Rust↔Python A/B still shows the
+effect.)
+
 ## Edit / capability (not a timing)
 
 | | SCIP only | **SCIP + tree-sitter** | Node (ts-morph) |
