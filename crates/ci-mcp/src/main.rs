@@ -1,6 +1,6 @@
 //! codeindex-rs MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the
-//! input tool (retrieve_context, describe_architecture) and the output tools
-//! (list_anchors, apply_edits). Launch per repo:
+//! input tools (retrieve_context, describe_architecture, find_symbols) and the
+//! output tools (list_anchors, read_node, apply_edits). Launch per repo:
 //!   codeindex-rs-mcp --root /path/to/repo   (or $CODEINDEX_ROOT, or cwd)
 //!
 //! The server is pure-Rust orchestration; all language/external tooling is behind
@@ -287,6 +287,42 @@ impl Server {
         Ok(format_architecture(&nodes, args["path"].as_str()))
     }
 
+    /// Exhaustive keyword/symbol search returning self-locating node-id handles (kind + range),
+    /// ranked by path-role/layer weight — the bridge between `retrieve_context` (fuzzy) and grep
+    /// (literal but not handle-returning). `substring` widens exact-name matching.
+    fn find_symbols(&mut self, args: &Value) -> Result<String, String> {
+        let query = args["query"]
+            .as_str()
+            .or_else(|| args["name"].as_str())
+            .ok_or("`query` is required")?
+            .to_string();
+        if query.trim().is_empty() {
+            return Err("`query` must be non-empty".into());
+        }
+        let substring = args["substring"].as_bool().unwrap_or(false);
+        if !index_exists(&self.root, &self.config) {
+            return Err("no index — run `codeindex-rs index` first".into());
+        }
+        let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
+        const CAP: usize = 200;
+        let (hits, total) = ci_retrieve::find_symbols(&index, &query, substring, &self.config, CAP);
+        if hits.is_empty() {
+            return Ok(format!(
+                "(no symbols {} {query:?})",
+                if substring { "containing" } else { "named" }
+            ));
+        }
+        let shown = if total > hits.len() { format!(" (showing top {})", hits.len()) } else { String::new() };
+        let mut out = format!("# {total} symbol(s) {} {query:?}{shown}\n", if substring { "containing" } else { "named" });
+        for h in &hits {
+            out.push_str(&format!(
+                "{}  {}  ({}:L{}-{})\n",
+                h.node_id, h.kind.as_str(), h.file, h.line_range[0], h.line_range[1]
+            ));
+        }
+        Ok(out)
+    }
+
     fn list_anchors(&mut self, args: &Value) -> Result<String, String> {
         let file = args["file"].as_str().ok_or("`file` is required")?.to_string();
         let nodes = self.provider()?.structure(Path::new(&file)).map_err(|e| e.to_string())?;
@@ -565,7 +601,8 @@ fn render_summary(m: &Manifest) -> String {
             if e.whole_file == Some(true) { "  (whole file)" } else { "" }
         ));
         for s in &e.matched_symbols {
-            out.push_str(&format!("                 ↳ {} {}  L{}-{}\n", s.kind.as_str(), s.name, s.line_range[0], s.line_range[1]));
+            // Include the node-id handle so the agent can read_node/apply_edits it directly.
+            out.push_str(&format!("                 ↳ {} {}  L{}-{}  [{}]\n", s.kind.as_str(), s.name, s.line_range[0], s.line_range[1], s.node_id));
         }
     }
     out
@@ -631,6 +668,11 @@ fn tools_list() -> Value {
             "name": "describe_architecture",
             "description": "Folder/architecture map (zero-API): per-directory file-kind patterns and detected module templates. Optional `path` scopes to a subtree.",
             "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}
+        },
+        {
+            "name": "find_symbols",
+            "description": "Exact/substring search over indexed symbol NAMES, returning self-locating node-id handles (with kind + line range) ranked by relevance — NOT file:line. Use it to jump straight from a name to an editable handle: every result feeds directly into read_node (id=…, incl. …:body/:doc sub-nodes) or apply_edits (name=… / the id). It's the bridge between retrieve_context (fuzzy, concept→files) and grep (literal, but gives you lines you'd have to map back to a symbol). Exhaustive by default (great for audits — \"every symbol named/containing X\"), not top-k. Pass `substring:true` to match anywhere in the name; omit it for whole-name matches. Prefer this over grep when you want to act on the symbol next.",
+            "inputSchema": {"type":"object","properties":{"query":{"type":"string","description":"symbol name (or fragment with substring:true)"},"substring":{"type":"boolean","description":"match anywhere in the name (default false = whole name)"}},"required":["query"]}
         },
         {
             "name": "list_anchors",
@@ -702,6 +744,7 @@ fn main() {
                 let result = match name {
                     "retrieve_context" => server.retrieve_context(args),
                     "describe_architecture" => server.describe_architecture(args),
+                    "find_symbols" => server.find_symbols(args),
                     "list_anchors" => server.list_anchors(args),
                     "read_node" => server.read_node(args),
                     "apply_edits" => server.apply_edits(args),

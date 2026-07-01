@@ -215,6 +215,10 @@ pub enum CommitResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchedSym {
+    /// The self-locating node-id handle (`file#Scope.name`), so the agent can `read_node`/edit it
+    /// directly instead of reconstructing it from name + file.
+    #[serde(default)]
+    pub node_id: String,
     pub name: String,
     pub kind: SymbolKind,
     /// [startLine, endLine], 1-based.

@@ -104,19 +104,20 @@ was a manual `git clone … ~/.marksman/models`; and a query embedded with the w
 - [x] Tests: `ensure_model` no-op when present / actionable error when absent+`CI_NO_MODEL_FETCH`;
       `ensure_index_matches` accepts a match and rejects dim/model mismatch.
 
-### Batch 4 — `find_symbols`: keyword/symbol search that returns handles
-**Why:** fills the gap between `retrieve_context` (fuzzy, concept→files) and grep (literal, but
+### Batch 4 — `find_symbols`: keyword/symbol search that returns handles  ✅
+**Why:** filled the gap between `retrieve_context` (fuzzy, concept→files) and grep (literal, but
 returns lines the agent must map back to symbols). Every hit is a self-locating handle, so the next
-step is `read_node id=…` / `apply_edits name=…` with no re-derivation. Pays off even for a lean
-single-server agent — the handle-return is the point.
-- [ ] `find_symbols` MCP tool: exact/substring match over indexed symbol names (opt. comments),
-      returning `{node_id, kind, range, weight}` ranked by the path-role/layer weights — **not**
-      `file:line`. Exact + exhaustive by default (audits: "every impl of X"), not top-k; cap + note
-      when huge.
-- [ ] Surface the qualified node id in `retrieve_context` matched-symbol lines too, so the handle
-      propagates directly instead of being reconstructed.
-- [ ] Encourage sub-node reads (`read_node id=…:body`/`:doc`) so a body edit loads only the body.
-- [ ] Tests: unique name → one handle; ambiguous → all handles; substring mode.
+step is `read_node id=…` / `apply_edits name=…` with no re-derivation.
+- [x] `ci_retrieve::find_symbols` + the `find_symbols` MCP tool: exact/substring match over indexed
+      symbol names, returning node-id handles + kind + range, ranked exact-first then by path-role/
+      layer weight then id. Exhaustive by default (audits), truncated to 200 with the total noted.
+- [x] `MatchedSym` now carries `node_id`; `retrieve_context`'s matched-symbol lines print the handle
+      (`[file#Scope.name]`) in both the MCP and CLI renderers.
+- [x] The `find_symbols` + `read_node` tool text points at `read_node id=…:body`/`:doc` so a body
+      edit loads only the body.
+- [x] Extracted `ci_retrieve::file_weighter` (was inline in `retrieve`) so ranking is shared, not
+      duplicated. Tests: exact→one handle, substring→all (docs excluded), cap truncates but total
+      still counts every match.
 
 ### Batch 5 — Ranking evaluation + multi-language retrieval weighting
 **Why:** retrieval weights (`rrf_k`, `symbol_match_bonus`, the layer boost) are hand-tuned with **no

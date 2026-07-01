@@ -185,11 +185,12 @@ fn render_summary(m: &Manifest) -> String {
         ));
         for s in &e.matched_symbols {
             out.push_str(&format!(
-                "                 ↳ {} {}  L{}-{}\n",
+                "                 ↳ {} {}  L{}-{}  [{}]\n",
                 s.kind.as_str(),
                 s.name,
                 s.line_range[0],
-                s.line_range[1]
+                s.line_range[1],
+                s.node_id
             ));
         }
     }

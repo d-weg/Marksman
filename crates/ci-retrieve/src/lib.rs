@@ -4,5 +4,5 @@
 pub mod retrieve;
 pub mod rrf;
 
-pub use retrieve::{retrieve, RetrieveOptions};
+pub use retrieve::{find_symbols, retrieve, file_weighter, RetrieveOptions, SymbolHit};
 pub use rrf::{reciprocal_rank_fusion, sorted_by_score};

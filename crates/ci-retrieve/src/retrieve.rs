@@ -221,40 +221,9 @@ pub fn retrieve(
 
     // 3. Package- AND path-aware weighting (post-RRF multiply on the fused score).
     // Static multiplier stays at package granularity; the query-conditioned LAYER boost keys off
-    // the file's *path*-derived role (falling back to the package's role), so a `backend/`/`db/`
+    // the file's *path*-derived role (falling back to the package's role), so a `backend`/`db`
     // directory is boosted on a backend query even inside a single-package repo. See weight.rs.
-    let packages: Vec<WeightedPackage> = index
-        .meta
-        .packages
-        .iter()
-        .map(|p| WeightedPackage {
-            name: p.name.clone(),
-            dir: p.dir.clone(),
-            ..Default::default()
-        })
-        .collect();
-    let pkg_role: HashMap<String, PackageRole> =
-        packages.iter().map(|p| (p.name.clone(), resolve_role(p))).collect();
-    let layer_mult = layer_multipliers(&q_tokens, config);
-    let pkg_of = |file: &str| -> String {
-        index.meta.files.get(file).map(|f| f.pkg.clone()).unwrap_or_default()
-    };
-    let weight_for = |file: &str| -> f64 {
-        let pkg = pkg_of(file);
-        let prole = *pkg_role.get(&pkg).unwrap_or(&PackageRole::Unknown);
-        // path role wins when decisive; otherwise the package's role.
-        let frole = match infer_role_from_path(file) {
-            PackageRole::Unknown => prole,
-            r => r,
-        };
-        let static_w = config
-            .package_weights
-            .get(&pkg)
-            .or_else(|| config.package_weights.get(prole.as_str()))
-            .map(|w| *w as f64)
-            .unwrap_or(1.0);
-        static_w * layer_mult.get(frole.as_str()).copied().unwrap_or(1.0)
-    };
+    let weight_for = file_weighter(index, &q_tokens, config);
 
     let mut weighted_fused: HashMap<String, f64> = HashMap::new();
     for (file, s) in &fused {
@@ -283,6 +252,7 @@ pub fn retrieve(
                     && !arr.iter().any(|x| x.name == c.symbol && x.line_range[0] == c.start_line)
                 {
                     arr.push(MatchedSym {
+                        node_id: c.id.clone(),
                         name: c.symbol.clone(),
                         kind: c.kind,
                         line_range: [c.start_line, c.end_line],
@@ -365,6 +335,102 @@ pub fn retrieve(
     }
 }
 
+/// A per-file relevance multiplier: static package weight × the query-conditioned layer boost, keyed
+/// on the file's path-derived role (falling back to its package role). Shared by `retrieve` (post-
+/// RRF multiply) and `find_symbols` (result ranking). Borrows `index`/`config` for its lifetime.
+pub fn file_weighter<'a>(
+    index: &'a IndexData,
+    query_tokens: &[String],
+    config: &'a Config,
+) -> impl Fn(&str) -> f64 + 'a {
+    let packages: Vec<WeightedPackage> = index
+        .meta
+        .packages
+        .iter()
+        .map(|p| WeightedPackage { name: p.name.clone(), dir: p.dir.clone(), ..Default::default() })
+        .collect();
+    let pkg_role: HashMap<String, PackageRole> =
+        packages.iter().map(|p| (p.name.clone(), resolve_role(p))).collect();
+    let layer_mult = layer_multipliers(query_tokens, config);
+    move |file: &str| -> f64 {
+        let pkg = index.meta.files.get(file).map(|f| f.pkg.as_str()).unwrap_or("");
+        let prole = *pkg_role.get(pkg).unwrap_or(&PackageRole::Unknown);
+        // path role wins when decisive; otherwise the package's role.
+        let frole = match infer_role_from_path(file) {
+            PackageRole::Unknown => prole,
+            r => r,
+        };
+        let static_w = config
+            .package_weights
+            .get(pkg)
+            .or_else(|| config.package_weights.get(prole.as_str()))
+            .map(|w| *w as f64)
+            .unwrap_or(1.0);
+        static_w * layer_mult.get(frole.as_str()).copied().unwrap_or(1.0)
+    }
+}
+
+/// One `find_symbols` hit: a self-locating node-id **handle** (feed it straight to `read_node` /
+/// `apply_edits`), its kind, 1-based line range, whether the name matched exactly, and file weight.
+#[derive(Debug, Clone)]
+pub struct SymbolHit {
+    pub node_id: String,
+    pub name: String,
+    pub kind: SymbolKind,
+    pub file: String,
+    pub line_range: [u32; 2],
+    pub exact: bool,
+    pub weight: f64,
+}
+
+/// Exhaustive keyword/symbol search over the index — the handle-returning counterpart to
+/// `retrieve_context`. Matches indexed symbol names (exact, or substring when `substring`), skips
+/// docs, and ranks exact-first, then by path-role/layer weight, then id. Returns up to `cap` hits
+/// plus the TOTAL match count (so the caller can note truncation). Deterministic.
+pub fn find_symbols(
+    index: &IndexData,
+    query: &str,
+    substring: bool,
+    config: &Config,
+    cap: usize,
+) -> (Vec<SymbolHit>, usize) {
+    let ql = query.trim().to_lowercase();
+    if ql.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let weight_for = file_weighter(index, &tokenize(query), config);
+    let mut hits: Vec<SymbolHit> = index
+        .symbols
+        .iter()
+        .filter(|s| !matches!(s.kind, SymbolKind::Doc))
+        .filter_map(|s| {
+            let nl = s.name.to_lowercase();
+            let exact = nl == ql;
+            if !(if substring { nl.contains(&ql) } else { exact }) {
+                return None;
+            }
+            Some(SymbolHit {
+                node_id: s.id.clone(),
+                name: s.name.clone(),
+                kind: s.kind,
+                file: s.file.clone(),
+                line_range: [s.start_line, s.end_line],
+                exact,
+                weight: weight_for(&s.file),
+            })
+        })
+        .collect();
+    let total = hits.len();
+    hits.sort_by(|a, b| {
+        b.exact
+            .cmp(&a.exact)
+            .then(b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.node_id.cmp(&b.node_id))
+    });
+    hits.truncate(cap);
+    (hits, total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,6 +474,48 @@ mod tests {
             end_line: 2,
             signature: None,
         }
+    }
+
+    fn index_with_symbols(symbols: Vec<SymbolEntry>) -> IndexData {
+        IndexData {
+            meta: IndexMeta {
+                version: 1, created_at: "0".into(), updated_at: "0".into(), model: "m".into(),
+                dims: 2, root: "/tmp".into(), is_monorepo: false, packages: vec![],
+                package_names: vec![], files: BTreeMap::new(),
+            },
+            symbols,
+            chunks: vec![],
+            vectors: vec![],
+            forward: Adjacency::new(),
+            graph: build_graph(Adjacency::new()),
+            bm25: Bm25::new(),
+        }
+    }
+
+    #[test]
+    fn find_symbols_returns_handles_exact_first_excludes_docs() {
+        let index = index_with_symbols(vec![
+            sym("a.ts", "parseConfig"),
+            sym("b.ts", "parse"),
+            sym("c.ts", "parseConfigFile"),
+            SymbolEntry { kind: SymbolKind::Doc, ..sym("d.md", "parse") }, // doc: never a hit
+        ]);
+
+        // Exact mode: only the whole-name "parse" (doc excluded).
+        let (hits, total) = find_symbols(&index, "parse", false, &Config::default(), 50);
+        assert_eq!(total, 1, "exact-only match count");
+        assert_eq!(hits[0].node_id, "b.ts#parse", "hit is a self-locating handle");
+        assert!(hits[0].exact);
+
+        // Substring mode: three code symbols contain "parse"; the exact one ranks first.
+        let (hits, total) = find_symbols(&index, "parse", true, &Config::default(), 50);
+        assert_eq!(total, 3);
+        assert_eq!(hits[0].node_id, "b.ts#parse", "exact match ranks ahead of substrings");
+        assert!(hits.iter().all(|h| h.kind != SymbolKind::Doc), "docs excluded");
+
+        // Cap truncates but the total still reports every match.
+        let (capped, total) = find_symbols(&index, "parse", true, &Config::default(), 1);
+        assert_eq!((capped.len(), total), (1, 3));
     }
 
     #[test]
