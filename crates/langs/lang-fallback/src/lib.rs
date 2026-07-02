@@ -246,6 +246,10 @@ enum Shape {
     Fn,
     Type,
     Container,
+    /// A named value: class field, top-level const, interface property, enum member. Emitted
+    /// as `SymbolKind::Variable`; the range widens to the enclosing STATEMENT so editing the
+    /// field by name can see its initializer (`k1 = 1.5;`, not just `k1`).
+    Field,
 }
 
 /// The per-language kind table — the ONLY language-specific part of the generic collector.
@@ -259,6 +263,12 @@ fn classify(lang: FbLang, kind: &str) -> Option<Shape> {
         (FbLang::Js | FbLang::Ts, "class_declaration") => Container,
         (FbLang::Ts, "interface_declaration" | "enum_declaration" | "abstract_class_declaration") => Container,
         (FbLang::Ts, "type_alias_declaration") => Type,
+        // Named values: SCIP collects these as Term symbols; edit targets in every language.
+        (FbLang::Ts, "public_field_definition" | "property_signature" | "enum_assignment") => Field,
+        (FbLang::Js, "field_definition") => Field,
+        (FbLang::Js | FbLang::Ts, "variable_declarator") => Field,
+        (FbLang::Go, "const_spec" | "var_spec") => Field,
+        (FbLang::Java, "field_declaration") => Field,
         (FbLang::Go, "function_declaration" | "method_declaration") => Fn,
         (FbLang::Go, "type_spec") => Type,
         (FbLang::Java, "method_declaration" | "constructor_declaration") => Fn,
@@ -284,6 +294,9 @@ fn def_name<'a>(node: &TsNode<'a>) -> Option<TsNode<'a>> {
         if d.kind().ends_with("identifier") {
             return Some(d);
         }
+        if let Some(n) = d.child_by_field_name("name") {
+            return Some(n); // java: field_declaration -> variable_declarator(name)
+        }
         d = d.child_by_field_name("declarator")?;
     }
     None
@@ -306,7 +319,7 @@ fn collect_generic(lang: FbLang, node: TsNode, bytes: &[u8], prefix: &str, out: 
         // only appears inside `type_declaration`) and TS's `type_alias_declaration` (payload
         // in its `value` field).
         let is_definition = child.child_by_field_name("body").is_some()
-            || matches!(shape, Shape::Fn)
+            || matches!(shape, Shape::Fn | Shape::Field)
             || (lang == FbLang::Go && child.kind() == "type_spec")
             || (lang == FbLang::Ts && child.kind() == "type_alias_declaration");
         if !is_definition {
@@ -317,12 +330,20 @@ fn collect_generic(lang: FbLang, node: TsNode, bytes: &[u8], prefix: &str, out: 
             Shape::Fn if prefix.ends_with('.') => SymbolKind::Method,
             Shape::Fn => SymbolKind::Function,
             Shape::Type | Shape::Container => SymbolKind::Class,
+            Shape::Field => SymbolKind::Variable,
+        };
+        // A declarator's own range stops at the name — climb to the declaration statement so
+        // `replace_text`/`replace_node` on the field can see `const k1 = 1.5;` whole.
+        let span_node = if matches!(shape, Shape::Field) && child.kind() == "variable_declarator" {
+            child.parent().unwrap_or(child)
+        } else {
+            child
         };
         let mut n = Node {
             id: format!("{prefix}{name}"),
             name: Some(name.to_string()),
             kind: NodeKind::Symbol(kind),
-            range: ts_range(&child),
+            range: ts_range(&span_node),
             name_range: Some(ts_range(&name_node)),
             children: vec![],
         };
@@ -352,7 +373,7 @@ fn collect_generic(lang: FbLang, node: TsNode, bytes: &[u8], prefix: &str, out: 
                 add_fn_subnodes(&mut n, &child, bytes);
                 out.push(n);
             }
-            Shape::Type => out.push(n),
+            Shape::Type | Shape::Field => out.push(n),
             Shape::Container => {
                 let inner = format!("{prefix}{name}.");
                 out.push(n);
@@ -431,8 +452,54 @@ impl GateEngine for NoGate {
         Ok(json!({ "changes": { uri: edits } }))
     }
 
-    fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
-        Ok(json!({})) // no importer-rewrite engine; the move proceeds, blast radius is ungated
+    /// JS/TS moves rewrite importers SYNTACTICALLY — the same job the compiler does in gated
+    /// mode, minus type knowledge: every relative specifier that resolves to `from` retargets
+    /// to `to`, and the MOVED file's own relative specifiers are recomputed from its new
+    /// directory. Quote and extension style are preserved (`"./x.js"` stays a `.js` specifier
+    /// even though the file on disk is `.ts`). Other fallback languages import by
+    /// package/module name, not file path — nothing to rewrite, the move proceeds as before.
+    fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
+        if !matches!(self.lang, FbLang::Js | FbLang::Ts) {
+            return Ok(json!({}));
+        }
+        let to_dir = Path::new(to).parent().unwrap_or(Path::new("")).to_path_buf();
+        let mut changes = serde_json::Map::new();
+        for ext in self.lang.exts() {
+            for rel in source_files(&self.root, ext) {
+                let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
+                let Some(tree) = self.parse(&content) else { continue };
+                let mut specs = Vec::new();
+                collect_spec_nodes(tree.root_node(), content.as_bytes(), &mut specs);
+                let mut edits = Vec::new();
+                for (range, spec) in specs {
+                    if !(spec.starts_with("./") || spec.starts_with("../")) {
+                        continue;
+                    }
+                    let new_spec = if rel == from {
+                        // The moved file's own imports: whatever they resolve to today, the
+                        // path there is different from the NEW directory.
+                        resolve_js_specifier(&self.root, &rel, &spec)
+                            .map(|target| with_spec_ext(relative_specifier(&to_dir, &target), &spec))
+                    } else if resolve_js_specifier(&self.root, &rel, &spec).as_deref() == Some(Path::new(from)) {
+                        // An importer of the moved file: retarget to the new location.
+                        let rel_dir = Path::new(&rel).parent().unwrap_or(Path::new("")).to_path_buf();
+                        Some(with_spec_ext(relative_specifier(&rel_dir, Path::new(to)), &spec))
+                    } else {
+                        None
+                    };
+                    if let Some(ns) = new_spec {
+                        if ns != spec {
+                            edits.push(json!({ "range": range, "newText": ns }));
+                        }
+                    }
+                }
+                if !edits.is_empty() {
+                    let uri = format!("file://{}", self.root.join(&rel).to_string_lossy());
+                    changes.insert(uri, Value::Array(edits));
+                }
+            }
+        }
+        Ok(json!({ "changes": changes }))
     }
 }
 
@@ -470,6 +537,59 @@ fn collect_syntax_errors(root: TsNode, content: &str, file: &str, out: &mut Vec<
             stack.push(ch);
         }
     }
+}
+
+/// Import/export specifier STRING nodes: `(inner range excluding quotes, specifier text)`.
+/// Specifiers never span lines, so the inner range is start col+1 .. end col-1.
+fn collect_spec_nodes(node: TsNode, bytes: &[u8], out: &mut Vec<(Value, String)>) {
+    if matches!(node.kind(), "import_statement" | "export_statement") {
+        if let Some(src) = node.child_by_field_name("source") {
+            let raw = src.utf8_text(bytes).unwrap_or("");
+            let spec = raw.trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
+            let (s, e) = (src.start_position(), src.end_position());
+            let range = json!({
+                "start": { "line": s.row, "character": s.column + 1 },
+                "end": { "line": e.row, "character": e.column.saturating_sub(1) },
+            });
+            out.push((range, spec));
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.named_children(&mut c) {
+        collect_spec_nodes(ch, bytes, out);
+    }
+}
+
+/// `./`-style relative path from `from_dir` to `target` (both repo-relative).
+fn relative_specifier(from_dir: &Path, target: &Path) -> String {
+    let f: Vec<_> = from_dir.components().collect();
+    let t: Vec<_> = target.components().collect();
+    let common = f.iter().zip(t.iter()).take_while(|(a, b)| a == b).count();
+    let mut s = String::new();
+    if f.len() == common {
+        s.push_str("./");
+    } else {
+        for _ in common..f.len() {
+            s.push_str("../");
+        }
+    }
+    let tail: Vec<String> = t[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+    s + &tail.join("/")
+}
+
+/// Restyle `path_spec`'s extension to match how `old_spec` wrote it: `"./x.js"` keeps `.js`
+/// (TS convention), an extension-less specifier stays extension-less.
+fn with_spec_ext(path_spec: String, old_spec: &str) -> String {
+    let mut base = path_spec;
+    let slash = base.rfind('/').map_or(0, |i| i + 1);
+    if let Some(dot) = base[slash..].rfind('.') {
+        base.truncate(slash + dot);
+    }
+    let old_leaf = old_spec.rsplit('/').next().unwrap_or(old_spec);
+    if let Some(dot) = old_leaf.rfind('.') {
+        base.push_str(&old_leaf[dot..]);
+    }
+    base
 }
 
 fn collect_identifier_edits(node: TsNode, bytes: &[u8], old: &str, new: &str, out: &mut Vec<Value>) {
@@ -856,6 +976,58 @@ mod tests {
         let f = nodes.iter().find(|n| n.id == "app.js#formatSpan").unwrap();
         assert!(f.children.iter().any(|c| c.id.ends_with(":body")), "js body sub-node");
         assert!(f.children.iter().any(|c| c.id.ends_with(":doc")), "leading comment -> :doc");
+    }
+
+    // Named values are anchors (SCIP collects them as Term symbols; edit targets in every
+    // language): TS class fields / interface properties / top-level consts, Go consts, Java
+    // fields — with ranges widened to the declaration statement.
+    #[test]
+    fn field_and_const_anchors_across_languages() {
+        let ts = generic_structure(
+            FbLang::Ts,
+            "cfg.ts",
+            "export const K_DEFAULT = 1.5;\nexport interface Opts {\n  topN: number;\n}\nexport class Ranker {\n  k1 = 1.5;\n  run(): number {\n    return this.k1;\n  }\n}\n",
+        );
+        let ids: Vec<&str> = ts.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"cfg.ts#K_DEFAULT"), "top-level const: {ids:?}");
+        assert!(ids.contains(&"cfg.ts#Opts.topN"), "interface property: {ids:?}");
+        assert!(ids.contains(&"cfg.ts#Ranker.k1"), "class field: {ids:?}");
+        let k = ts.iter().find(|n| n.id == "cfg.ts#K_DEFAULT").unwrap();
+        assert!(matches!(k.kind, NodeKind::Symbol(SymbolKind::Variable)));
+        assert!(k.range.end_char > 20, "range spans the whole declaration, not just the name: {:?}", k.range);
+
+        let go = generic_structure(FbLang::Go, "cfg.go", "package cfg\n\nconst MaxRetries = 3\n\nvar timeout = 10\n");
+        let ids: Vec<&str> = go.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"cfg.go#MaxRetries") && ids.contains(&"cfg.go#timeout"), "go const/var: {ids:?}");
+
+        let java = generic_structure(FbLang::Java, "Cfg.java", "public class Cfg {\n  private int maxRetries = 3;\n}\n");
+        let ids: Vec<&str> = java.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"Cfg.java#Cfg.maxRetries"), "java field via declarator name: {ids:?}");
+    }
+
+    // A JS/TS move REWRITES importers syntactically (and the moved file's own imports),
+    // preserving specifier extension style — the fallback equivalent of willRenameFiles.
+    #[test]
+    fn js_move_rewrites_importers_and_own_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(root.join("app.js"), "import { fold } from \"./b.js\";\nexport const x = fold(1);\n").unwrap();
+        std::fs::write(root.join("b.js"), "import { base } from \"./util.js\";\nexport function fold(n) {\n  return base + n;\n}\n").unwrap();
+        std::fs::write(root.join("util.js"), "export const base = 1;\n").unwrap();
+
+        let p = FallbackProvider::new(root, FbLang::Js);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let res = p
+            .apply_edits(&[EditOp::MoveFile { from: "b.js".into(), to: "lib/b.js".into() }], &opts)
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "move commits: {res:?}");
+        assert!(root.join("lib/b.js").exists() && !root.join("b.js").exists());
+
+        let app = std::fs::read_to_string(root.join("app.js")).unwrap();
+        assert!(app.contains("\"./lib/b.js\""), "importer retargeted (ext style kept): {app}");
+        let moved = std::fs::read_to_string(root.join("lib/b.js")).unwrap();
+        assert!(moved.contains("\"../util.js\""), "moved file's own import recomputed: {moved}");
     }
 
     // The tree-sitter SYNTAX gate: an edit that no longer parses must REJECT (tree-sitter
