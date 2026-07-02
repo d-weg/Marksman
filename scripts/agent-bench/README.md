@@ -38,7 +38,9 @@ metric. It's built to be trustworthy, not to look good.
 
 ## Run it (step by step)
 
-Three arms: **baseline** (no codeindex) · **rust** (codeindex-rs MCP) · **ts** (Node codeindex MCP).
+Arms: **baseline** (no codeindex) · **rust** (codeindex-rs MCP) — the comparison that matters.
+A third **ts** arm (the Node codeindex MCP — the frozen, unmaintained prototype Marksman
+rewrote) is opt-in via `--arms baseline,rust,ts`, kept only for historical comparison.
 Each arm is a single agent — the subagent-spawn tool is disallowed, so the top-level token/cost
 numbers describe the whole run (a delegated run would otherwise report the main agent's tokens while
 `$` billed the hidden subagent too).

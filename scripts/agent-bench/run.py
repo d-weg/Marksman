@@ -260,7 +260,9 @@ def main():
     ap.add_argument("--repo", help="main benchmark repo; required unless every selected task has its own `fixture`")
     ap.add_argument("--task")
     ap.add_argument("--runs", type=int, default=1)
-    ap.add_argument("--arms", default="baseline,rust,ts")
+    # "ts" (the Node prototype Marksman rewrote) is opt-in: it's frozen/unmaintained and exists
+    # only as a historical comparison arm — the benchmark that matters is baseline vs rust.
+    ap.add_argument("--arms", default="baseline,rust")
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
                     help="cost lever: claude-haiku-4-5 (cheapest) · claude-sonnet-4-6 (default) · claude-opus-4-8")
     ap.add_argument("--save-transcript", help="dir to dump per-run stream-json transcripts + a tool-usage summary (to see where tokens go)")

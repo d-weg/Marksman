@@ -90,8 +90,9 @@ The above are micro-benchmarks. This is the one that matters: the **same agent (
 headless, sonnet 4.6) on the same tasks**, with and without Marksman, fully accounted. Harness:
 `scripts/agent-bench/` (see its README for the trust properties — one variable, an objective
 per-task `check`, clean git + index reset each run, tokens straight from Claude Code's JSON,
-every task reported). Three arms: **baseline** (no tool), **rust** (Marksman MCP), **ts** (the
-Node `codeindex` MCP — the mature tool Marksman is a rewrite of). Target repo: the Node
+every task reported). Arms: **baseline** (no tool) vs **rust** (Marksman MCP) — the comparison
+that matters — plus an opt-in **ts** arm (the Node `codeindex` MCP: the frozen, unmaintained
+prototype Marksman rewrote, kept for historical comparison only). Target repo: the Node
 `codeindex` itself (~600-symbol TS). `sec` = wall-clock; `$` = Claude Code's `total_cost_usd`
 (the true economic score — it bakes in prompt caching + output pricing, so it can diverge from
 raw `in_tok`). Results below: 7 tasks, single run (2026-07-02); re-run with `--runs 3` for
