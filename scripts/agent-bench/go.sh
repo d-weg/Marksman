@@ -20,7 +20,11 @@ fi
 export ANTHROPIC_API_KEY
 
 # The real claude binary (PATH `claude` is a broken stub here); pick the latest installed.
-export CLAUDE_BIN="$(ls -d "$HOME/Library/Application Support/Claude/claude-code"/*/claude.app/Contents/MacOS/claude 2>/dev/null | sort -V | tail -1)"
+# A PRE-SET CLAUDE_BIN wins — that's how a wrapper (e.g. a token-compression proxy shim)
+# gets between the harness and claude; CLAUDE_REAL always points at the discovered binary
+# so such a shim can exec it without relying on the broken PATH stub.
+export CLAUDE_REAL="$(ls -d "$HOME/Library/Application Support/Claude/claude-code"/*/claude.app/Contents/MacOS/claude 2>/dev/null | sort -V | tail -1)"
+export CLAUDE_BIN="${CLAUDE_BIN:-$CLAUDE_REAL}"
 export CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 export CI_NPM_CACHE="/tmp/ci-npm-cache"
 # cargo on PATH for the harness AND the agent: T7-multilang's check runs `cargo check`, and the
