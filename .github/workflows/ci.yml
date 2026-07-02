@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      # Fast tier only: pure-Rust unit tests, no external tools. The e2e tier (#[ignore])
+      # spawns real scip-typescript / rust-analyzer / tsls and is run locally per
+      # CONTRIBUTING.md before provider/gate changes.
+      - run: cargo test --workspace
+
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true # informational — the gate is build+test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets

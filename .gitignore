@@ -9,3 +9,6 @@ scripts/agent-bench/.key
 
 # local dogfood: machine-specific MCP config (absolute paths)
 .mcp.json
+
+# per-machine agent settings
+.claude/

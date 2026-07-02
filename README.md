@@ -1,5 +1,8 @@
 # Marksman
 
+[![CI](https://github.com/d-weg/Marksman/actions/workflows/ci.yml/badge.svg)](https://github.com/d-weg/Marksman/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Precise code retrieval and type-checked edits for coding agents — over MCP.**
 
 Marksman is a local-first [Model Context Protocol](https://modelcontextprotocol.io) server that gives an AI coding agent two things grep-and-guess can't:
@@ -13,7 +16,7 @@ Written in Rust: a language-blind core plus per-language providers. **TypeScript
 
 Agents burn tokens grepping for context and break builds with blind string edits. Marksman hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
 
-On a 6-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an agent **with** Marksman cost **~55% less and finished ~40% faster** than without, 6/6 correct — repo-wide type rename: **3 turns vs the baseline's 21**. The tool descriptions are audited to contain zero benchmark-specific content. The suite now also carries a **multilanguage task** (Rust + TypeScript renames in one session, each gated by its own compiler — not yet in the published numbers). Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
+On a 7-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an agent **with** Marksman cost **~53% less and finished ~51% faster** than without, 7/7 correct — repo-wide type rename: **3 turns vs the baseline's 18**. The suite includes a **multilanguage task**: a Rust and a TypeScript rename in one session, each gated by its own compiler (4 turns vs baseline's 13). The tool descriptions are audited to contain zero benchmark-specific content. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Capabilities (MCP tools)
 
@@ -120,6 +123,13 @@ An optional `codeindex.config.json` in the repo root overrides retrieval / index
 
 - **Languages:** **TypeScript** (`scip-typescript` + `ts-morph`) and **Rust** (in-process tree-sitter + rust-analyzer) — both with type-checked, blast-radius-gated edits. **Python** rides an in-process tree-sitter fallback: full retrieval + skeletal outline + structural edits, but *ungated* (`gated: false`) until its LSP/indexer lands. The core (`ci-*` crates) is language-blind; a new language is a new provider implementing the same `LanguageProvider` trait.
 - 16-crate Rust workspace, ~50 unit tests plus real-tool integration tests. See [docs/](docs/) for architecture, roadmap, and benchmarks.
+
+## Contributing
+
+PRs welcome — [CONTRIBUTING.md](CONTRIBUTING.md) covers the build, the two test tiers (fast
+unit tests in CI; real-tool e2e suites to run locally before provider/gate changes), the
+benchmark rules, and the project's non-negotiables (never serve stale reads, never silently
+degrade a gate).
 
 ## License
 
