@@ -932,6 +932,39 @@ pub fn commit_edits(
             }
         }
     }
+    // Files the batch CREATES (create_file / a move's destination) exist only in the overlay —
+    // and a didOpen buffer at a path that isn't on disk is NOT enough for the gate: language
+    // servers assign open buffers to a project by enumerating the FILE SYSTEM (tsserver's
+    // configured project, rust-analyzer's crate graph), so importers of the new path gate on a
+    // phantom "cannot find module". Materialize those paths transiently for the check; the
+    // drop-guard removes them again on any reject/error path, and a committing transaction
+    // defuses it (vfs.commit rewrites the same content). Only the ts-morph engine, with its own
+    // in-memory project, never needed this.
+    struct TransientCreates(Vec<PathBuf>);
+    impl Drop for TransientCreates {
+        fn drop(&mut self) {
+            for p in &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    let mut transient = TransientCreates(Vec::new());
+    let mut transient_rels: HashSet<String> = HashSet::new();
+    for rel in &changed_rel {
+        let abs = root.join(rel);
+        if !abs.exists() {
+            if let Some(content) = vfs.read(Path::new(rel)) {
+                if let Some(parent) = abs.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&abs, &content).is_ok() {
+                    transient.0.push(abs);
+                    transient_rels.insert(rel.clone());
+                }
+            }
+        }
+    }
+
     // After = overlay (edited) content for the changed files; disk content for the dependents
     // (their source is unchanged, but tsserver re-checks them against the overlaid changed
     // files, so a freshly-broken caller surfaces here).
@@ -954,8 +987,11 @@ pub fn commit_edits(
     let new: Vec<&Diag> = if after.is_empty() {
         Vec::new()
     } else {
+        // The transiently-materialized creations must stay INVISIBLE to the baseline — they hold
+        // after-content, so including them would let a broken new file excuse its own errors.
         let baseline_files: Vec<(String, String)> = affected
             .iter()
+            .filter(|rel| !transient_rels.contains(*rel))
             .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
             .collect();
         // COUNT baseline occurrences per key, don't just collect the key set: the key has no line
@@ -1062,6 +1098,9 @@ pub fn commit_edits(
 
     if opts.write && !opts.dry_run {
         vfs.commit()?;
+        // The transaction landed — the materialized creations are now REAL files (vfs.commit
+        // just rewrote them); defuse the guard so its drop doesn't delete them.
+        transient.0.clear();
     }
     Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0 })
 }
@@ -1603,11 +1642,25 @@ mod tests {
         assert!(vfs.read(Path::new("a.ts")).is_none());
     }
 
+    /// Serializes tsls STARTUP across the two real-LSP tests in this binary: both spawn
+    /// `npx --yes` against the same npm cache, and concurrent npx installs corrupt it —
+    /// the loser dies at spawn ("lsp server disconnected"). Same contention lang-ts fixed
+    /// for scip/ts-morph behind its cache lock; here an in-process mutex suffices (cargo
+    /// runs test binaries sequentially). Held only across start — a warm cache is fine to
+    /// read concurrently.
+    static TSLS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn start_tsls(root: &Path) -> ci_lsp::LspClient {
+        let _serialize = TSLS_START.lock().unwrap();
+        let mut cmd = std::process::Command::new("npx");
+        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
+            .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
+        ci_lsp::LspClient::start(root, cmd).expect("start tsls")
+    }
+
     // Real move via LSP willRenameFiles. #[ignore]; run with `--ignored`.
     #[test]
     #[ignore]
     fn move_file_rewrites_importers() {
-        use ci_lsp::LspClient;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"strict":true,"noEmit":true},"include":["src"]}"#).unwrap();
@@ -1615,10 +1668,7 @@ mod tests {
         fs::write(root.join("src/math.ts"), "export function add(a: number, b: number): number {\n  return a + b;\n}\n").unwrap();
         fs::write(root.join("src/app.ts"), "import { add } from \"./math.js\";\nexport const r = add(1, 2);\n").unwrap();
 
-        let mut cmd = std::process::Command::new("npx");
-        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
-            .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
-        let mut lsp = LspClient::start(root, cmd).expect("start tsls");
+        let mut lsp = start_tsls(root);
         let structure_of = |_f: &str| Vec::new();
         let no_imports = |_: &str| Vec::<String>::new();
         let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
@@ -1660,7 +1710,6 @@ mod tests {
     #[test]
     #[ignore]
     fn gate_rejects_type_error_accepts_clean() {
-        use ci_lsp::LspClient;
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         fs::write(root.join("tsconfig.json"), r#"{"compilerOptions":{"strict":true,"noEmit":true},"include":["src"]}"#).unwrap();
@@ -1670,10 +1719,7 @@ mod tests {
 
         let structure_of = |_f: &str| vec![fn_node("src/a.ts", "add", 1, 3)];
         let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
-        let mut cmd = std::process::Command::new("npx");
-        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
-            .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
-        let mut lsp = LspClient::start(root, cmd).expect("start tsls");
+        let mut lsp = start_tsls(root);
         let no_imports = |_: &str| Vec::<String>::new();
 
         // 1. A type-breaking replace_node is REJECTED; disk unchanged.

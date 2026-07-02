@@ -259,10 +259,13 @@ honestly says "not type-verified" and the agent hand-verifies; gated mode's stro
 exactly what makes its miss dangerous. SCIP's semantic import graph is what makes the one-hop
 blast radius sound where re-exports flatten — that's the margin, measured.
 
-**Decision:** `full` stays the TS default, now with data behind the reason. `treesitter-gated`
-must not present a one-hop syntactic radius as a full type-check — either its blast radius
-goes transitive (cheap on the repos that mode targets) or its commit replies must scope the
-claim. Until one of those lands, treat the mode as bench-only.
+**Decision:** `full` stays the TS default, now with data behind the reason. And the unsound
+half is FIXED: `treesitter-gated` now serves the gate the **transitive** reverse-importer set
+(`ci_core::transitive_reverse_imports`), so a barrel can't hide a consumer — the same e2e that
+pinned the false-clean now asserts the reject reaches through the barrel, a partial fix still
+blocks, and only the complete batch commits. Scip mode keeps the cheaper one-hop radius (its
+semantic graph is already flattened). The T9 numbers above describe the pre-fix behavior —
+they're what justified the fix.
 
 (Designing T9 also surfaced a real batching bug, now fixed with a regression test: structural
 ops resolve spans from pre-batch disk truth, so a schema op + a ready fix in the SAME file —

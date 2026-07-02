@@ -464,11 +464,13 @@ impl LanguageProvider for TsTreeGated {
         }
         let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
         let structure_of = |f: &str| self.read.structure(Path::new(f)).unwrap_or_default();
-        // Blast radius from the tree-sitter relative-import graph — syntactically derived,
-        // so barrels/re-exports don't flatten like SCIP's semantic edges. That fidelity gap
-        // is part of what this ablation measures.
+        // Blast radius from the tree-sitter relative-import graph. Syntactic edges do NOT
+        // flatten barrels — a consumer of `export * from './x'` edges to the barrel, not x —
+        // so the gate's one hop must be served the TRANSITIVE reverse-importer set or a barrel
+        // hides its consumers and the gate claims a false "clean" (measured: bench T9-barrel).
+        // Full/scip mode keeps one-hop: its semantic graph is already flattened.
         let reverse = ci_core::reverse_import_map(&self.read.import_graph().unwrap_or_default());
-        let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
+        let reverse_imports = |file: &str| ci_core::transitive_reverse_imports(&reverse, file);
         ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
     }
 }
@@ -665,8 +667,10 @@ mod tests {
             other => panic!("required field through a barrel must reject in full mode: {other:?}"),
         }
 
-        // TREESITTER-GATED (syntactic graph): app.ts edges to the barrel, not policy.ts. The
-        // same edit still rejects — but only for policy.ts's own literal, blind to app.ts.
+        // TREESITTER-GATED (syntactic graph): app.ts edges to the barrel, not policy.ts — the
+        // graph itself can't flatten `export *`. The gate compensates by serving the TRANSITIVE
+        // reverse-importer set (the T9-barrel fix), so the same edit must reject naming app.ts
+        // just like scip mode — a barrel must never hide a consumer from the gate.
         let dir2 = tempfile::tempdir().unwrap();
         write_fixture(dir2.path());
         let gated = TsTreeGated::new(dir2.path());
@@ -678,28 +682,41 @@ mod tests {
         );
         match gated.apply_edits(std::slice::from_ref(&burst), &opts).unwrap() {
             CommitResult::Rejected { feedback, .. } => {
-                assert!(!feedback.contains("src/app.ts"), "the syntactic radius shouldn't see app.ts:\n{feedback}")
+                assert!(feedback.contains("src/app.ts"), "the transitive radius must reach through the barrel:\n{feedback}")
             }
-            other => panic!("policy.ts's own literal must still reject: {other:?}"),
+            other => panic!("a barrel-hidden consumer must still reject in gated mode: {other:?}"),
         }
-        // Fix only what that reject showed (the same-file literal). The commit then claims
-        // clean — while app.ts's literal lacks the new required field, i.e. tsc now fails.
-        // This under-gating is treesitter-gated's documented residual, NOT a bug to fix here;
-        // if it ever stops reproducing (e.g. the gate goes transitive), rejoice and update this.
-        let fix_and_burst = [
-            burst,
+        // A batch that fixes only the same-file literal must STILL reject (app.ts is broken) …
+        let partial = [
+            burst.clone(),
             EditOp::ReplaceNode {
                 node_id: "src/core/policy.ts#defaultPolicy".into(),
                 // The fallback node range starts at `function` — the `export` keyword stays.
                 code: "function defaultPolicy(name: string): QuotaPolicy {\n  return { name, limit: 100, burst: 0 };\n}".into(),
             },
         ];
-        match gated.apply_edits(&fix_and_burst, &opts).unwrap() {
+        match gated.apply_edits(&partial, &opts).unwrap() {
+            CommitResult::Rejected { feedback, .. } => {
+                assert!(feedback.contains("src/app.ts"), "the untouched consumer still blocks:\n{feedback}")
+            }
+            other => panic!("a partial fix must not commit: {other:?}"),
+        }
+        // … and the complete batch (consumer included) commits everywhere.
+        let complete = [
+            partial[0].clone(),
+            partial[1].clone(),
+            EditOp::ReplaceText {
+                node_id: "src/app.ts#anon".into(),
+                old_text: "limit: 20".into(),
+                new_text: "limit: 20, burst: 0".into(),
+            },
+        ];
+        match gated.apply_edits(&complete, &opts).unwrap() {
             CommitResult::Ok { .. } => {}
-            other => panic!("gated mode can't see the barrel consumer, so this must commit: {other:?}"),
+            other => panic!("the complete fix must commit: {other:?}"),
         }
         let app = fs::read_to_string(dir2.path().join("src/app.ts")).unwrap();
-        assert!(!app.contains("burst"), "consumer untouched — committed 'clean' with a broken importer");
+        assert!(app.contains("burst: 0"), "consumer updated in the same gated batch:\n{app}");
     }
 
     // Real end-to-end for the post-edit read refresh (scip-typescript + node + ts-morph):

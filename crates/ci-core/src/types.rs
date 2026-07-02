@@ -129,6 +129,27 @@ pub fn reverse_import_map(graph: &ImportGraph) -> HashMap<String, Vec<String>> {
     reverse
 }
 
+/// The TRANSITIVE reverse-importer set of `file` (excluding `file` itself), BFS over a
+/// [`reverse_import_map`]. A SYNTACTIC import graph does not flatten barrels — a consumer of
+/// `export * from './x'` edges to the barrel, not to x — so the edit gate's one-hop blast
+/// radius would miss it and could claim "clean" on a broken consumer (measured: bench task
+/// T9-barrel). Providers whose graph is syntactic serve this closure instead; semantic (scip)
+/// graphs are already flattened and keep the cheaper one-hop.
+pub fn transitive_reverse_imports(reverse: &HashMap<String, Vec<String>>, file: &str) -> Vec<String> {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    let mut queue: Vec<&str> = vec![file];
+    while let Some(f) = queue.pop() {
+        for importer in reverse.get(f).map(|v| v.as_slice()).unwrap_or_default() {
+            if importer != file && seen.insert(importer) {
+                out.push(importer.clone());
+                queue.push(importer);
+            }
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Edit protocol — mirrors src/edit/types.ts `AgentOp` in the TS implementation.
 // The blueprint's granular driver methods (set_body/rename/move/type_check) are
@@ -327,6 +348,22 @@ mod tests {
         importers.sort();
         assert_eq!(importers, vec!["a.ts".to_string(), "b.ts".to_string()]);
         assert!(!rev.contains_key("a.ts"), "a.ts has no importers");
+    }
+
+    // The barrel shape: app -> barrel -> policy. One-hop reverse of policy is just the barrel;
+    // the transitive set must surface app (and never the file itself, even through a cycle).
+    #[test]
+    fn transitive_reverse_imports_crosses_barrels_and_survives_cycles() {
+        let mut g: ImportGraph = BTreeMap::new();
+        g.insert(PathBuf::from("app.ts"), vec![PathBuf::from("barrel.ts")]);
+        g.insert(PathBuf::from("barrel.ts"), vec![PathBuf::from("policy.ts")]);
+        g.insert(PathBuf::from("policy.ts"), vec![PathBuf::from("app.ts")]); // cycle back
+        let rev = reverse_import_map(&g);
+
+        let mut hops = transitive_reverse_imports(&rev, "policy.ts");
+        hops.sort();
+        assert_eq!(hops, vec!["app.ts".to_string(), "barrel.ts".to_string()]);
+        assert!(!transitive_reverse_imports(&rev, "app.ts").contains(&"app.ts".to_string()));
     }
 
     #[test]
