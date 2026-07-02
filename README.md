@@ -13,7 +13,7 @@ Written in Rust: a language-blind core plus per-language providers. **TypeScript
 
 Agents burn tokens grepping for context and break builds with blind string edits. Marksman hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
 
-On a 6-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an agent **with** Marksman cost **~55% less and finished ~40% faster** than without, 6/6 correct — repo-wide type rename: **3 turns vs the baseline's 21**. The tool descriptions are audited to contain zero benchmark-specific content. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
+On a 6-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an agent **with** Marksman cost **~55% less and finished ~40% faster** than without, 6/6 correct — repo-wide type rename: **3 turns vs the baseline's 21**. The tool descriptions are audited to contain zero benchmark-specific content. The suite now also carries a **multilanguage task** (Rust + TypeScript renames in one session, each gated by its own compiler — not yet in the published numbers). Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Capabilities (MCP tools)
 
@@ -29,8 +29,9 @@ On a 6-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an
 ## How it works
 
 - **Read:** `scip-typescript` (compiler-accurate symbols + cross-file references) merged with in-process **tree-sitter** (sub-symbol AST), embedded by a native **Model2Vec** (`potion-code-16M`) embedder — no GPU, no embedding server — then indexed (BM25 + flat vector store + import graph, persisted as protobuf) and retrieved with **Reciprocal Rank Fusion** + graph expansion.
-- **Write:** a persistent, warmed **ts-morph** engine applies edits behind an in-memory VFS, gated by a baseline-diff of type diagnostics over the **blast radius** (the changed files + their importers). A generic LSP path is the fallback (`CI_EDIT_ENGINE=lsp`).
-- **Fast startup:** the SCIP index is cached and validated by a content-hash fingerprint of the source (plus pinned tool versions) — a warm start on an unchanged repo is **~0.1s instead of ~26s**; any doubt reindexes, never a stale load. Symbol ranges are re-anchored against the current file content on every read, so edits made mid-session (by the tool or by you) never leave the anchors stale.
+- **Write:** a persistent, warmed **ts-morph** engine applies edits behind an in-memory VFS, gated by a baseline-diff of type diagnostics over the **blast radius** (the changed files + their importers). A generic LSP path is the fallback (`CI_EDIT_ENGINE=lsp`); it prefers **LSP 3.17 pull diagnostics** (request/response — a slow server can never be mistaken for a clean file), which is how the Rust gate drives rust-analyzer.
+- **Fast startup:** the SCIP index is cached and validated by a content-hash fingerprint of the source (plus pinned tool versions) — a warm start on an unchanged repo is **~0.1s instead of ~26s**; any doubt reindexes, never a stale load.
+- **Reads stay true in-session:** symbol ranges are re-anchored against the current file content on every read, and after a committed edit the write engine **re-describes the changed files** (new symbols, new import edges) back into the read path — a function you just added is immediately visible to `list_anchors`/`find_symbols`, no reindex. The Rust scip graph gets the same treatment: fingerprinted at build, with drifted/edited files served fresh tree-sitter edges.
 
 ## Install
 
@@ -110,7 +111,7 @@ Environment variables:
 | `CI_TSMORPH_DIR` | where the ts-morph sidecar is installed | `<tmp>/ci-tsmorph` |
 | `CI_EDIT_ENGINE` | write engine: `tsmorph` (default) or `lsp` | `tsmorph` |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
-| `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off), e.g. `CI_SCIP_RUST` — Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) vs `mod`-only; generated at index time, ≈ a `cargo check` | the `scip.<lang>` config value |
+| `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off), e.g. `CI_SCIP_RUST` — Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) vs `mod`-only; generated at index time (≈ a `cargo check`) and content-fingerprinted: files edited since serve fresh tree-sitter edges, and a cache without a fingerprint is refused rather than trusted stale | the `scip.<lang>` config value |
 | `CODEINDEX_ROOT` | repo root for the MCP server | current directory |
 
 An optional `codeindex.config.json` in the repo root overrides retrieval / index settings (top-N, RRF k, weights, …). For example, `{ "scip": { "rust": true } }` builds the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) instead of the `mod`-only tree-sitter graph (`scip` is a per-language map; `CI_SCIP_RUST` overrides it per-run).
