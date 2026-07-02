@@ -20,7 +20,7 @@ TASKS = json.loads((HERE / "tasks.json").read_text())
 ROOT = HERE.parent.parent
 RUST = str(ROOT / "target/release/codeindex-rs")
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
-TS_DIR = os.environ.get("CODEINDEX_TS_DIR", "/Users/davi.vasconcelos/codeindex")
+TS_DIR = os.environ.get("CODEINDEX_TS_DIR", os.path.expanduser("~/codeindex"))
 
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
@@ -32,13 +32,31 @@ CI_TOOLS = ",".join([
     "mcp__codeindex__apply_edits",
 ])
 
-# arm name -> mcp config path (None = no codeindex). Both servers are named "codeindex"
-# so the same mcp__codeindex__* tool allow-list works for either.
-ARMS = {
-    "baseline": None,
-    "rust": str(HERE / "codeindex-rust.mcp.json"),
-    "ts": str(HERE / "codeindex-ts.mcp.json"),
-}
+# The three arms; "baseline" runs with no codeindex MCP. Configs are GENERATED at runtime
+# (see mcp_config_for) so the repo carries no machine-specific absolute paths. Both servers
+# are named "codeindex" so the same mcp__codeindex__* tool allow-list works for either.
+ARMS = ("baseline", "rust", "ts")
+
+
+def mcp_config_for(arm):
+    """Write the arm's MCP config to a temp file and return its path (None for baseline).
+    Paths come from this checkout (rust) / $CODEINDEX_TS_DIR (ts) / the caller's env."""
+    if arm == "baseline":
+        return None
+    if arm == "rust":
+        env = {"CI_NPM_CACHE": os.environ.get("CI_NPM_CACHE", "/tmp/ci-npm-cache")}
+        if os.environ.get("CI_MODEL_DIR"):
+            env["CI_MODEL_DIR"] = os.environ["CI_MODEL_DIR"]
+        cfg = {"mcpServers": {"codeindex": {"command": str(ROOT / "target/release/codeindex-rs-mcp"), "env": env}}}
+    else:  # ts — the Node oracle
+        cfg = {"mcpServers": {"codeindex": {
+            "command": os.path.join(TS_DIR, "node_modules/.bin/tsx"),
+            "args": [os.path.join(TS_DIR, "src/mcp.ts")],
+        }}}
+    fd, path = tempfile.mkstemp(prefix=f"bench-{arm}-", suffix=".mcp.json")
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f)
+    return path
 
 
 def sh(cmd, cwd=None, env=None):
@@ -121,8 +139,12 @@ def run_agent(repo, prompt, mcp_config, model, transcript=None):
     # exactly which tools the agent called and how big each response was. Otherwise the compact
     # `json` result is all we need for the token table.
     fmt = "stream-json" if transcript else "json"
+    # --strict-mcp-config on EVERY arm: the configured servers are the ONLY servers. Without it,
+    # user-scope MCP servers on the bench machine leak into the run (a T5 ts-arm run was caught
+    # using this repo's own globally-registered tool mid-task) — contaminating both the arm
+    # isolation and the token accounting.
     cmd = [CLAUDE, "-p", full, "--output-format", fmt, "--model", model,
-           "--max-turns", "40", "--dangerously-skip-permissions"]
+           "--max-turns", "40", "--dangerously-skip-permissions", "--strict-mcp-config"]
     if transcript:
         cmd += ["--verbose"]
     tools = BASE_TOOLS + ("," + CI_TOOLS if mcp_config else "")
@@ -252,6 +274,7 @@ def main():
 
     if not preflight():
         sys.exit(1)
+    arm_cfgs = {a: mcp_config_for(a) for a in arms}
     # One prepared context per distinct repo: the main --repo (tasks without `fixture`) plus a
     # throwaway materialized copy per named fixture (e.g. the multilanguage task's mixed repo).
     ctxs = {}
@@ -277,7 +300,7 @@ def main():
                 if args.save_transcript:
                     os.makedirs(args.save_transcript, exist_ok=True)
                     tx = os.path.join(args.save_transcript, f"{task['id']}.{arm}.run{ri}.jsonl")
-                m = run_agent(ctx["repo"], task["prompt"], ARMS[arm], args.model, transcript=tx)
+                m = run_agent(ctx["repo"], task["prompt"], arm_cfgs[arm], args.model, transcript=tx)
                 m["ok"] = check(ctx["repo"], task["check"])
                 agg[arm].append(m)
                 if tx:

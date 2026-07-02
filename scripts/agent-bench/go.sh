@@ -27,8 +27,16 @@ export CI_NPM_CACHE="/tmp/ci-npm-cache"
 # baseline arm needs the same toolchain the rust arm's MCP server finds via its own fallback.
 # (First T7 run failed BOTH arms on `command not found: cargo` in the check subprocess.)
 [ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
-export CODEINDEX_TS_DIR="${CODEINDEX_TS_DIR:-/Users/davi.vasconcelos/codeindex}"
-export CI_MODEL_DIR="${CI_MODEL_DIR:-/Users/davi.vasconcelos/codeindex/.models/potion-code-16M}"
+# The Node codeindex checkout (the `ts` arm + the default bench target repo) and the embedding
+# model dir — override both via env. Model fallback order: the README's install location, then
+# a model bundled inside the TS checkout.
+export CODEINDEX_TS_DIR="${CODEINDEX_TS_DIR:-$HOME/codeindex}"
+if [ -z "${CI_MODEL_DIR:-}" ]; then
+  for cand in "$HOME/.marksman/models/potion-code-16M" "$CODEINDEX_TS_DIR/.models/potion-code-16M"; do
+    [ -d "$cand" ] && CI_MODEL_DIR="$cand" && break
+  done
+fi
+export CI_MODEL_DIR="${CI_MODEL_DIR:?no embedding model found — set CI_MODEL_DIR (see README: Get the embedding model)}"
 
 # Prepare the disposable clone if missing (e.g. after a reboot clears /tmp).
 TARGET=/tmp/bench-target

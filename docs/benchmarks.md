@@ -94,37 +94,49 @@ every task reported). Three arms: **baseline** (no tool), **rust** (Marksman MCP
 Node `codeindex` MCP — the mature tool Marksman is a rewrite of). Target repo: the Node
 `codeindex` itself (~600-symbol TS). `sec` = wall-clock; `$` = Claude Code's `total_cost_usd`
 (the true economic score — it bakes in prompt caching + output pricing, so it can diverge from
-raw `in_tok`). Results below: 6 tasks, single run (2026-07-01); re-run with `--runs 3` for
-medians.
+raw `in_tok`). Results below: 7 tasks, single run (2026-07-02); re-run with `--runs 3` for
+medians. T1–T6 run on the TS oracle repo; **T7-multilang** runs on its own mixed Rust+TS+Python
+fixture and is **baseline vs rust only** — the `ts` arm is the Node oracle, which handles
+TypeScript ONLY and cannot index the fixture's Rust, so its totals are over 6 tasks by design.
 
 | task | arm | in_tok | out_tok | turns | sec | $ | ok |
 |---|---|--:|--:|--:|--:|--:|:--:|
-| T1-rename | baseline | 218201 | 1697 | 12 | 37 | 0.1932 | 1/1 |
-|  | **rust** | **73417** | **474** | **3** | **18** | **0.0499** | 1/1 |
-|  | ts | 121556 | 708 | 5 | 27 | 0.0613 | 1/1 |
-| T2-move | baseline | 183938 | 1083 | 8 | 31 | 0.0853 | 1/1 |
-|  | **rust** | **73374** | **468** | **3** | **18** | **0.0497** | 1/1 |
-|  | ts | 69279 | 412 | 3 | 17 | 0.0326 | 1/1 |
-| T3-locate-edit | baseline | 114156 | 481 | 5 | 17 | 0.0546 | 1/1 |
-|  | **rust** | **73314** | **408** | **3** | **15** | **0.0486** | 1/1 |
-|  | ts | 177462 | 883 | 7 | 32 | 0.0855 | 1/1 |
-| T4-body-edit | baseline | 93373 | 462 | 4 | 17 | 0.0496 | 1/1 |
-|  | rust | 73531 | 433 | 3 | 15 | 0.0495 | 1/1 |
-|  | ts | 69498 | 391 | 3 | 17 | 0.0325 | 1/1 |
-| T5-schema-field | baseline | 272856 | 1637 | 12 | 39 | 0.1379 | 1/1 |
-|  | **rust** | **101248** | **836** | **4** | **23** | **0.0677** | 1/1 |
-|  | ts | 379669 | 3533 | 17 | 74 | 0.2131 | 1/1 |
-| T6-type-rename | baseline | 281323 | 2448 | 21 | 39 | 0.1929 | 1/1 |
-|  | **rust** | **73580** | **603** | **3** | **18** | **0.0522** | 1/1 |
-|  | ts | 69356 | 427 | 3 | 18 | 0.0330 | 1/1 |
+| T1-rename | baseline | 195542 | 2071 | 13 | 53 | 0.1799 | 1/1 |
+|  | **rust** | **73328** | **391** | **3** | **21** | **0.0484** | 1/1 |
+|  | ts | 121501 | 678 | 5 | 65 | 0.0607 | 1/1 |
+| T2-move | baseline | 185750 | 1192 | 12 | 65 | 0.0883 | 1/1 |
+|  | **rust** | **73363** | **498** | **3** | **17** | **0.0502** | 1/1 |
+|  | ts | 69284 | 387 | 3 | 18 | 0.0323 | 1/1 |
+| T3-locate-edit | baseline | 114176 | 486 | 5 | 18 | 0.0547 | 1/1 |
+|  | **rust** | **73310** | **355** | **3** | **15** | **0.0478** | 1/1 |
+|  | ts | 174885 | 936 | 7 | 30 | 0.0833 | 1/1 |
+| T4-body-edit | baseline | 93334 | 433 | 4 | 17 | 0.0492 | 1/1 |
+|  | rust | 73523 | 483 | 3 | 16 | 0.0502 | 1/1 |
+|  | ts | 69527 | 511 | 3 | 20 | 0.0344 | 1/1 |
+| T5-schema-field | baseline | 203530 | 1731 | 12 | 40 | 0.1115 | 1/1 |
+|  | **rust** | **101498** | **1124** | **4** | **28** | **0.0731** | 1/1 |
+|  | ts † | 318802 | 3746 | 15 | 83 | 0.1936 | 1/1 |
+| T6-type-rename | baseline | 240709 | 2354 | 18 | 44 | 0.1773 | 1/1 |
+|  | **rust** | **73409** | **477** | **3** | **18** | **0.0499** | 1/1 |
+|  | ts | 69469 | 516 | 3 | 21 | 0.0346 | 1/1 |
+| T7-multilang | baseline | 195078 | 1858 | 13 | 38 | 0.1352 | 1/1 |
+|  | **rust** | **73635** | **514** | **4** | **20** | **0.0515** | 1/1 |
+|  | ts | — (TS-only tool: cannot run a Rust+TS task) | | | | | |
 
 ### Totals
 
 | arm | input tok | output tok | sec | $ cost | vs baseline (in / out / sec / $) | success |
 |---|--:|--:|--:|--:|---|--:|
-| baseline | 1163847 | 7808 | 180 | 0.7135 | — | 6/6 |
-| **rust** | **468464** | **3222** | **107** | **0.3176** | **−60% / −59% / −40% / −55%** | 6/6 |
-| ts | 886820 | 6354 | 184 | 0.4579 | −24% / −19% / +2% / −36% | 6/6 |
+| baseline | 1228119 | 10125 | 276 | 0.7961 | — | 7/7 |
+| **rust** | **542066** | **3842** | **134** | **0.3711** | **−56% / −62% / −51% / −53%** | 7/7 |
+| ts | 823468 | 6774 | 238 | 0.4388 | −33% / −33% / −14% / −45% (over its 6 TS tasks) | 6/6 |
+
+† **T5-ts caveat:** mid-task the agent reached for `mcp__marksman__*` tools — a USER-SCOPE MCP
+server (this repo's own tool, registered globally on the bench machine) leaked into the run
+because the harness passed `--mcp-config` without `--strict-mcp-config`. The task still passed
+its check, but that arm's T5 trajectory is contaminated. The harness now passes
+`--strict-mcp-config` on every arm (baseline included), so configured servers are the ONLY
+servers; future runs can't leak.
 
 **Headlines:**
 - **An agent with Marksman costs ~55% less and finishes ~40% faster, 6/6 correct** — and wins or
@@ -133,14 +145,20 @@ medians.
   cache reads) and output's higher per-token price. The dominant cost driver is **turns**: each
   turn re-sends the whole context, and more turns means more (pricey) output. Rust takes the
   fewest turns on every task.
-- **Repo-wide structural edits are the blowouts.** T6-type-rename: **3 turns vs baseline's 21**
+- **Repo-wide structural edits are the blowouts.** T6-type-rename: **3 turns vs baseline's 18**
   (one gated `rename` rewrites the interface and every reference/import; baseline read five whole
-  files and made 12 hand-edits). T1-rename 3 vs 12; T2-move 3 vs 8.
+  files and made 9 hand-edits). T1-rename 3 vs 13; T2-move 3 vs 12.
 - **Wide-blast-radius edits ride the reject-driven protocol.** T5 (add a required field to an
   interface + set it at every construction site): the rust agent makes the anchor edit alone,
   the type-check gate *rejects* with **every** affected site — each with its current source and
-  a ready-to-copy `fix:` action — and one batch later it's done. 4 turns / 836 output tokens vs
-  baseline's 12 / 1637, and no grep can miss a site: the compiler enumerates them.
+  a ready-to-copy `fix:` action — and one batch later it's done. 4 turns vs baseline's 12, and
+  no grep can miss a site: the compiler enumerates them.
+- **T7-multilang: two compilers, one session.** Rename a Rust function (cargo-gated) AND a TS
+  function (tsc-gated) in a mixed repo: rust arm does it in **4 turns / $0.05 vs baseline's
+  13 / $0.14** — each rename one `apply_edits`, each gated by its own language's compiler
+  through per-file provider dispatch. (This task's FIRST run also flushed out two real bugs —
+  single-provider batch dispatch and phantom engine buffers after dry-run gates — both fixed;
+  that's the other thing a multilanguage task is for.)
 - **T3-locate went from parity to a win** via constraint-based disambiguation: the agent edits a
   field by bare name with no locate step; when the name collides, the server resolves it from the
   edit's own `oldText` (only one candidate contains it) instead of asking back.
@@ -154,20 +172,13 @@ medians.
   fixture names or task values** (an earlier revision leaked near-verbatim task answers into
   description examples; those runs were discarded and the examples replaced with
   fixture-foreign ones). What the tool teaches, it teaches generically.
-- **All 6/6 succeeded, so the type-check gate's resilience value is NOT in these numbers** —
-  insurance doesn't pay out on the happy path. The measured win is efficiency.
-- **Scope:** 6 tasks, one single-package TS repo, sonnet 4.6. The *shape* is robust; absolute
-  deltas are this-repo/these-tasks.
-
-**Pending — T7-multilang.** The suite now includes a seventh task (`tasks.json`: two renames in
-ONE session — a Rust function gated by `cargo check` and a TS function gated by tsc — on a
-self-contained mixed Rust+TS+Python fixture, `scripts/agent-bench/fixture-multilang/`). It
-exercises the per-file provider registry end to end and runs standalone:
-`python3 scripts/agent-bench/run.py --task T7-multilang --arms baseline,rust`. The `ts` arm is
-excluded by the task's `arms` field (the Node oracle can't index Rust). **Not yet measured** —
-the numbers above remain the 6-task result.
+- **All tasks succeeded in every arm, so the type-check gate's resilience value is NOT in these
+  numbers** — insurance doesn't pay out on the happy path. The measured win is efficiency.
+- **Scope:** 7 tasks (6 on one single-package TS repo + 1 on a small mixed fixture), sonnet 4.6.
+  The *shape* is robust; absolute deltas are this-repo/these-tasks.
 - The `ts` arm runs the original codeindex's **current** ranker; part of rust's edge may be its
-  improved retrieval and edit-workflow design, not only Rust speed.
+  improved retrieval and edit-workflow design, not only Rust speed. And it is **TypeScript-only**
+  by design — its totals exclude T7 (see the table note).
 
 Reproduce: `bash scripts/agent-bench/go.sh --runs 3` (needs `$ANTHROPIC_API_KEY`; rebuilds the
 release binaries first, so results always reflect the current source). Add

@@ -31,6 +31,10 @@ metric. It's built to be trustworthy, not to look good.
    target repo. (An earlier revision leaked near-verbatim task answers into description
    examples; those runs were discarded.) When adding an example to a tool description, grep the
    fixture for it first.
+8. **Hermetic MCP config.** Every arm (baseline included) runs with `--strict-mcp-config`: the
+   generated per-arm config is the ONLY MCP source, so user-scope servers registered on the
+   bench machine can't leak tools into a run. (Caught in practice: a ts-arm task once picked up
+   this repo's own globally-registered server mid-run.)
 
 ## Run it (step by step)
 
@@ -59,9 +63,11 @@ python3 scripts/agent-bench/run.py --repo /tmp/bench-target --runs 3
 #    options: --arms baseline,rust   (drop the TS arm) · --task T1-rename · --runs N
 ```
 
-Env knobs: `CODEINDEX_TS_DIR` (default `/Users/davi.vasconcelos/codeindex`) points at the Node
-codeindex checkout used for the `ts` arm. A preflight aborts loudly if `claude` can't return
-JSON — the run never silently reports zeros.
+Env knobs: `CODEINDEX_TS_DIR` (default `~/codeindex`) points at the Node codeindex checkout
+used for the `ts` arm (which is **TypeScript-only** — it sits out T7-multilang). MCP configs
+are generated at runtime from this checkout's paths, and every arm runs with
+`--strict-mcp-config` so user-scope MCP servers on the machine can never leak into a run. A
+preflight aborts loudly if `claude` can't return JSON — the run never silently reports zeros.
 
 The script builds each arm's index once, then for each task runs
 the agent twice (with / without codeindex), checks success, and prints a markdown table +
