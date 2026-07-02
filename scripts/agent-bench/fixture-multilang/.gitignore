@@ -3,3 +3,4 @@ node_modules/
 .codeindex/
 .codeindex-rs/
 Cargo.lock
+__pycache__/

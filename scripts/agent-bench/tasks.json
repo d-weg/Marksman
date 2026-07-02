@@ -42,5 +42,13 @@
     "prompt": "This repo mixes Rust and TypeScript. Do both renames, everywhere (definition, call sites, imports): 1) rename the Rust function percentile to quantile; 2) rename the TypeScript function formatLatency to renderLatency. Keep the Rust crate passing `cargo check` and the TypeScript passing `npm run typecheck`.",
     "check": "! grep -rEq 'percentile\\(' src && grep -q 'pub fn quantile' src/stats.rs && cargo check -q && ! grep -rq 'formatLatency' web && grep -q 'renderLatency' web/format.ts && grep -q 'renderLatency' web/client.ts && npm run -s typecheck",
     "why": "Multilanguage: ONE session, edits gated by TWO compilers (rust-analyzer + tsc) via per-file provider dispatch, on a self-contained mixed fixture (`fixture` field — copied to a throwaway git repo per run). The Node oracle is TS-only, so `arms` restricts to baseline vs rust."
+  },
+  {
+    "id": "T8-fallback",
+    "fixture": "fixture-multilang",
+    "arms": ["baseline", "rust"],
+    "prompt": "Two renames, everywhere in this repo (definitions and call sites): 1) in the Python job code, rename the function rollup_day to daily_rollup; 2) in the Go tool code, rename the function bucketLabel to tierLabel. Keep the Python byte-compilable.",
+    "check": "! grep -rEq 'rollup_day\\(' jobs && grep -q 'def daily_rollup' jobs/rollup.py && grep -q 'daily_rollup(day)' jobs/rollup.py && python3 -m py_compile jobs/rollup.py && ! grep -rEq 'bucketLabel\\(' tools && grep -q 'func tierLabel' tools/latency.go && grep -q 'tierLabel(u)' tools/latency.go",
+    "why": "The GENERIC fallback provider: Python + Go in one session, neither with a native integration — structural tree-sitter edits, honestly UNGATED (the tool must say so). Measures whether the fallback still beats grep+Edit on find+edit efficiency. The Node oracle can't index either language, so arms are baseline vs rust."
   }
 ]

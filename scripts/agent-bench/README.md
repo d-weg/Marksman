@@ -99,6 +99,7 @@ totals (input/output token deltas, success counts).
 | T5-schema-field | add a required field to an interface + set it at every construction site | the wide-blast-radius protocol: anchor edit → gate reject enumerates every site with ready-to-copy fixes → one batch |
 | T6-type-rename | rename an interface repo-wide (definition + all references/imports) | gated cross-file rename at type level — the biggest baseline blowout (3 turns vs ~21) |
 | T7-multilang | two renames in ONE session: a Rust function (cargo-checked) and a TS function (tsc-checked), in a mixed Rust+TS+Python repo | per-file provider dispatch — each edit gated by its own language's compiler; the multi-provider registry end to end |
+| T8-fallback | two renames in ONE session: a Python and a Go function — neither language has a native integration | the GENERIC tree-sitter fallback provider (ungated edits, honestly labeled) — does structure-aware editing without a compiler gate still beat grep+Edit? |
 
 Two optional per-task fields power T7:
 
