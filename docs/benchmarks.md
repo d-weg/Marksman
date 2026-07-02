@@ -225,7 +225,7 @@ semantic margin is exactly the un-benched cases: barrels, re-exports, big repos)
 `treesitter-gated` as a supported zero-dependency-at-startup mode, and never present the
 ungated tier as adequate for a language that has a compiler.
 
-### T9-barrel — putting SCIP's claimed margin on the bench (designed, run pending)
+### T9-barrel — putting SCIP's claimed margin on the bench (measured)
 
 The ablation's verdict leaned on an un-benched claim: SCIP's value is barrels/re-exports.
 T9 tests exactly that. `fixture-barrels` is a small TS repo where every consumer imports
@@ -243,18 +243,26 @@ errors on a new required interface field, so the consumers sit *outside* the gat
 commit claims clean while `tsc` fails. That is treesitter-gated's honest residual: not extra
 turns, a **false "type-checked" claim**.
 
-Pre-registered predictions (single runs, turns as the robust column):
+Measured (single runs, 2026-07-02) — the pre-registered predictions hit on all three arms:
 
-- `full`: T5-like — one reject enumerating all 5 sites, one fix batch; ~4-5 turns, beats baseline.
-- `treesitter-gated`: the gate rejects only the same-file + direct-import sites; if the agent
-  trusts the (false) clean commit, **ok=False**; if it re-verifies by hand, it pays baseline-like
-  turns. Either way, worse than full — the first task where the two gated modes separate.
-- baseline: fine (tsc sees everything), at its usual grep + typecheck-iterate cost.
+| arm | turns | $ | ok | what happened |
+|---|--:|--:|:--:|---|
+| baseline | 17 | 0.1939 | 1/1 | tsc sees everything; grep + typecheck-iterate grind |
+| `full` (SCIP) | 6 | 0.1142 | 1/1 | T5-like: reject enumerates the barrel-hidden sites, fix batch, done — −41% $ |
+| `treesitter-gated` | **5** | **0.0945** | **0/1** | **cheapest, fastest, WRONG** — the gate claimed clean, the agent (told to trust it) stopped, tsc fails |
 
-Run: `bash scripts/agent-bench/go.sh --task T9-barrel --runs 3`, then the same with
-`CI_TS_MODE=treesitter-gated --arms rust`. If treesitter-gated *doesn't* degrade, the honest
-conclusion flips: SCIP would be margin nobody measured a need for, and the gated mode's
-blast radius should go transitive instead.
+This is the ablation's missing datapoint, and it flips the "gated ≈ full" reading into its
+precise form: **equivalent on direct-import repos, unsound on barrels.** The failure is the
+worst kind — not expensive, not noisy, just a confident false "type-checked" claim. Pure
+tree-sitter (ungated) *passed* this same task at 11 turns/$0.124 precisely because its reply
+honestly says "not type-verified" and the agent hand-verifies; gated mode's stronger claim is
+exactly what makes its miss dangerous. SCIP's semantic import graph is what makes the one-hop
+blast radius sound where re-exports flatten — that's the margin, measured.
+
+**Decision:** `full` stays the TS default, now with data behind the reason. `treesitter-gated`
+must not present a one-hop syntactic radius as a full type-check — either its blast radius
+goes transitive (cheap on the repos that mode targets) or its commit replies must scope the
+claim. Until one of those lands, treat the mode as bench-only.
 
 (Designing T9 also surfaced a real batching bug, now fixed with a regression test: structural
 ops resolve spans from pre-batch disk truth, so a schema op + a ready fix in the SAME file —
