@@ -158,6 +158,14 @@ medians.
   insurance doesn't pay out on the happy path. The measured win is efficiency.
 - **Scope:** 6 tasks, one single-package TS repo, sonnet 4.6. The *shape* is robust; absolute
   deltas are this-repo/these-tasks.
+
+**Pending — T7-multilang.** The suite now includes a seventh task (`tasks.json`: two renames in
+ONE session — a Rust function gated by `cargo check` and a TS function gated by tsc — on a
+self-contained mixed Rust+TS+Python fixture, `scripts/agent-bench/fixture-multilang/`). It
+exercises the per-file provider registry end to end and runs standalone:
+`python3 scripts/agent-bench/run.py --task T7-multilang --arms baseline,rust`. The `ts` arm is
+excluded by the task's `arms` field (the Node oracle can't index Rust). **Not yet measured** —
+the numbers above remain the 6-task result.
 - The `ts` arm runs the original codeindex's **current** ranker; part of rust's edge may be its
   improved retrieval and edit-workflow design, not only Rust speed.
 

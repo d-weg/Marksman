@@ -90,5 +90,16 @@ totals (input/output token deltas, success counts).
 | T4-body-edit | change two length checks inside one function | surgical sub-symbol edits (`replace_text`) vs read + re-emit |
 | T5-schema-field | add a required field to an interface + set it at every construction site | the wide-blast-radius protocol: anchor edit → gate reject enumerates every site with ready-to-copy fixes → one batch |
 | T6-type-rename | rename an interface repo-wide (definition + all references/imports) | gated cross-file rename at type level — the biggest baseline blowout (3 turns vs ~21) |
+| T7-multilang | two renames in ONE session: a Rust function (cargo-checked) and a TS function (tsc-checked), in a mixed Rust+TS+Python repo | per-file provider dispatch — each edit gated by its own language's compiler; the multi-provider registry end to end |
+
+Two optional per-task fields power T7:
+
+- **`fixture`** — a subdirectory of this script's dir (e.g. `fixture-multilang/`) holding a
+  self-contained repo. The harness copies it to a throwaway temp dir and `git init`s it there
+  (never git-resets a fixture in place — it lives inside this project's worktree), then builds
+  indexes/snapshots exactly like the main `--repo`. Tasks with a `fixture` don't need `--repo`:
+  `python3 run.py --task T7-multilang --arms baseline,rust` runs standalone.
+- **`arms`** — restricts which arms run the task. T7 sets `["baseline", "rust"]`: the Node
+  oracle is TypeScript-only, so a `ts` arm would measure a tool on a repo it can't index.
 
 Latest results and analysis live in [docs/benchmarks.md](../../docs/benchmarks.md).

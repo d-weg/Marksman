@@ -1,0 +1,7 @@
+{
+  "name": "metricsd-web",
+  "private": true,
+  "scripts": {
+    "typecheck": "npx -y -p typescript@5.6.2 tsc --noEmit"
+  }
+}

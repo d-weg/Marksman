@@ -53,29 +53,43 @@ def sh(cmd, cwd=None, env=None):
 # reset (a file copy, not a reindex — no API cost). Every run starts from an identical index
 # that matches the reset source.
 INDEX_DIRS = [".codeindex", ".codeindex-rs"]
-SNAP = None  # set by snapshot_indexes()
 
 
 def snapshot_indexes(repo):
-    global SNAP
-    SNAP = tempfile.mkdtemp(prefix="bench-index-snap-")
+    snap = tempfile.mkdtemp(prefix="bench-index-snap-")
     for d in INDEX_DIRS:
         src = os.path.join(repo, d)
         if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(SNAP, d))
+            shutil.copytree(src, os.path.join(snap, d))
+    return snap
 
 
-def reset(repo, base):
+def reset(repo, base, snap):
     sh(["git", "reset", "--hard", base], cwd=repo)
     sh(["git", "clean", "-fdq"] + sum([["-e", d] for d in INDEX_DIRS], []), cwd=repo)
     # Restore each index from the pristine, base-consistent snapshot.
-    if SNAP:
+    if snap:
         for d in INDEX_DIRS:
-            snap = os.path.join(SNAP, d)
-            if os.path.isdir(snap):
+            s = os.path.join(snap, d)
+            if os.path.isdir(s):
                 dst = os.path.join(repo, d)
                 shutil.rmtree(dst, ignore_errors=True)
-                shutil.copytree(snap, dst)
+                shutil.copytree(s, dst)
+
+
+def materialize_fixture(name):
+    """Copy a bench fixture (a subdir of this script's dir, named by a task's `fixture` field)
+    into a throwaway git repo. NEVER git-reset a fixture in place — it lives inside this
+    project's own worktree, so a reset there would clobber the project, not the fixture."""
+    src = HERE / name
+    if not src.is_dir():
+        sys.exit(f"ERROR: task fixture '{name}' not found at {src}")
+    tmp = tempfile.mkdtemp(prefix=f"bench-{name}-")
+    shutil.copytree(src, tmp, dirs_exist_ok=True)
+    sh(["git", "init", "-q"], cwd=tmp)
+    sh(["git", "add", "-A"], cwd=tmp)
+    sh(["git", "-c", "user.email=bench@local", "-c", "user.name=bench", "commit", "-qm", "base"], cwd=tmp)
+    return tmp
 
 
 # Nudge the codeindex arms to actually USE the tools — otherwise the benchmark
@@ -203,9 +217,25 @@ def build_indexes(repo, arms):
         sh(["npm", "run", "index", "--", "--root", repo], cwd=TS_DIR)
 
 
+def prepare_repo(repo, arms):
+    """Reset to a pristine base, build the indexes from scratch, snapshot them. Returns the
+    context every run of every task against this repo starts from."""
+    base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `codeindex-rs
+    # index` updates INCREMENTALLY (mtime-keyed), so a stale index left by a prior run — or a
+    # dirty working tree — would be snapshotted and then restored on every reset, leaving the
+    # index inconsistent with the reset SOURCE (the T6 postmortem). Reset tracked source to
+    # base and delete the index dirs so the build is from scratch.
+    sh(["git", "reset", "--hard", base], cwd=repo)
+    for d in INDEX_DIRS:
+        shutil.rmtree(os.path.join(repo, d), ignore_errors=True)
+    build_indexes(repo, arms)
+    return {"repo": repo, "base": base, "snap": snapshot_indexes(repo)}
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo", required=True)
+    ap.add_argument("--repo", help="main benchmark repo; required unless every selected task has its own `fixture`")
     ap.add_argument("--task")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--arms", default="baseline,rust,ts")
@@ -213,45 +243,47 @@ def main():
                     help="cost lever: claude-haiku-4-5 (cheapest) · claude-sonnet-4-6 (default) · claude-opus-4-8")
     ap.add_argument("--save-transcript", help="dir to dump per-run stream-json transcripts + a tool-usage summary (to see where tokens go)")
     args = ap.parse_args()
-    repo = os.path.abspath(args.repo)
     arms = [a for a in args.arms.split(",") if a in ARMS]
+    tasks = [t for t in TASKS if not args.task or t["id"] == args.task]
+    if not tasks:
+        sys.exit(f"ERROR: no task matches {args.task!r}")
+    if any("fixture" not in t for t in tasks) and not args.repo:
+        sys.exit("ERROR: --repo is required (some selected tasks don't carry their own `fixture`)")
 
     if not preflight():
         sys.exit(1)
-    base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-    print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model}\nrepo: {repo} @ {base[:8]}\n")
-    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `build_indexes` runs
-    # before the task loop's first reset, and `codeindex-rs index` updates INCREMENTALLY (mtime-keyed),
-    # so a stale index left by a prior run — or a dirty working tree — would be snapshotted and then
-    # restored on every reset, leaving the index inconsistent with the reset SOURCE. That silently
-    # sabotages symbol-targeting tasks: e.g. a rename whose symbol the stale index already renamed
-    # away resolves to "not found", forcing a grep fallback and an invalid measurement (the T6
-    # postmortem). Reset tracked source to base and delete the index dirs so the build is from scratch.
-    sh(["git", "reset", "--hard", base], cwd=repo)
-    for d in INDEX_DIRS:
-        shutil.rmtree(os.path.join(repo, d), ignore_errors=True)
-    build_indexes(repo, arms)
-    snapshot_indexes(repo)  # pristine, base-consistent indexes restored on every reset
+    # One prepared context per distinct repo: the main --repo (tasks without `fixture`) plus a
+    # throwaway materialized copy per named fixture (e.g. the multilanguage task's mixed repo).
+    ctxs = {}
+    if any("fixture" not in t for t in tasks):
+        ctxs[None] = prepare_repo(os.path.abspath(args.repo), arms)
+    for name in sorted({t["fixture"] for t in tasks if "fixture" in t}):
+        ctxs[name] = prepare_repo(materialize_fixture(name), arms)
+    print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model}")
+    for name, c in ctxs.items():
+        print(f"repo[{name or 'main'}]: {c['repo']} @ {c['base'][:8]}")
+    print()
 
     rows = []
-    for task in TASKS:
-        if args.task and task["id"] != args.task:
-            continue
+    for task in tasks:
+        ctx = ctxs[task.get("fixture")]
+        # A task may restrict its arms (e.g. the multilang task: the Node oracle is TS-only).
+        task_arms = [a for a in arms if a in task.get("arms", arms)]
         agg = {a: [] for a in arms}
         for ri in range(args.runs):
-            for arm in arms:
-                reset(repo, base)
+            for arm in task_arms:
+                reset(ctx["repo"], ctx["base"], ctx["snap"])
                 tx = None
                 if args.save_transcript:
                     os.makedirs(args.save_transcript, exist_ok=True)
                     tx = os.path.join(args.save_transcript, f"{task['id']}.{arm}.run{ri}.jsonl")
-                m = run_agent(repo, task["prompt"], ARMS[arm], args.model, transcript=tx)
-                m["ok"] = check(repo, task["check"])
+                m = run_agent(ctx["repo"], task["prompt"], ARMS[arm], args.model, transcript=tx)
+                m["ok"] = check(ctx["repo"], task["check"])
                 agg[arm].append(m)
                 if tx:
                     print(f"[{task['id']} {arm} run{ri}] in={m['in']} out={m['out']} turns={m['turns']} ok={m['ok']}")
                     summarize_transcript(tx)
-        reset(repo, base)
+        reset(ctx["repo"], ctx["base"], ctx["snap"])
         rows.append((task["id"], agg))
 
     med = lambda xs, k: statistics.median(x[k] for x in xs) if xs else 0
@@ -268,6 +300,8 @@ def main():
     for tid, agg in rows:
         for arm in arms:
             xs = agg[arm]
+            if not xs:
+                continue  # arm not run for this task (task-level `arms` restriction)
             ok = sum(1 for x in xs if x["ok"])
             print(f"| {tid} | {arm} | {med(xs,'in'):.0f} | {med(xs,'out'):.0f} | {med(xs,'turns'):.0f} | {med(xs,'dur'):.0f} | {med(xs,'cost'):.4f} | {ok}/{len(xs)} |")
             tot[arm]["in"] += med(xs, "in"); tot[arm]["out"] += med(xs, "out")

@@ -34,5 +34,13 @@
     "prompt": "Rename the SymbolEntry interface to CodeSymbol everywhere in the codebase — its definition in src/types.ts and every reference and import across all files. Keep everything compiling.",
     "check": "! grep -rq 'SymbolEntry' src && grep -q 'interface CodeSymbol' src/types.ts && npm run -s typecheck",
     "why": "Type rename propagating across 5 files — scaled-up T1 (a function rename in ~3 files). Baseline must chase every reference/import and typecheck-iterate; a gated structural rename does the whole blast radius in one call. tsc + zero-SymbolEntry-remaining is ungameable."
+  },
+  {
+    "id": "T7-multilang",
+    "fixture": "fixture-multilang",
+    "arms": ["baseline", "rust"],
+    "prompt": "This repo mixes Rust and TypeScript. Do both renames, everywhere (definition, call sites, imports): 1) rename the Rust function percentile to quantile; 2) rename the TypeScript function formatLatency to renderLatency. Keep the Rust crate passing `cargo check` and the TypeScript passing `npm run typecheck`.",
+    "check": "! grep -rEq 'percentile\\(' src && grep -q 'pub fn quantile' src/stats.rs && cargo check -q && ! grep -rq 'formatLatency' web && grep -q 'renderLatency' web/format.ts && grep -q 'renderLatency' web/client.ts && npm run -s typecheck",
+    "why": "Multilanguage: ONE session, edits gated by TWO compilers (rust-analyzer + tsc) via per-file provider dispatch, on a self-contained mixed fixture (`fixture` field — copied to a throwaway git repo per run). The Node oracle is TS-only, so `arms` restricts to baseline vs rust."
   }
 ]

@@ -1,0 +1,8 @@
+# Standalone crate: the empty [workspace] detaches it from any enclosing cargo workspace
+# (this fixture lives inside the codeindex-rs repo but is materialized to a temp dir for runs).
+[workspace]
+
+[package]
+name = "metricsd"
+version = "0.1.0"
+edition = "2021"
