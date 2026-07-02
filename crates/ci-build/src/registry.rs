@@ -132,6 +132,16 @@ const SUPPORTED: &[LangSpec] = &[
         excludes: &[],
     },
     // The generic tree-sitter fallback languages (lang-fallback): read path + ungated edits.
+    // JS rides the fallback (not the TS provider): scip-typescript/ts-morph only see JS when a
+    // tsconfig opts in via allowJs, and the gate is only as strong as checkJs — routing JS
+    // through them would claim "type-checked clean" on barely-checked code. Gated JS via the
+    // TS toolchain is a roadmap item.
+    LangSpec {
+        name: "js",
+        globs: &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
+        langs: &[Lang::Js],
+        excludes: &["**/node_modules/**", "**/dist/**", "**/build/**"],
+    },
     LangSpec { name: "go", globs: &["**/*.go"], langs: &[Lang::Go], excludes: &["**/vendor/**"] },
     LangSpec { name: "java", globs: &["**/*.java"], langs: &[Lang::Java], excludes: &[] },
     LangSpec { name: "ruby", globs: &["**/*.rb"], langs: &[Lang::Ruby], excludes: &[] },

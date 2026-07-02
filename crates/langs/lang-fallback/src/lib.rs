@@ -29,6 +29,7 @@ use tree_sitter::{Node as TsNode, Parser, Point};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FbLang {
     Python,
+    Js,
     Go,
     Java,
     Ruby,
@@ -36,7 +37,7 @@ pub enum FbLang {
     Cpp,
 }
 
-pub const ALL: &[FbLang] = &[FbLang::Python, FbLang::Go, FbLang::Java, FbLang::Ruby, FbLang::C, FbLang::Cpp];
+pub const ALL: &[FbLang] = &[FbLang::Python, FbLang::Js, FbLang::Go, FbLang::Java, FbLang::Ruby, FbLang::C, FbLang::Cpp];
 
 impl FbLang {
     /// Pick a fallback language for `root` by the source files actually present.
@@ -47,6 +48,7 @@ impl FbLang {
     pub fn from_name(name: &str) -> Option<FbLang> {
         match name {
             "python" | "py" => Some(FbLang::Python),
+            "js" | "javascript" => Some(FbLang::Js),
             "go" => Some(FbLang::Go),
             "java" => Some(FbLang::Java),
             "ruby" | "rb" => Some(FbLang::Ruby),
@@ -64,6 +66,7 @@ impl FbLang {
     fn ts_language(self) -> tree_sitter::Language {
         match self {
             FbLang::Python => tree_sitter_python::LANGUAGE.into(),
+            FbLang::Js => tree_sitter_javascript::LANGUAGE.into(),
             FbLang::Go => tree_sitter_go::LANGUAGE.into(),
             FbLang::Java => tree_sitter_java::LANGUAGE.into(),
             FbLang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
@@ -75,6 +78,7 @@ impl FbLang {
     fn exts(self) -> &'static [&'static str] {
         match self {
             FbLang::Python => &["py", "pyi"],
+            FbLang::Js => &["js", "jsx", "mjs", "cjs"],
             FbLang::Go => &["go"],
             FbLang::Java => &["java"],
             FbLang::Ruby => &["rb"],
@@ -86,6 +90,7 @@ impl FbLang {
     pub fn label(self) -> &'static str {
         match self {
             FbLang::Python => "python",
+            FbLang::Js => "javascript",
             FbLang::Go => "go",
             FbLang::Java => "java",
             FbLang::Ruby => "ruby",
@@ -206,6 +211,7 @@ pub fn outline(lang: FbLang, content: &str) -> String {
     // languages keep `elide_bodies`' default.
     let fn_kinds: &[&str] = match lang {
         FbLang::Python => &["function_definition"],
+        FbLang::Js => &["function_declaration", "generator_function_declaration", "method_definition"],
         FbLang::Go => &["function_declaration", "method_declaration"],
         FbLang::Java => &["method_declaration", "constructor_declaration"],
         FbLang::Ruby => &["method", "singleton_method"],
@@ -234,6 +240,11 @@ enum Shape {
 fn classify(lang: FbLang, kind: &str) -> Option<Shape> {
     use Shape::*;
     Some(match (lang, kind) {
+        // JS (grammar includes JSX): classes qualify their methods; arrow-function consts are
+        // variable declarators (no name field on the function) and stay out — same tradeoff as
+        // scip's Term handling, revisit if it bites.
+        (FbLang::Js, "function_declaration" | "generator_function_declaration" | "method_definition") => Fn,
+        (FbLang::Js, "class_declaration") => Container,
         (FbLang::Go, "function_declaration" | "method_declaration") => Fn,
         (FbLang::Go, "type_spec") => Type,
         (FbLang::Java, "method_declaration" | "constructor_declaration") => Fn,
@@ -720,6 +731,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join(file), content).unwrap();
         FallbackProvider::new(dir.path(), lang).structure(Path::new(file)).unwrap()
+    }
+
+    #[test]
+    fn js_structure_functions_classes_methods() {
+        let nodes = generic_structure(
+            FbLang::Js,
+            "app.js",
+            "// Formats a duration for display.\nfunction formatSpan(ms) {\n  return ms + 'ms';\n}\n\nclass Panel {\n  render(rows) {\n    return rows.map(formatSpan);\n  }\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"app.js#formatSpan"), "js function: {ids:?}");
+        assert!(ids.contains(&"app.js#Panel"), "js class: {ids:?}");
+        assert!(ids.contains(&"app.js#Panel.render"), "js method qualified: {ids:?}");
+        let f = nodes.iter().find(|n| n.id == "app.js#formatSpan").unwrap();
+        assert!(f.children.iter().any(|c| c.id.ends_with(":body")), "js body sub-node");
+        assert!(f.children.iter().any(|c| c.id.ends_with(":doc")), "leading comment -> :doc");
     }
 
     #[test]

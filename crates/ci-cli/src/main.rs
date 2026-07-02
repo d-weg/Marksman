@@ -187,6 +187,7 @@ fn cmd_doctor(root: &Path) {
     }
     let fallback_langs: Vec<&str> = [
         (ci_walk::Lang::Python, "python"),
+        (ci_walk::Lang::Js, "javascript"),
         (ci_walk::Lang::Go, "go"),
         (ci_walk::Lang::Java, "java"),
         (ci_walk::Lang::Ruby, "ruby"),

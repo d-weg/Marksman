@@ -201,8 +201,10 @@ alongside code.
 **Why:** last, once the lifecycle / safety / quality floor is in.
 - [ ] Go / Ruby fallback: a data addition to `FbLang` (grammar + node-kind names); the provider,
       dispatch, outline, and ungated-edit path are already language-generic.
-- [ ] Gated upgrades per language: pyright + scip-python (Python), gopls + scip-go (Go) — swap the
-      no-op gate for a real `GateEngine`, reaching TS/Rust parity.
+- [ ] Gated upgrades per language: pyright + scip-python (Python), gopls + scip-go (Go), and
+      JavaScript through the TS toolchain (only honest with `allowJs` + `checkJs` handling — a
+      weak gate must not claim "type-checked clean"; JS rides the generic provider until then) —
+      swap the no-op gate for a real `GateEngine`, reaching TS/Rust parity.
 - [ ] Retrieval scale: decide an ANN/inverted index **or** an explicit "small/medium repos" non-goal
       plus a file cap — BM25 search and vector ranking are both O(n) per query today (fine now,
       unbounded on a large monorepo; `ci-arch` already caps at 20k files, the index doesn't).
