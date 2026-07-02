@@ -198,14 +198,26 @@ alongside code.
       code" workflow agents handle fine with plain text edits. Removed; the `set_key` machinery is
       not useful for code (code's "path" is the node id, with type-checking on top).
 
-### Batch 8 — Breadth: more languages + retrieval scale
-**Why:** last, once the lifecycle / safety / quality floor is in.
-- [ ] Go / Ruby fallback: a data addition to `FbLang` (grammar + node-kind names); the provider,
-      dispatch, outline, and ungated-edit path are already language-generic.
-- [ ] Gated upgrades per language: pyright + scip-python (Python), gopls + scip-go (Go), and
-      JavaScript through the TS toolchain (only honest with `allowJs` + `checkJs` handling — a
-      weak gate must not claim "type-checked clean"; JS rides the generic provider until then) —
-      swap the no-op gate for a real `GateEngine`, reaching TS/Rust parity.
+### Batch 8 — Breadth: more languages, via the measured rollout ladder
+**Why:** last, once the lifecycle / safety / quality floor is in. **The ladder is now
+measured policy** (read-path ablation + T9/T10, [benchmarks.md](benchmarks.md) §2–3): the
+compiler GATE carries the agent value (tree-sitter reads + a real gate = −36% vs baseline,
+zero startup deps); SCIP is the *maturity step* that keeps the gate's radius sound on
+monorepos / cross-package imports (where its edges are the entire measured advantage). So a
+new language does NOT wait for a scip indexer:
+- [x] Go / Ruby / Java / C / C++ / JS fallback: data additions to `FbLang` (grammar + classify
+      rows); provider, dispatch, outline, syntax-gated edits, and the rename verification scan
+      are language-generic.
+- [ ] **Step 1 — tree-sitter + gate** per language: keep the generic tree-sitter read + the
+      syntactic import graph (served TRANSITIVELY to the gate — `transitive_reverse_imports`,
+      the T9 fix) and swap `NoGate` for the language's real checker as `GateEngine`: pyright
+      (Python), gopls (Go), and JS through tsc (only honest with `allowJs`+`checkJs` handling —
+      a weak gate must not claim "type-checked clean"). `TsTreeGated` is the proven template.
+- [ ] **Step 2 — scip indexer** per language (scip-python, scip-go, …), when that language's
+      users hit the seams where it is load-bearing: cross-package/bare-specifier imports (the
+      syntactic graph has NO such edges — T10) and radius precision on large repos (the
+      transitive closure over-approximates; scip's one-hop set stays bounded by true
+      referencers).
 - [ ] Retrieval scale: decide an ANN/inverted index **or** an explicit "small/medium repos" non-goal
       plus a file cap — BM25 search and vector ranking are both O(n) per query today (fine now,
       unbounded on a large monorepo; `ci-arch` already caps at 20k files, the index doesn't).
@@ -261,6 +273,41 @@ existing hub/expansion tests plus the eval are the gate.
       centrality to tag/sort each directory's top files as the repo's "core modules" — a token-budgeted
       ranked map (AGF's ~1k-token repo map), reusing 9b, no recompute. Keep it a data addition to the
       `ci-arch` output; defer if it grows the schema.
+
+### Batch 10 — Provider conformance: one contract, verified across every provider
+**Why:** providers now span three tiers (full/scip · tree-sitter+gate · ungated fallback) and
+eight languages, and the ablation work proved the failure mode to fear: a provider that
+*mostly* behaves — same ops, same replies — but quietly diverges on a contract point (a
+one-hop radius where transitivity is required, a stale read after commit, a "clean" claim its
+gate can't back). Each of those was caught ad-hoc by a bespoke e2e; the contract itself should
+be executable, so the NEXT provider can't ship without passing it. Architectural consistency
+(same seams) and code consistency (same shared helpers, same layout) become checked, not
+reviewed-for.
+
+- [ ] **10a — write the contract down.** One doc (`docs/provider-contract.md`) stating what
+      every `LanguageProvider` must guarantee, per tier: id scheme (`file#Scope.name` +
+      `:body`/`:params`/`:return`/`:doc` sub-nodes; field ranges span the declaration);
+      `import_graph()` edge semantics (and that syntactic graphs MUST be served transitively to
+      the gate); gate soundness (baseline-diff: pre-existing breakage never blocks, introduced
+      breakage always rejects — with the barrel/cross-package cases called out); freshness
+      (post-commit reads reflect the edit; doubt = reindex, never stale); honesty (`gated:`
+      labels match what the gate actually verified; missing toolchain = disabled-with-reason,
+      never degraded). Source: the invariants above + the trait docs + the bespoke e2e lessons.
+- [ ] **10b — the conformance suite.** A `ci-conformance` dev-crate: one battery, parameterized
+      over a provider + a per-language mini-fixture (each provider contributes its fixture; the
+      assertions are shared). Fast tier (structure/ids/graph/anchor shape — runs in CI on every
+      provider) + real-tool tier (`#[ignore]`, gates/renames/freshness against the actual
+      checker — the existing bespoke e2es fold in as instances instead of one-offs).
+- [ ] **10c — code-consistency audit + enforcement.** Every provider uses the shared spine —
+      `commit_edits`, `reverse_import_map`/`transitive_reverse_imports`, `ci-treesitter`
+      helpers, `ci_core::text` — no provider-local reimplementations (the same-file-batch and
+      byte-offset bugs both came from duplicated logic). Same crate layout
+      (`crates/langs/lang-<x>`: provider + engine + tests + sidecar bin). Checklist wired into
+      CONTRIBUTING; a `lang-template` skeleton crate so Step-1 languages (Batch 8) start
+      conformant instead of converging later.
+- [ ] **10d — run the audit.** Existing providers (ts, rust, fallback×8) through the suite;
+      every gap becomes either a fix or an explicitly documented tier limitation (the
+      T9-pre-fix kind of gap must be impossible to hold silently).
 
 ## Capability checklist for ANY new language provider (definition-of-done)
 The bar TS and Rust meet — every new provider should target all of it. The seams
