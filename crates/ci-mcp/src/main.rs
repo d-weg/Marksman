@@ -705,6 +705,31 @@ impl Server {
         if registry.providers().next().is_none() {
             return Err("no language provider available for this repo".into());
         }
+        // Rename facts (extension + old leaf name), gathered while we still own `ops`: if any
+        // group turns out UNGATED, the server re-verifies these repo-wide itself and puts the
+        // evidence in the response (see `scan_word`) — the agent must never burn turns
+        // grepping to check a rename the server can check in milliseconds.
+        let mut renames: Vec<(String, String)> = Vec::new();
+        for op in &ops {
+            if let ci_core::EditOp::Rename { node_id, .. } = op {
+                let file = file_of(node_id);
+                let leaf = node_id
+                    .rsplit('#')
+                    .next()
+                    .unwrap_or(node_id)
+                    .split(':')
+                    .next()
+                    .unwrap_or("")
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let ext = Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
+                if !leaf.is_empty() && !ext.is_empty() && !renames.contains(&(ext.clone(), leaf.clone())) {
+                    renames.push((ext, leaf));
+                }
+            }
+        }
         let mut groups: Vec<(usize, Vec<ci_core::EditOp>)> = Vec::new();
         for op in ops {
             let slot = match op_file(&op) {
@@ -798,17 +823,43 @@ impl Server {
                 changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
             )),
             // Ungated (tree-sitter fallback — or a mixed batch touching one such language):
-            // structural edit, NOT type-checked. Be honest so the agent knows to verify — and
-            // that rename was best-effort within the edited file only.
-            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => Ok(format!(
-                "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — at least one edited \
-                 language has no type-checker wired up, so those edits were NOT verified to compile, and their `rename` \
-                 rewrote matching identifiers within the edited file only (not cross-file references). Review or run the \
-                 project's own checks to confirm.\nFiles changed:\n{}",
-                if dry_run { " (dry run — nothing written yet)" } else { "" },
-                changed_files.len(),
-                changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
-            )),
+            // structural edit, NOT type-checked. Honesty stays, but the server does the
+            // verification IT can do — a repo-wide rename scan — and hands the evidence over,
+            // instead of telling the agent to go verify (which measurably costs 2-4 turns of
+            // grep/read per task: the T8 bench arm lost to baseline on exactly that).
+            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
+                let scan = if !dry_run && !renames.is_empty() {
+                    let mut lines = Vec::new();
+                    for (ext, old) in &renames {
+                        let hits = scan_word(&self.root, ext, old);
+                        if hits.is_empty() {
+                            lines.push(format!("  '{old}': no remaining occurrences in any .{ext} file ✓"));
+                        } else {
+                            lines.push(format!(
+                                "  '{old}': {} line(s) still mention it —\n    {}",
+                                hits.len(),
+                                hits.join("\n    ")
+                            ));
+                        }
+                    }
+                    format!(
+                        "\nrename verification (server-side scan of EVERY file of that language):\n{}\n\
+                         The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
+                         to verify the rename(s). Remaining mentions (if any) are comments/strings (usually fine \
+                         to leave, or update with replace_text) or cross-file references to fix per file.\n",
+                        lines.join("\n")
+                    )
+                } else {
+                    "\nRun the project's own checks if correctness is uncertain.\n".to_string()
+                };
+                Ok(format!(
+                    "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — no type-checker \
+                     is wired for the edited language(s), so the edits were NOT compile-verified.{scan}Files changed:\n{}",
+                    if dry_run { " (dry run — nothing written yet)" } else { "" },
+                    changed_files.len(),
+                    changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
+                ))
+            }
             ci_core::CommitResult::Rejected { feedback, .. } => {
                 Err(format!("rejected — nothing written:\n{feedback}"))
             }
@@ -884,6 +935,45 @@ fn render_summary(m: &Manifest) -> String {
 /// The file portion of a node id (`src/a.ts#Foo.bar:body` -> `src/a.ts`).
 fn file_of(id: &str) -> &str {
     id.split('#').next().unwrap_or(id)
+}
+
+/// Word-boundary occurrences of `name` across every `.{ext}` file (gitignore-aware) — the
+/// server-side verification behind an UNGATED rename's response. Textual truth on purpose:
+/// comments and strings count (they're exactly what an identifier rename leaves behind), and
+/// the agent gets file:line evidence instead of an instruction to go grep. Capped, one hit
+/// per line.
+fn scan_word(root: &Path, ext: &str, name: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    let is_word = |b: Option<u8>| b.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
+    for entry in ignore::WalkBuilder::new(root).build().flatten() {
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(path) else { continue };
+        let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        for (ln, line) in content.lines().enumerate() {
+            let bytes = line.as_bytes();
+            let mut start = 0;
+            while let Some(pos) = line[start..].find(name) {
+                let i = start + pos;
+                let before = if i == 0 { None } else { Some(bytes[i - 1]) };
+                let after = bytes.get(i + name.len()).copied();
+                if !is_word(before) && !is_word(after) {
+                    hits.push(format!("{rel}:{}: {}", ln + 1, line.trim()));
+                    break; // one hit per line is enough evidence
+                }
+                start = i + name.len();
+            }
+            if hits.len() >= 8 {
+                return hits;
+            }
+        }
+    }
+    hits
 }
 
 /// The file an op edits — what decides WHICH language provider handles it (`None` only for a

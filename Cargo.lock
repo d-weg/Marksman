@@ -167,6 +167,7 @@ dependencies = [
  "ci-index",
  "ci-proto",
  "ci-retrieve",
+ "ignore",
  "lang-fallback",
  "lang-rust",
  "lang-ts",

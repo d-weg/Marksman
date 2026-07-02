@@ -119,8 +119,10 @@ PREAMBLE = (
     "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__find_symbols,"
     "mcp__marksman__retrieve_context,mcp__marksman__read_node,mcp__marksman__list_anchors\"\n"
     "What they do: apply_edits (structural + surgical edits — rename / move_file / replace_text / "
-    "set_body / replace_node target:body|return|param.N / insert_member — all type-checked before they "
-    "land), find_symbols (name -> node-id handles; to disambiguate a name apply_edits called ambiguous), "
+    "set_body / replace_node target:body|return|param.N / insert_member — type-checked before landing "
+    "when the language has a checker; otherwise applied structurally and the reply carries a "
+    "server-side verification scan. TRUST the reply either way — never re-verify by hand), "
+    "find_symbols (name -> node-id handles; to disambiguate a name apply_edits called ambiguous), "
     "retrieve_context (find code by concept), read_node (one symbol's full source), list_anchors (a "
     "file's anchors).\n"
     "Then EDIT WITH THE TOOL, not grep+Edit: if the task NAMES the symbol, call apply_edits by name "
@@ -128,7 +130,7 @@ PREAMBLE = (
     "`src/http/retry.ts#parseResponse`) so it resolves in ONE call; else a bare name works and an ambiguous one "
     "just returns candidate ids to re-issue with. This holds even for "
     "a ONE-LINE change (change a default, fix a value) — use apply_edits replace_text by name; do NOT "
-    "reach for Grep/Bash/Read+Edit for a small edit. It's type-checked and needs no separate search.\n\n"
+    "reach for Grep/Bash/Read+Edit for a small edit. It's verified server-side and needs no separate search.\n\n"
     "Task: "
 )
 
