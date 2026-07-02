@@ -111,6 +111,7 @@ dependencies = [
  "ci-core",
  "lang-fallback",
  "lang-rust",
+ "lang-template",
  "lang-ts",
  "tempfile",
 ]
@@ -581,6 +582,18 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "lang-template"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "ci-edit",
+ "ci-lsp",
+ "lang-fallback",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

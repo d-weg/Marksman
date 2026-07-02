@@ -1,0 +1,16 @@
+[package]
+name = "lang-template"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The Step-1 provider skeleton: tree-sitter reads + your language's checker as the edit gate. Copy this crate to add a gated language (see docs/provider-contract.md)."
+
+[dependencies]
+ci-core = { path = "../../ci-core" }
+ci-edit = { path = "../../ci-edit" }
+ci-lsp = { path = "../../ci-lsp" }
+lang-fallback = { path = "../lang-fallback" }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

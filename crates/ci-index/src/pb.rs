@@ -237,8 +237,11 @@ pub(crate) fn encode_index(data: &IndexData) -> Vec<u8> {
     pb.encode_to_vec()
 }
 
-/// Decode `index.pb` bytes back into the store's parts (vectors/graph are rebuilt by the caller).
-pub(crate) fn decode_index(bytes: &[u8]) -> Result<(IndexMeta, Vec<SymbolEntry>, Vec<ChunkMeta>, Adjacency, Bm25Json)> {
+/// The store's decoded parts (vectors/graph are rebuilt by the caller).
+pub(crate) type DecodedIndex = (IndexMeta, Vec<SymbolEntry>, Vec<ChunkMeta>, Adjacency, Bm25Json);
+
+/// Decode `index.pb` bytes back into the store's parts.
+pub(crate) fn decode_index(bytes: &[u8]) -> Result<DecodedIndex> {
     let pb = PbIndex::decode(bytes).map_err(|e| Error::Other(format!("index.pb decode: {e} — re-run `index`")))?;
     let m = pb.meta.ok_or_else(|| Error::Other("index.pb has no meta — re-run `index`".into()))?;
     let meta = IndexMeta {

@@ -217,9 +217,9 @@ impl TsProvider {
         // run, so the conservative pre-run guarantee narrows to just these hidden files.
         let mut fp = fp;
         for doc in provider.scip.documents() {
-            if !fp.contains_key(&doc) {
-                if let Some(h) = hash_file(&root.join(&doc)) {
-                    fp.insert(doc, h);
+            if let std::collections::btree_map::Entry::Vacant(slot) = fp.entry(doc) {
+                if let Some(h) = hash_file(&root.join(slot.key())) {
+                    slot.insert(h);
                 }
             }
         }

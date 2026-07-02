@@ -369,7 +369,7 @@ fn enclosing_symbol(nodes: &[Node], line: u32) -> Option<String> {
         for n in nodes {
             if n.name.is_some() && n.range.start_line <= line && line <= n.range.end_line {
                 let span = n.range.end_line - n.range.start_line;
-                if best.map_or(true, |(_, s)| span <= s) {
+                if best.is_none_or(|(_, s)| span <= s) {
                     *best = Some((n, span));
                 }
             }

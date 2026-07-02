@@ -315,6 +315,44 @@ fn conformance_rust_reads() {
     );
 }
 
+// The Step-1 SKELETON (lang-template) through the same battery, gated by its mock checker:
+// a copied crate starts conformant — reads, anchors, edit atomicity, and a gate that rejects
+// what its checker flags — before the real checker is wired in.
+#[test]
+fn conformance_template() {
+    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+        Box::new(lang_template::GatedTreeSitter::new(root, FbLang::Go, lang_template::mock::factory()))
+    });
+    run_read_battery(
+        &mk,
+        &ReadFixture {
+            label: "template/go+mock-gate",
+            files: &[(
+                "svc.go",
+                "package svc\n\n// Latency bucket.\ntype Bucket struct {\n\tp99 float64\n}\n\nfunc Probe(url string) bool {\n\treturn true\n}\n",
+            )],
+            target: "svc.go",
+            want_ids: &["svc.go#Bucket", "svc.go#Probe"],
+            fn_symbol: "svc.go#Probe",
+            expect_params: true,
+            doc_symbol: Some("svc.go#Bucket"),
+            edge: None,
+            expect_gated: true,
+        },
+    );
+    run_edit_battery(
+        &mk,
+        &EditFixture {
+            label: "template/go+mock-gate",
+            files: &[("svc.go", "package svc\n\nfunc Probe(url string) bool {\n\treturn true\n}\n")],
+            target_symbol: "svc.go#Probe",
+            clean: ("return true", "return false"),
+            // The mock checker flags this marker — the reject here is the GATE, not the parser.
+            breaks: ("return true", "return true // TEMPLATE_TYPE_ERROR"),
+        },
+    );
+}
+
 // Real-tool tier: the product TS provider (scip-typescript via npx).
 // `cargo test -p ci-conformance -- --ignored`
 #[test]
