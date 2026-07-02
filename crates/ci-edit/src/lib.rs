@@ -842,7 +842,46 @@ pub fn commit_edits(
     // phantom state produce wrong spans (silently, when name lengths happen to match).
     engine.sync_disk()?;
 
-    for (i, op) in ops.iter().enumerate() {
+    // Structural ops resolve their spans from PRE-batch `structure_of` (disk truth), so within
+    // one file an edit higher up shifts the disk-truth span of every op below it — and the tool's
+    // own reject flow invites exactly that batch (a schema op + its ready-to-copy fixes, one of
+    // which may sit in the same file, e.g. a default-constructor right under its interface).
+    // Apply same-file structural ops BOTTOM-UP (descending node start), the same trick the rename
+    // path uses for its workspace edits: every disk-truth span stays valid. Only contiguous runs
+    // of structural ops are permuted — rename/move/delete/create keep their stated order — and
+    // rejections report the op's ORIGINAL index.
+    let is_structural = |op: &EditOp| {
+        !matches!(
+            op,
+            EditOp::Rename { .. } | EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } | EditOp::CreateFile { .. }
+        )
+    };
+    let mut order: Vec<usize> = (0..ops.len()).collect();
+    let mut lo = 0;
+    while lo < order.len() {
+        if !is_structural(&ops[order[lo]]) {
+            lo += 1;
+            continue;
+        }
+        let mut hi = lo;
+        while hi < order.len() && is_structural(&ops[order[hi]]) {
+            hi += 1;
+        }
+        // Stable sort: (file, descending start). An op whose node doesn't resolve keeps a neutral
+        // key — it will reject at apply time with its own error regardless of position.
+        order[lo..hi].sort_by_cached_key(|&k| {
+            op_node_id(&ops[k])
+                .and_then(|id| {
+                    find(&structure_of(file_of(id)), id)
+                        .map(|n| (file_of(id).to_string(), std::cmp::Reverse(n.range.start_line)))
+                })
+                .unwrap_or_else(|| (String::new(), std::cmp::Reverse(0)))
+        });
+        lo = hi;
+    }
+
+    for i in order {
+        let op = &ops[i];
         // Trust boundary: reject before any VFS mutation if the op targets a path outside the repo.
         for p in op_paths(op) {
             if let Err(e) = ensure_within_root(root, &p) {
@@ -1495,6 +1534,56 @@ mod tests {
         assert!(feedback.contains(r#""oldText":"id: symbolId(name),""#), "fix anchor: {feedback}");
         // Nothing was written — the reject left disk untouched.
         assert!(!fs::read_to_string(root.join("a.ts")).unwrap().contains("nameLower"));
+    }
+
+    // A same-file batch (the reject-then-batch flow: a schema op + a ready fix whose site lives
+    // in the SAME file, e.g. a default-constructor right under its interface): every op's span
+    // comes from PRE-batch disk truth, so commit_edits must apply same-file structural ops
+    // bottom-up or the top op shifts the lower op's span and the batch corrupts.
+    #[test]
+    fn same_file_batch_applies_bottom_up_so_disk_truth_spans_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("a.ts"),
+            "export interface Policy {\n  name: string;\n}\n\nexport function defaultPolicy(): Policy {\n  return { name: \"x\" };\n}\n",
+        )
+        .unwrap();
+
+        let structure_of = |f: &str| {
+            if f != "a.ts" {
+                return vec![];
+            }
+            let mut iface = fn_node("a.ts", "Policy", 1, 3);
+            iface.kind = NodeKind::Symbol(SymbolKind::Interface);
+            let mut func = fn_node("a.ts", "defaultPolicy", 5, 7);
+            let mut body = fn_node("a.ts", "defaultPolicy:body", 5, 7);
+            body.id = "a.ts#defaultPolicy:body".into();
+            body.range = Range { start_line: 5, start_char: 40, end_line: 7, end_char: 1 };
+            func.children = vec![body];
+            vec![iface, func]
+        };
+        let no_imports = |_: &str| Vec::<String>::new();
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        let res = commit_edits(
+            root,
+            &[
+                // Stated top-first — the order an agent naturally writes (schema op, then fixes).
+                EditOp::InsertMember { node_id: "a.ts#Policy".into(), code: "burst: number;".into() },
+                EditOp::InsertInBody { node_id: "a.ts#defaultPolicy".into(), code: "void 0;".into(), after: None },
+            ],
+            &structure_of,
+            &mut NoopEngine,
+            &opts,
+            &no_imports,
+        )
+        .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "same-file batch must commit: {res:?}");
+        let out = fs::read_to_string(root.join("a.ts")).unwrap();
+        assert!(out.contains("{\n  burst: number;\n  name: string;\n}"), "member landed first in the block:\n{out}");
+        assert!(out.contains("void 0;"), "body insert landed:\n{out}");
+        assert!(out.contains("return { name: \"x\" };"), "function body intact:\n{out}");
     }
 
     #[test]

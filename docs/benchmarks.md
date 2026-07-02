@@ -200,7 +200,7 @@ collector's missing field anchors — a fallback bug fixed after this run, not a
 limit. Most telling: **T5's reject-driven flow worked identically** (4 turns) — the syntactic
 relative-import graph found the same blast radius, because this repo imports directly. SCIP's
 semantic edges would only separate on barrel re-exports / large-repo ambiguity, which this
-suite doesn't contain. **On tasks like these, the compiler GATE carries the value; the SCIP
+suite doesn't contain (T9-barrel below was designed to test exactly that). **On tasks like these, the compiler GATE carries the value; the SCIP
 read path is margin insurance.**
 
 **Pure tree-sitter LOSES on a typed language.** T1 failed, T5 failed (no compiler = no
@@ -214,6 +214,43 @@ syntactic move importer-rewrite; T1/T6 would improve with the same fixes; T5 wou
 semantic margin is exactly the un-benched cases: barrels, re-exports, big repos), keep
 `treesitter-gated` as a supported zero-dependency-at-startup mode, and never present the
 ungated tier as adequate for a language that has a compiler.
+
+### T9-barrel — putting SCIP's claimed margin on the bench (designed, run pending)
+
+The ablation's verdict leaned on an un-benched claim: SCIP's value is barrels/re-exports.
+T9 tests exactly that. `fixture-barrels` is a small TS repo where every consumer imports
+`QuotaPolicy` **through a barrel** (`core/index.ts` re-exporting `export *`), plus one direct
+importer as a control; the task is T5-shaped (add a required field, update every construction
+site).
+
+The mechanism under test, verified end-to-end before the run (the
+`barrel_consumer_inside_scip_blast_radius_outside_syntactic` e2e in lang-ts): the edit gate
+expands **one** reverse-import hop, and one hop only reaches a barrel consumer if the graph
+flattens the barrel. SCIP's semantic graph does — the consumer edges directly to `policy.ts`,
+so the reject enumerates every construction site with ready fixes. The syntactic graph
+(`CI_TS_MODE=treesitter-gated`) edges the consumer to the barrel; the barrel itself never
+errors on a new required interface field, so the consumers sit *outside* the gate — and the
+commit claims clean while `tsc` fails. That is treesitter-gated's honest residual: not extra
+turns, a **false "type-checked" claim**.
+
+Pre-registered predictions (single runs, turns as the robust column):
+
+- `full`: T5-like — one reject enumerating all 5 sites, one fix batch; ~4-5 turns, beats baseline.
+- `treesitter-gated`: the gate rejects only the same-file + direct-import sites; if the agent
+  trusts the (false) clean commit, **ok=False**; if it re-verifies by hand, it pays baseline-like
+  turns. Either way, worse than full — the first task where the two gated modes separate.
+- baseline: fine (tsc sees everything), at its usual grep + typecheck-iterate cost.
+
+Run: `bash scripts/agent-bench/go.sh --task T9-barrel --runs 3`, then the same with
+`CI_TS_MODE=treesitter-gated --arms rust`. If treesitter-gated *doesn't* degrade, the honest
+conclusion flips: SCIP would be margin nobody measured a need for, and the gated mode's
+blast radius should go transitive instead.
+
+(Designing T9 also surfaced a real batching bug, now fixed with a regression test: structural
+ops resolve spans from pre-batch disk truth, so a schema op + a ready fix in the SAME file —
+a default-constructor under its interface — corrupted each other. `commit_edits` now applies
+same-file structural ops bottom-up, the same descending-span trick the rename path already
+used.)
 
 ### T8-fallback — the generic (UNGATED) provider, and a lesson in tool ergonomics
 

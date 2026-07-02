@@ -614,6 +614,94 @@ mod tests {
         assert!(!fs::read_to_string(root.join("src/math.ts")).unwrap().contains("add"), "definition renamed");
     }
 
+    // The barrel blast-radius claim, verified end-to-end (this is what bench task T9 measures):
+    // the gate expands ONE reverse-import hop, so it only reaches a consumer importing through a
+    // barrel (`export *`) if the graph flattens the barrel. SCIP's semantic graph does — the
+    // consumer edges DIRECTLY to the defining file, and adding a required interface field rejects
+    // naming the consumer's construction site. The syntactic graph does not: the consumer edges to
+    // the barrel, the barrel itself never errors on a new required field, and the same edit
+    // COMMITS "clean" while the consumer no longer compiles — the accepted residual of
+    // treesitter-gated mode. #[ignore]; `cargo test -p lang-ts -- --ignored`.
+    #[test]
+    #[ignore]
+    fn barrel_consumer_inside_scip_blast_radius_outside_syntactic() {
+        let write_fixture = |root: &Path| {
+            fs::create_dir_all(root.join("src/core")).unwrap();
+            fs::write(
+                root.join("tsconfig.json"),
+                r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true},"include":["src"]}"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/core/policy.ts"),
+                "export interface QuotaPolicy {\n  name: string;\n  limit: number;\n}\n\nexport function defaultPolicy(name: string): QuotaPolicy {\n  return { name, limit: 100 };\n}\n",
+            )
+            .unwrap();
+            fs::write(root.join("src/core/index.ts"), "export * from \"./policy\";\n").unwrap();
+            fs::write(
+                root.join("src/app.ts"),
+                "import { QuotaPolicy } from \"./core\";\nexport const anon: QuotaPolicy = { name: \"anon\", limit: 20 };\n",
+            )
+            .unwrap();
+        };
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let burst = EditOp::InsertMember { node_id: "src/core/policy.ts#QuotaPolicy".into(), code: "burst: number;".into() };
+
+        // FULL (scip): the barrel is flattened — app.ts edges directly to policy.ts — so the
+        // one-hop gate reaches the consumer and the reject names its construction site.
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let full = TsProvider::index(dir.path()).expect("scip-typescript indexing");
+        let g = full.import_graph().unwrap();
+        let app_edges = g.get(&PathBuf::from("src/app.ts")).expect("app.ts edges");
+        assert!(
+            app_edges.contains(&PathBuf::from("src/core/policy.ts")),
+            "scip graph must flatten the barrel: {app_edges:?}"
+        );
+        match full.apply_edits(std::slice::from_ref(&burst), &opts).unwrap() {
+            CommitResult::Rejected { feedback, .. } => {
+                assert!(feedback.contains("src/app.ts"), "reject must name the barrel consumer:\n{feedback}")
+            }
+            other => panic!("required field through a barrel must reject in full mode: {other:?}"),
+        }
+
+        // TREESITTER-GATED (syntactic graph): app.ts edges to the barrel, not policy.ts. The
+        // same edit still rejects — but only for policy.ts's own literal, blind to app.ts.
+        let dir2 = tempfile::tempdir().unwrap();
+        write_fixture(dir2.path());
+        let gated = TsTreeGated::new(dir2.path());
+        let g = gated.import_graph().unwrap();
+        let app_edges = g.get(&PathBuf::from("src/app.ts")).expect("app.ts edges");
+        assert!(
+            !app_edges.contains(&PathBuf::from("src/core/policy.ts")),
+            "syntactic graph must NOT flatten the barrel (else this test guards nothing): {app_edges:?}"
+        );
+        match gated.apply_edits(std::slice::from_ref(&burst), &opts).unwrap() {
+            CommitResult::Rejected { feedback, .. } => {
+                assert!(!feedback.contains("src/app.ts"), "the syntactic radius shouldn't see app.ts:\n{feedback}")
+            }
+            other => panic!("policy.ts's own literal must still reject: {other:?}"),
+        }
+        // Fix only what that reject showed (the same-file literal). The commit then claims
+        // clean — while app.ts's literal lacks the new required field, i.e. tsc now fails.
+        // This under-gating is treesitter-gated's documented residual, NOT a bug to fix here;
+        // if it ever stops reproducing (e.g. the gate goes transitive), rejoice and update this.
+        let fix_and_burst = [
+            burst,
+            EditOp::ReplaceNode {
+                node_id: "src/core/policy.ts#defaultPolicy".into(),
+                // The fallback node range starts at `function` — the `export` keyword stays.
+                code: "function defaultPolicy(name: string): QuotaPolicy {\n  return { name, limit: 100, burst: 0 };\n}".into(),
+            },
+        ];
+        match gated.apply_edits(&fix_and_burst, &opts).unwrap() {
+            CommitResult::Ok { .. } => {}
+            other => panic!("gated mode can't see the barrel consumer, so this must commit: {other:?}"),
+        }
+        let app = fs::read_to_string(dir2.path().join("src/app.ts")).unwrap();
+        assert!(!app.contains("burst"), "consumer untouched — committed 'clean' with a broken importer");
+    }
+
     // Real end-to-end for the post-edit read refresh (scip-typescript + node + ts-morph):
     // WITHOUT re-running the indexer, a committed edit must make (a) a NEW symbol visible to
     // structure() — impossible before, reanchor can't invent nodes — and (b) a NEW file's
