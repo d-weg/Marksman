@@ -265,7 +265,22 @@ half is FIXED: `treesitter-gated` now serves the gate the **transitive** reverse
 pinned the false-clean now asserts the reject reaches through the barrel, a partial fix still
 blocks, and only the complete batch commits. Scip mode keeps the cheaper one-hop radius (its
 semantic graph is already flattened). The T9 numbers above describe the pre-fix behavior —
-they're what justified the fix.
+they're what justified the fix. Post-fix rerun: gated passes T9 at 6 turns / $0.128 —
+identical trajectory to full. On a single-package repo the two are now equivalent even on
+barrels; what a small fixture *cannot* measure is radius precision at scale (a transitive
+syntactic closure over-approximates — see the monorepo caveat below), which is where scip's
+true-reference edges are still expected to pay.
+
+**Monorepo caveat (un-benched, but structural):** the syntactic resolver follows only
+RELATIVE specifiers — a bare `@acme/core` import is a package to it, so a workspace monorepo's
+syntactic graph has **zero cross-package edges** and no transitive closure can recover them:
+the gated mode's radius stops at the package boundary, which is exactly where a monorepo's
+blast radius lives. SCIP resolves workspace/paths aliases into true cross-package reference
+edges. Separately, at scale the transitive closure OVER-approximates (one barrel re-exporting
+50 modules puts every importer of any of them in every edit's radius — gate latency grows with
+repo size), while scip's one-hop set stays bounded by actual referencers. Both effects point
+the same way: on big/monorepo TS, `full` isn't margin, it's load-bearing — pending a T10-style
+fixture to measure it.
 
 (Designing T9 also surfaced a real batching bug, now fixed with a regression test: structural
 ops resolve spans from pre-batch disk truth, so a schema op + a ready fix in the SAME file —
