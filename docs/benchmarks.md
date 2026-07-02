@@ -284,6 +284,37 @@ self-contained so scip was unaffected — on dependency-heavy repos, install fir
 finding). Agent-level A/B on external repos needs repo-specific tasks with objective checks —
 the harness takes `--repo`, tasks live in `scripts/agent-bench/tasks.json`.
 
+### Composition with a context-compression proxy (Headroom, measured)
+
+Marksman and token-compression proxies attack different waste, so we measured the
+composition: the full 10-task suite through [Headroom](https://github.com/headroomlabs-ai/headroom)
+0.28 (`headroom proxy` + `ANTHROPIC_BASE_URL`), single runs vs two same-day unwrapped controls.
+
+| arm | $ (wrapped) | $ (controls) | success |
+|---|--:|--:|--:|
+| baseline | 1.4604 | 1.0090 / 1.1391 | 10/10 |
+| rust (Marksman) | 0.5909 | 0.6470 / 0.7056 | 10/10 |
+
+- **No protocol breakage.** All 20 wrapped tasks passed, including the reject-driven T5/T9/T10.
+  The proxy's own router explains why: it *protects error outputs* and skips small content and
+  tool schemas — Marksman's responses (small, dense, error-anchored, verbatim-executable) are
+  exactly the content classes a well-behaved compressor leaves alone. Structurally disjoint.
+- **No measurable saving on this suite.** Headroom's own accounting: 5.2% of input tokens
+  compressed ($0.07) — 40 of 116 requests had nothing compressible. This suite's contexts are
+  2–4k tokens/request and its cost driver is TURNS, which compression cannot reduce; run-level
+  $ differences are trajectory noise (the wrapped baseline drew expensive T6/T9 runs).
+- **Where composition WOULD pay:** the proxy's single best hit (15.4k → 4.1k tokens, −73%) was
+  a baseline whole-file read — the waste class Marksman eliminates at the source and Headroom
+  compresses after the fact. On long sessions / big files (a `checker.ts` read is ~50k lines),
+  a grep-and-read agent benefits from compression; a Marksman agent mostly never emits the
+  dumps in the first place.
+
+Caveats: single runs; `in_tok` is not comparable across wrapped/unwrapped arms (proxy cache
+alignment shifts the cache-write/read mix); the wrapped rust arm posted unusually LOW turn
+counts (2-turn renames) — correct but unexplained, not claimed. Recipe:
+`headroom proxy --port 8787`, a shim exporting `ANTHROPIC_BASE_URL`, `CLAUDE_BIN=<shim> go.sh …`
+(go.sh honors a pre-set `CLAUDE_BIN` and exports `CLAUDE_REAL` for the shim).
+
 ### Retrieval overlap vs the Node prototype (Jaccard, per task)
 
 | task | rust | node | shared | Jaccard |
