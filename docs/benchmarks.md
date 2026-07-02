@@ -181,10 +181,25 @@ servers; future runs can't leak.
   improved retrieval and edit-workflow design, not only Rust speed. And it is **TypeScript-only**
   by design — its totals exclude T7 (see the table note).
 
-**Pending — T8-fallback.** The suite now also carries a task for the GENERIC tree-sitter
-fallback provider: a Python and a Go rename in one session (neither language has a native
-integration; edits are structural and honestly reported `gated: false`). Not yet measured —
-run `bash scripts/agent-bench/go.sh --task T8-fallback --runs 3` and add the row here.
+### T8-fallback — the generic (UNGATED) provider, and a lesson in tool ergonomics
+
+T8 exercises the generic tree-sitter fallback: a Python and a Go rename in one session —
+neither language has a native integration, edits are structural and honestly `gated: false`.
+Measured separately (single runs, 2026-07-02), it took **three iterations of the tool's
+RESPONSE design** to win, which is the real result:
+
+| response design | baseline $ | rust $ | rust turns | outcome |
+|---|--:|--:|--:|---|
+| v1: "…review or run the project's own checks" | 0.0957 | 0.1183 | 10 | **loses +24%** — the agent pays for the tool, then re-verifies by hand like a baseline agent |
+| v2: + server-side rename scan (file:line evidence, "do NOT grep") | 0.1679 | 0.1202 | 9 | −28% — but 3 failed attempts to fix a flagged comment (the agent anchored by the now-gone OLD name) before a native-tool fallback |
+| v3: + every scan hit carries a **verbatim-executable `fix:` action** (enclosing symbol, post-rename id) | 0.1688 | **0.0622** | **5** | **−63% $ / −58% out / −41% sec**, 1/1 |
+
+Final trajectory: ToolSearch → renames → one verbatim fix re-issue. The transferable
+principle (same mechanism as T5's reject-driven fixes): **a tool response that leaves the
+agent any "check it yourself" or "figure out the addressing" step is a design bug — do the
+check server-side, inline the evidence, and make every suggested follow-up copy-paste
+executable.** Response tokens are cheap (cached input); turns are expensive (full-context
+resend + output).
 
 Reproduce: `bash scripts/agent-bench/go.sh --runs 3` (needs `$ANTHROPIC_API_KEY`; rebuilds the
 release binaries first, so results always reflect the current source). Add
