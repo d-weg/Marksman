@@ -28,6 +28,18 @@ pub struct LspClient {
     next_id: i64,
     /// uri -> current document version (for didOpen vs didChange).
     open: HashMap<String, i64>,
+    /// Server supports LSP 3.17 pull diagnostics (`textDocument/diagnostic`). Preferred over
+    /// the publish path: request/response semantics, so the gate can never mistake a slow
+    /// server for a clean file (the publish path settles on silence — a race under load).
+    pull_diagnostics: bool,
+    /// Server sends `experimental/serverStatus` (rust-analyzer, when we advertise the client
+    /// capability). Until it reports `quiescent`, a pull can return legitimately-EMPTY results
+    /// (the file belongs to no loaded crate yet), so the first pull must wait for quiescence.
+    saw_server_status: bool,
+    quiescent: bool,
+    /// One-time grace window granted, so the first pull can't race the server's FIRST
+    /// serverStatus notification (sent moments after `initialized`) and skip the wait.
+    status_grace_done: bool,
 }
 
 impl LspClient {
@@ -48,19 +60,35 @@ impl LspClient {
         let (tx, rx) = channel::<Value>();
         std::thread::spawn(move || reader_loop(stdout, tx));
 
-        let mut client = LspClient { child, stdin, rx, root: root.to_path_buf(), next_id: 1, open: HashMap::new() };
+        let mut client = LspClient {
+            child,
+            stdin,
+            rx,
+            root: root.to_path_buf(),
+            next_id: 1,
+            open: HashMap::new(),
+            pull_diagnostics: false,
+            saw_server_status: false,
+            quiescent: false,
+            status_grace_done: false,
+        };
 
         let init = json!({
             "processId": null,
             "rootUri": file_uri(root),
             "capabilities": {
-                "textDocument": { "publishDiagnostics": {}, "synchronization": {} },
+                "textDocument": { "publishDiagnostics": {}, "synchronization": {}, "diagnostic": {} },
                 "workspace": { "fileOperations": { "willRename": true } },
+                "experimental": { "serverStatusNotification": true },
             },
             "workspaceFolders": [ { "uri": file_uri(root), "name": "root" } ],
         });
         let id = client.send_request("initialize", init)?;
-        client.pump_until_response(id, Duration::from_secs(60))?;
+        let resp = client.pump_until_response(id, Duration::from_secs(60))?;
+        client.pull_diagnostics = resp
+            .pointer("/result/capabilities/diagnosticProvider")
+            .map(|v| !v.is_null())
+            .unwrap_or(false);
         client.send_notification("initialized", json!({}))?;
         Ok(client)
     }
@@ -96,6 +124,10 @@ impl LspClient {
             }
         }
 
+        if self.pull_diagnostics {
+            return self.pull_diagnostics_for(&uri_to_rel);
+        }
+
         let targets: HashSet<String> = uri_to_rel.keys().cloned().collect();
         let mut store: HashMap<String, Vec<Value>> = HashMap::new();
         let mut seen: HashSet<String> = HashSet::new();
@@ -120,6 +152,7 @@ impl LspClient {
             }
             match self.rx.recv_timeout(remaining.min(tick)) {
                 Ok(msg) => {
+                    self.observe(&msg);
                     quiet_since = Instant::now(); // any server activity resets the silence timer
                     let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
                     if method == "textDocument/publishDiagnostics" {
@@ -162,23 +195,59 @@ impl LspClient {
         let mut out = Vec::new();
         for (uri, rel) in &uri_to_rel {
             for d in store.get(uri).into_iter().flatten() {
-                if d.get("severity").and_then(|s| s.as_i64()).unwrap_or(1) != 1 {
-                    continue; // errors only
+                if let Some(diag) = error_diag(rel, d) {
+                    out.push(diag);
                 }
-                let code = d
-                    .get("code")
-                    .and_then(|c| c.as_i64().or_else(|| c.as_str().and_then(|s| s.parse().ok())))
-                    .unwrap_or(0);
-                let message = d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
-                let line = d
-                    .get("range")
-                    .and_then(|r| r.get("start"))
-                    .and_then(|s| s.get("line"))
-                    .and_then(|l| l.as_i64())
-                    .unwrap_or(0) as u32
-                    + 1;
-                out.push(Diag { file: rel.clone(), code, message, line });
             }
+        }
+        Ok(out)
+    }
+
+    /// LSP 3.17 pull diagnostics: one `textDocument/diagnostic` request per target. The response
+    /// is computed for the exact content we just pushed — no settle heuristics, so a slow server
+    /// stalls the gate (recoverable timeout) instead of slipping a broken edit through. Transient
+    /// "still loading / content modified" errors are retried until the deadline.
+    fn pull_diagnostics_for(&mut self, uri_to_rel: &HashMap<String, String>) -> Result<Vec<Diag>> {
+        let timing = std::env::var("CI_TIMING").is_ok();
+        let t_diag = Instant::now();
+        // Cold-server guard: before the workspace is loaded, a pull returns legitimately-EMPTY
+        // diagnostics (the file belongs to no crate yet) — the one way a broken edit could still
+        // slip through the pull path. Wait for quiescence first when the server reports status.
+        self.wait_quiescent(Instant::now() + Duration::from_secs(120))?;
+        let mut out = Vec::new();
+        for (uri, rel) in uri_to_rel {
+            // Generous: the FIRST pull can block on the cold project load (rust-analyzer queues
+            // the request until the workspace is ready); warm pulls are sub-second.
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let id = self.send_request(
+                    "textDocument/diagnostic",
+                    json!({ "textDocument": { "uri": uri } }),
+                )?;
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let resp = self.pump_until_response(id, remaining.max(Duration::from_secs(1)))?;
+                if let Some(err) = resp.get("error") {
+                    let msg = err.to_string().to_lowercase();
+                    let transient = msg.contains("content modified")
+                        || msg.contains("-32801")
+                        || msg.contains("loading")
+                        || msg.contains("not ready");
+                    if transient && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(150));
+                        continue;
+                    }
+                    return Err(Error::Driver(format!("lsp textDocument/diagnostic error: {err}")));
+                }
+                for d in resp.pointer("/result/items").and_then(|i| i.as_array()).into_iter().flatten() {
+                    if let Some(diag) = error_diag(rel, d) {
+                        out.push(diag);
+                    }
+                }
+                break;
+            }
+        }
+        if timing {
+            eprintln!("[timing]   diagnostics() {:?} via pull ({} files)", t_diag.elapsed(), uri_to_rel.len());
         }
         Ok(out)
     }
@@ -195,6 +264,59 @@ impl LspClient {
 
     // ── internals ──────────────────────────────────────────────────────────
 
+    /// Track `experimental/serverStatus` notifications (rust-analyzer): `quiescent` flips true
+    /// once initial analysis is done. Must be called on every message every receive loop sees,
+    /// or a status update read by one loop is lost to the others.
+    fn observe(&mut self, msg: &Value) {
+        if msg.get("method").and_then(|m| m.as_str()) == Some("experimental/serverStatus") {
+            self.saw_server_status = true;
+            self.quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
+        }
+    }
+
+    /// Block until a status-reporting server (rust-analyzer) is quiescent. No-op for servers
+    /// that never sent `experimental/serverStatus` (tsls): their pulls are request-scoped and
+    /// don't depend on a background workspace load.
+    fn wait_quiescent(&mut self, deadline: Instant) -> Result<()> {
+        if !self.saw_server_status && !self.status_grace_done {
+            let grace = Instant::now() + Duration::from_secs(3);
+            while !self.saw_server_status && Instant::now() < grace {
+                match self.rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(msg) => {
+                        self.observe(&msg);
+                        if msg.get("id").is_some() && msg.get("method").is_some() {
+                            self.reply_server_request(&msg)?;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return Err(Error::Driver("lsp server disconnected".into()))
+                    }
+                }
+            }
+            self.status_grace_done = true;
+        }
+        while self.saw_server_status && !self.quiescent {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(Error::Driver("lsp server not quiescent before deadline".into()));
+            }
+            match self.rx.recv_timeout(remaining.min(Duration::from_millis(300))) {
+                Ok(msg) => {
+                    self.observe(&msg);
+                    if msg.get("id").is_some() && msg.get("method").is_some() {
+                        self.reply_server_request(&msg)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(Error::Driver("lsp server disconnected".into()))
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn pump_until_response(&mut self, id: i64, timeout: Duration) -> Result<Value> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -204,6 +326,7 @@ impl LspClient {
             }
             match self.rx.recv_timeout(remaining.min(Duration::from_secs(5))) {
                 Ok(msg) => {
+                    self.observe(&msg);
                     let is_resp = msg.get("id").map(|v| v == &json!(id)).unwrap_or(false)
                         && (msg.get("result").is_some() || msg.get("error").is_some());
                     if is_resp {
@@ -266,6 +389,26 @@ impl Drop for LspClient {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// An LSP `Diagnostic` JSON value -> `Diag`, errors only (`None` for warnings/hints).
+fn error_diag(rel: &str, d: &Value) -> Option<Diag> {
+    if d.get("severity").and_then(|s| s.as_i64()).unwrap_or(1) != 1 {
+        return None; // errors only
+    }
+    let code = d
+        .get("code")
+        .and_then(|c| c.as_i64().or_else(|| c.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0);
+    let message = d.get("message").and_then(|m| m.as_str()).unwrap_or("").to_string();
+    let line = d
+        .get("range")
+        .and_then(|r| r.get("start"))
+        .and_then(|s| s.get("line"))
+        .and_then(|l| l.as_i64())
+        .unwrap_or(0) as u32
+        + 1;
+    Some(Diag { file: rel.to_string(), code, message, line })
 }
 
 /// Read framed LSP messages (`Content-Length: N\r\n\r\n<json>`) onto the channel.
