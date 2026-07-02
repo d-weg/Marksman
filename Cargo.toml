@@ -19,6 +19,7 @@ members = [
     "crates/ci-edit",
     "crates/ci-arch",
     "crates/ci-mcp",
+    "crates/ci-conformance",
 ]
 
 # Member crates are added here as each phase lands, so `cargo build` stays green.

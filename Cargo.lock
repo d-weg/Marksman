@@ -105,6 +105,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ci-conformance"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "lang-fallback",
+ "lang-rust",
+ "lang-ts",
+ "tempfile",
+]
+
+[[package]]
 name = "ci-core"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,15 @@
+[package]
+name = "ci-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Provider conformance suite: one executable contract every LanguageProvider must pass (see docs/provider-contract.md)."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+lang-fallback = { path = "../langs/lang-fallback" }
+lang-rust = { path = "../langs/lang-rust" }
+lang-ts = { path = "../langs/lang-ts" }

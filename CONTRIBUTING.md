@@ -29,6 +29,18 @@ The `#[ignore]` tier spawns the real external tools and needs network on first r
 fetches). **Run the relevant e2e suite before sending a PR that touches a provider, the edit
 gate, or ci-lsp** — the unit tier deliberately cannot see integration regressions there.
 
+Providers additionally pass the **conformance suite** — the executable form of
+[docs/provider-contract.md](docs/provider-contract.md):
+
+```bash
+cargo test -p ci-conformance               # every provider × the shared contract battery (CI)
+cargo test -p ci-conformance -- --ignored  # + the providers that shell out (scip-typescript)
+```
+
+Touching a provider means keeping its conformance instance green; adding a language means
+adding its fixtures to `ci-conformance/tests/conformance.rs` — that, not review, is what
+guarantees providers stay consistent.
+
 House rules encoded in the tests, worth knowing before you change behavior:
 
 - **Never serve stale reads.** Indexes are fingerprinted; any doubt reindexes or refuses —

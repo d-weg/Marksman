@@ -274,40 +274,26 @@ existing hub/expansion tests plus the eval are the gate.
       ranked map (AGF's ~1k-token repo map), reusing 9b, no recompute. Keep it a data addition to the
       `ci-arch` output; defer if it grows the schema.
 
-### Batch 10 — Provider conformance: one contract, verified across every provider
-**Why:** providers now span three tiers (full/scip · tree-sitter+gate · ungated fallback) and
-eight languages, and the ablation work proved the failure mode to fear: a provider that
-*mostly* behaves — same ops, same replies — but quietly diverges on a contract point (a
-one-hop radius where transitivity is required, a stale read after commit, a "clean" claim its
-gate can't back). Each of those was caught ad-hoc by a bespoke e2e; the contract itself should
-be executable, so the NEXT provider can't ship without passing it. Architectural consistency
-(same seams) and code consistency (same shared helpers, same layout) become checked, not
-reviewed-for.
-
-- [ ] **10a — write the contract down.** One doc (`docs/provider-contract.md`) stating what
-      every `LanguageProvider` must guarantee, per tier: id scheme (`file#Scope.name` +
-      `:body`/`:params`/`:return`/`:doc` sub-nodes; field ranges span the declaration);
-      `import_graph()` edge semantics (and that syntactic graphs MUST be served transitively to
-      the gate); gate soundness (baseline-diff: pre-existing breakage never blocks, introduced
-      breakage always rejects — with the barrel/cross-package cases called out); freshness
-      (post-commit reads reflect the edit; doubt = reindex, never stale); honesty (`gated:`
-      labels match what the gate actually verified; missing toolchain = disabled-with-reason,
-      never degraded). Source: the invariants above + the trait docs + the bespoke e2e lessons.
-- [ ] **10b — the conformance suite.** A `ci-conformance` dev-crate: one battery, parameterized
-      over a provider + a per-language mini-fixture (each provider contributes its fixture; the
-      assertions are shared). Fast tier (structure/ids/graph/anchor shape — runs in CI on every
-      provider) + real-tool tier (`#[ignore]`, gates/renames/freshness against the actual
-      checker — the existing bespoke e2es fold in as instances instead of one-offs).
-- [ ] **10c — code-consistency audit + enforcement.** Every provider uses the shared spine —
-      `commit_edits`, `reverse_import_map`/`transitive_reverse_imports`, `ci-treesitter`
-      helpers, `ci_core::text` — no provider-local reimplementations (the same-file-batch and
-      byte-offset bugs both came from duplicated logic). Same crate layout
-      (`crates/langs/lang-<x>`: provider + engine + tests + sidecar bin). Checklist wired into
-      CONTRIBUTING; a `lang-template` skeleton crate so Step-1 languages (Batch 8) start
+### Provider conformance — one contract, verified across every provider  ✅ (pre-OSS gate, shipped)
+**Why:** providers span three tiers (full/scip · tree-sitter+gate · ungated fallback) and
+eight+ languages, and the ablation work proved the failure mode to fear: a provider that
+*mostly* behaves but quietly diverges on a contract point (a one-hop radius where transitivity
+is required, a stale read after commit, a "clean" claim its gate can't back). The contract is
+now executable — the NEXT provider can't ship without passing it.
+- [x] **The contract**: [docs/provider-contract.md](provider-contract.md) — identity/addressing,
+      reads, graph semantics (syntactic graphs served TRANSITIVELY to the gate), edit atomicity,
+      gate soundness (barrel + cross-package cases named), honesty, freshness, code consistency.
+- [x] **The suite**: `crates/ci-conformance` — one shared battery (read invariants: id scheme,
+      nesting, name_range slicing, `:body`/`:params`/`:doc` anchors, graph determinism/honesty;
+      edit clauses: commit, dry-run, syntax-gate reject, whole-batch atomicity, soft-fail
+      anchors) × per-language fixtures. Fast tier in CI (fallback×8 + rust reads); `--ignored`
+      tier for scip-typescript. Live-checker gate e2es remain in the provider crates as
+      contract instances (barrel, monorepo, rename/reject suites), referenced from the doc.
+- [x] **The audit**: all 10 instances green; grep-audit confirms every provider routes writes
+      through `commit_edits` and no provider re-implements the graph/text helpers. CONTRIBUTING
+      wires the suite into the PR flow.
+- [ ] (nice-to-have) a `lang-template` skeleton crate so Step-1 languages (Batch 8) start
       conformant instead of converging later.
-- [ ] **10d — run the audit.** Existing providers (ts, rust, fallback×8) through the suite;
-      every gap becomes either a fix or an explicitly documented tier limitation (the
-      T9-pre-fix kind of gap must be impossible to hold silently).
 
 ## Capability checklist for ANY new language provider (definition-of-done)
 The bar TS and Rust meet — every new provider should target all of it. The seams
