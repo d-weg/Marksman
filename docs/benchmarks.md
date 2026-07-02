@@ -1,33 +1,55 @@
 # Marksman — benchmarks
 
-Two kinds of evidence, in order of importance:
+This file answers, in order:
 
-1. **[The live-agent A/B](#1-headline--the-live-agent-ab)** — the same agent with and without
-   Marksman, end-to-end, objectively checked. This is the number that matters.
-2. **[The read-path ablation](#2-what-each-layer-buys--the-read-path-ablation)** — which *layer*
-   of the tool (compiler gate, import-graph radius, SCIP edges) buys which part of that win.
-   This is what decides [how new languages roll out](#3-what-this-settles--the-provider-rollout-ladder).
+1. [Does the tool actually help an agent?](#1-does-it-help--the-live-agent-ab) — the headline A/B.
+2. [Which parts of the design earn their keep?](#2-which-parts-of-the-design-earn-their-keep--the-read-path-ablation) — an ablation, and the language-rollout policy it settled.
+3. [Does it hold up on a big real repo?](#3-does-it-hold-up-on-a-big-real-repo)
+4. [How do the client and middleware change the numbers?](#4-how-the-client-and-middleware-change-the-numbers)
+5. [What makes a tool response effective?](#5-tool-response-design-the-lesson-that-transfers) — the design lesson that generalizes beyond this project.
+6. [Component micro-benchmarks](#6-component-micro-benchmarks).
+7. [Methodology, trust properties, and how to reproduce](#7-methodology-trust-and-reproduction).
 
-[Micro-benchmarks](#4-micro-benchmarks) (index speed, retrieval overlap, startup) and
-[reproduction](#5-reproduce) at the end.
+### Terms used throughout
+
+- **baseline / rust** — the two *arms* of every A/B: the same agent (Claude Code headless,
+  sonnet 4.6) with only its standard tools (baseline) vs with the Marksman MCP server loaded
+  (rust). Nothing else differs.
+- **turn** — one agent↔model round trip. Every turn re-sends the whole conversation, so
+  **turns are the dominant cost driver**, not the size of any single response.
+- **$** — Claude Code's own reported cost (`total_cost_usd`). The truest single score: it bakes
+  in prompt caching and output pricing. Raw token counts (`in_tok`) can mislead — identical
+  tokens can bill differently depending on cache hits — so read **turns** and **$**.
+- **the gate** — before a Marksman edit lands on disk, the change is type-checked together
+  with every file the change could break; if anything *new* breaks, nothing is written and the
+  reply lists every affected site. Pre-existing errors never block (the gate diffs against a
+  baseline).
+- **blast radius** — that set of possibly-affected files: the changed files plus the files
+  that import them.
+- **import graph** — which file depends on which. Built two ways: **syntactic** (parse the
+  import statements — done in-process by *tree-sitter*, a fast error-tolerant parser) or
+  **semantic** (ask the compiler what actually references what — stored in a *SCIP* index,
+  produced by tools like `scip-typescript`). The difference matters enormously; §2 measures it.
+- **barrel** — an index file that re-exports others (`export * from "./x"`). Consumers import
+  the barrel, not the defining file — which hides the real dependency from a syntactic graph.
+- **bare specifier** — an import by package name (`import { X } from "@acme/core"`) rather
+  than by relative path. A syntactic parser cannot tell it from a third-party dependency.
+- **ungated / fallback tier** — languages without a wired-up compiler (Python, Go, Java, …)
+  get tree-sitter reads and structural edits that are syntax-checked only; every reply says
+  `gated: false` so the agent knows the edit was not type-verified.
+
+All results below are single runs unless stated (historical 3-run medians showed the same
+shape); dates are 2026-07-02.
 
 ---
 
-## 1. Headline — the live-agent A/B
+## 1. Does it help? — the live-agent A/B
 
-The same agent (Claude Code headless, sonnet 4.6), the same tasks, the same repos; the ONLY
-variable is whether the Marksman MCP is loaded. Harness: `scripts/agent-bench/` (see its README
-for the trust properties: objective per-task `check`, clean git + index reset per run,
-`--strict-mcp-config` on every arm, tokens straight from Claude Code's JSON, every task
-reported, no subagents). `$` = Claude Code's `total_cost_usd` — the true economic score (it
-bakes in prompt caching and output pricing); **turns** is the robust column for single runs
-(cache-creation vs cache-read pricing can move `$` at identical token counts).
-
-### Full 10-task suite (single runs, 2026-07-02)
-
-Six tasks on a ~600-symbol single-package TS repo, plus four self-contained fixtures:
-mixed Rust+TS (T7), Python+Go via the generic fallback (T8), a barrel-heavy TS repo (T9),
-and a TS workspace monorepo (T10).
+The experiment: give the same agent the same task on the same repo, with and without
+Marksman, and check the result objectively (a shell command per task: greps + the project's
+own type-checker — an outcome the agent can't fake). Ten tasks: six on a ~600-symbol
+TypeScript repo, plus four purpose-built fixtures — a mixed Rust+TS repo (T7), Python+Go on
+the ungated tier (T8), a barrel-heavy repo (T9), and a TypeScript workspace monorepo (T10).
 
 | arm | input tok | output tok | sec | $ | vs baseline (in/out/sec/$) | success |
 |---|--:|--:|--:|--:|---|--:|
@@ -43,348 +65,315 @@ and a TS workspace monorepo (T10).
 | T5-schema-field | required field + all construction sites | 13 / 0.1354 | **4 / 0.0673** |
 | T6-type-rename | interface rename across 5 files | 22 / 0.2444 | **3 / 0.0496** |
 | T7-multilang | Rust + TS renames, two compilers, one session | 13 / 0.1243 | **4 / 0.0522** |
-| T8-fallback | Python + Go renames, generic UNGATED provider | 8 / 0.0967 | **6 / 0.0811** |
-| T9-barrel | required field consumed through a barrel (`export *`) | 17 / 0.1485 | **7 / 0.1337** |
-| T10-monorepo | required field consumed cross-package (`@acme/core`) | 10 / 0.0869 | **5 / 0.0860** |
+| T8-fallback | Python + Go renames, ungated tier | 8 / 0.0967 | **6 / 0.0811** |
+| T9-barrel | required field consumed through a barrel | 17 / 0.1485 | **7 / 0.1337** |
+| T10-monorepo | required field consumed cross-package | 10 / 0.0869 | **5 / 0.0860** |
 
-### What wins where
+### Why it wins — three mechanisms
 
-- **Repo-wide structural edits are the blowouts.** T6: **3 turns vs 22** — one gated `rename`
-  rewrites the interface and every reference/import; baseline reads five whole files and
-  hand-edits each. Same shape on T1 and T2.
-- **Wide-blast-radius edits ride the reject-driven protocol** (T5, T9, T10): the agent makes
-  the anchor edit alone; the type-check gate *rejects* with **every** affected site — each with
-  its current source and a ready-to-copy `fix:` action — and one batch later it's done. No grep
-  can miss a site; the compiler enumerates them. This works **through barrels** (T9) and
-  **across package boundaries** (T10).
-- **Two compilers, one session** (T7): a Rust rename gated by rust-analyzer and a TS rename
-  gated by tsc, each one `apply_edits`, via per-file provider dispatch.
-- **Languages with no integration still win** (T8): the generic tree-sitter provider applies
-  structural edits honestly marked `gated: false`, with a server-side verification scan whose
-  hits carry verbatim-executable fixes ([the three-iteration story](#25-the-response-design-lesson-t8-v1v3)).
+- **One call replaces N hand-edits.** A repo-wide rename is a single `apply_edits`: the
+  server rewrites the definition and every reference, type-checks the result, and commits
+  atomically. The baseline agent reads whole files, edits each site by hand, and iterates
+  the type-checker — T6 is 3 turns vs 22.
+- **The type-checker finds the affected sites, so the agent doesn't search.** For a change
+  that breaks many places (add a required field — T5, T9, T10), the agent makes the anchor
+  edit alone; the gate *rejects* it with **every** affected site, each shown with its current
+  source and a ready-to-copy fix. One batch later it's done. No grep can miss a site, because
+  the compiler enumerated them — and this works through barrels (T9) and across package
+  boundaries (T10).
+- **Languages without a compiler still come out ahead** (T8): structural edits honestly
+  labeled "not type-verified," plus a server-side verification scan whose findings each carry
+  a copy-paste-executable fix (see [§5](#5-tool-response-design-the-lesson-that-transfers)).
 
 ### Honest caveats
 
-- **Single runs** (historical 3-run medians showed the same shape). Trajectory variance is
-  real — T5-shaped tasks occasionally pre-explore (7–9 turns instead of 4); every path
-  converges through the same self-sufficient reject.
-- **No benchmark-tuned prompting.** Tool descriptions are audited to contain zero fixture
-  names or task values (an early leak was caught and those runs discarded).
-- **Every arm passed everything, so the gate's *resilience* value is not in these numbers** —
-  insurance doesn't pay out on the happy path. The measured win is efficiency. (The ablation
-  below is where unsoundness became measurable — and got fixed.)
-- Absolute deltas are these-repos/these-tasks; the shape is what's robust.
+- Single runs; trajectory variance is real (a T5-shaped task occasionally pre-explores and
+  lands at 7–9 turns instead of 4 — still well under baseline).
+- The tool descriptions the agent sees are audited to contain **zero** benchmark-specific
+  content (an early revision leaked task answers into description examples; those runs were
+  discarded).
+- Every arm passed every task, so the gate's *insurance* value — catching a broken edit — is
+  not in these numbers. The measured win is efficiency.
+- Absolute deltas belong to these repos and tasks; the *shape* (structural edits and
+  wide-blast-radius changes are the blowouts) is what generalizes.
 
-### Earlier 3-arm run (vs the Node prototype)
-
-The first 7-task run also carried a **ts** arm — the frozen Node `codeindex` prototype Marksman
-rewrote. Rust: **−53% $, 7/7, winning or tying the prototype on every task** (T1 3 turns vs its
-5; T5 4 vs 15). Historical detail (including the T5 contamination that led to
-`--strict-mcp-config` everywhere) is in git history (`docs/benchmarks.md` @ 43d4caf); the ts
-arm stays opt-in and unmaintained.
+*Historical note:* the first 7-task run also carried the frozen Node.js prototype Marksman
+was rewritten from, as a third arm. Marksman won or tied it on every task (−53% vs baseline
+overall). Details, including a contamination incident that led to stricter arm isolation,
+are in git history (`docs/benchmarks.md` @ 43d4caf).
 
 ---
 
-## 2. What each layer buys — the read-path ablation
+## 2. Which parts of the design earn their keep? — the read-path ablation
 
-`CI_TS_MODE` swaps the TypeScript read path so the SAME suite isolates each layer:
-**`full`** (SCIP + tree-sitter + ts-morph gate, the default) · **`treesitter-gated`**
-(tree-sitter reads + syntactic import graph + the same ts-morph gate; no scip, no Node at
-startup) · **`treesitter`** (pure tree-sitter, ungated). Findings, as a ladder:
+Marksman's TypeScript support stacks three layers: tree-sitter parsing (fast, in-process,
+syntactic), a SCIP index (compiler-accurate symbols and references), and the ts-morph
+compiler gate on edits. Which layer produces §1's win? `CI_TS_MODE` swaps the read path so
+the same suite isolates each one:
 
-1. **The compiler GATE carries the agent value.**
-2. **The gate is only as good as its blast RADIUS** (T9: barrels hide consumers from a naive
-   syntactic radius → fixed with a transitive closure).
-3. **The radius is only as good as its EDGES** (T10: bare workspace specifiers give a
-   syntactic graph *no* cross-package edges — only a compiler can mint them; this is what
-   SCIP is for).
+| mode | reads & import graph | edit gate |
+|---|---|---|
+| `full` (the default) | SCIP + tree-sitter | compiler |
+| `treesitter-gated` | tree-sitter only (syntactic) | compiler (same one) |
+| `treesitter` | tree-sitter only | **none** (syntax check only) |
 
-### 2.1 Whole-suite: full vs treesitter-gated (10 tasks, 2026-07-02)
+Three findings, each one level deeper:
 
-| arm | $ | vs baseline | success | turns per task (T1…T10) |
+### 2.1 The compiler gate carries most of the value
+
+| mode | $ | vs baseline | success | turns per task (T1…T10) |
 |---|--:|--:|--:|---|
 | `full` | 0.6648 | **−45%** | 10/10 | 3 3 3 3 4 3 4 6 7 5 |
 | `treesitter-gated` | 0.7639 | **−36%** | 10/10 | 3 3 3 3 4 3 4 6 6 8 |
 
-**Gated is a dead tie on eight of ten tasks** — identical turns, $ within noise. The whole
-SCIP premium (~10 points of the win) is concentrated where its semantic edges exist and the
-syntactic graph's don't:
+Identical turn counts on eight of ten tasks: on a single-package repo with direct imports,
+**tree-sitter reads + the compiler gate deliver most of the win with zero startup
+dependencies** (no Node.js needed until an edit). The whole SCIP premium (~10 points) is
+concentrated in T9 and T10 — the two tasks built to stress the import graph. §2.3 and §2.4
+explain why.
 
-- **T9-barrel**: tie *after* the transitive-radius fix (gated 6 turns / $0.126 vs full 7 /
-  $0.134) — the barrel gap was radius-depth, and it's closed.
-- **T10-monorepo**: gated pays **8 turns / $0.150 vs full's 5 / $0.086 (+74%)** — exactly
-  baseline's cost ($0.087). The syntactic graph has zero cross-package edges (a bare
-  `@acme/core` is indistinguishable from a third-party package), so the agent hand-verifies
-  what the gate can't see: the tool is paid for and its advantage evaporates.
+### 2.2 Without any gate, the tool *loses* on typed languages
 
-So: **tree-sitter + gate already beats baseline decisively (−36%) with zero startup
-dependencies; SCIP converts the worst cases (monorepos, cross-package blast radius) from
-break-even into wins and keeps the gate's radius sound without hand-verification.**
+Pure tree-sitter (no compiler anywhere): **$1.14, 8/9 — worse than having no tool.** T5
+fails outright (nothing syntactic can enumerate the consequences of a type change — that is
+the compiler's irreplaceable job) and T6 "passes" at 25 turns, double baseline cost. The
+ungated tier is right **only** where the language has no usable checker (Python/Go — T8, where
+it reaches −63% at its best), and wrong wherever a compiler exists but goes unused. A related
+lesson: an honest "NOT type-verified" reply outperforms a confident false one — see 2.3.
 
-### 2.2 The ungated tier: where it's right and where it loses
+### 2.3 The gate is only as good as its blast radius (barrels)
 
-Pure tree-sitter (no gate) on the same suite: **$1.14, 8/9 — loses to baseline** on a typed
-language. T5 fails outright (no compiler = no consequence enumeration, the one thing nothing
-syntactic recovers), T6 "passes" at 25 turns / 2× baseline. But T4/T8 stay clean, and it even
-passed T9 (11 turns) — because its reply honestly says "NOT type-verified", the agent
-hand-verifies like a baseline. The tier is **right where the language has no checker**
-(Python/Go/… — T8's −63% at its best) and **wrong wherever a compiler exists but isn't used**.
-Corollary: a *false* "type-checked" claim is worse than an honest "unverified" — the pre-fix
-T9 gated run was the cheapest, fastest arm and the only one that shipped a broken repo.
+A syntactic import graph edges a consumer to the **barrel** it imports, not to the file that
+defines the symbol — and a barrel itself never gets a type error when a required field is
+added behind it. So a naive one-hop blast radius misses the consumers entirely, and the gate
+can claim "type-checked clean" on an edit that broke them.
 
-### 2.3 T9-barrel — radius depth (measured, then fixed)
-
-`fixture-barrels`: every consumer imports through `core/index.ts` (`export *`); task =
-required field + all construction sites. The gate expands reverse-import hops from the
-provider's graph; a syntactic graph edges consumers to the *barrel*, which itself never errors
-on a new required field — so with a naive one-hop radius the consumers sat outside the gate:
+Today this cannot happen: syntactic graphs serve the gate the **transitive** closure of
+importers (`ci_core::transitive_reverse_imports`), and an end-to-end test pins it. We know
+the failure was real because T9 measured it before the fix landed:
 
 | arm (pre-fix) | turns | $ | ok |
 |---|--:|--:|:--:|
 | baseline | 17 | 0.1939 | 1/1 |
 | `full` | 6 | 0.1142 | 1/1 |
-| `treesitter-gated` | **5** | **0.0945** | **0/1 — cheapest, fastest, WRONG** (false "clean") |
+| `treesitter-gated` | **5** | **0.0945** | **0/1 — cheapest, fastest, and wrong** |
 
-**Fixed:** syntactic graphs now serve the gate the **transitive** reverse-importer set
-(`ci_core::transitive_reverse_imports`); scip keeps the cheaper one-hop (its semantic graph
-already flattens barrels — a consumer edges directly to the defining file). The
-`barrel_consumer_…` e2e pins both mechanisms; post-fix agent runs tie full (6 turns, 1/1).
+The cheapest arm shipped a broken repo while claiming it was type-checked — the worst
+possible failure, and the reason "the radius must be sound" is now contract, not judgment
+(see [provider-contract.md](provider-contract.md)). Post-fix, both modes tie on T9. SCIP's
+graph never needed the fix: the compiler resolves the barrel, so the consumer's edge points
+directly at the defining file.
 
-### 2.4 T10-monorepo — edge existence (SCIP-only, measured)
+### 2.4 The radius is only as good as its edges (monorepos) — where SCIP is load-bearing
 
-`fixture-monorepo`: workspace packages import core via the **bare specifier** `@acme/core`
-(root-tsconfig `paths`). Unlike T9 this is not a depth problem — the syntactic resolver
-follows only relative specifiers, so there are **zero cross-package edges to close over**.
-The `monorepo_bare_specifier_…` e2e verifies both sides: full resolves the alias (reject
-names the consumer in the other package; the ts-morph gate surfaces cross-package diagnostics
-through the root tsconfig), gated commits "clean" across a broken package boundary.
+Workspace monorepos import by **bare specifier** (`@acme/core`). A syntactic parser cannot
+distinguish that from a third-party package, so it records **no edge at all** — and no
+transitive closure can recover an edge that doesn't exist. Only a compiler can resolve the
+workspace alias. Measured on T10:
 
 | arm | turns | $ | ok |
 |---|--:|--:|:--:|
-| baseline | 9–10 | ~0.09–0.15 | 1/1 |
-| `full` | 5–6 | 0.086–0.106 | 1/1 (−30% and better) |
-| `treesitter-gated` | 8–9 | 0.150–0.152 | 1/1 *only because that trajectory re-verified by hand* — at baseline cost |
+| baseline | 9–10 | 0.087–0.152 | 1/1 |
+| `full` (SCIP) | 5–6 | 0.086–0.106 | 1/1 — the cross-package sites arrive in the reject, −30% |
+| `treesitter-gated` | 8–9 | 0.150–0.152 | 1/1 *only because the agent re-verified by hand* — at baseline cost |
 
-(Two runs each; project-references / multi-tsconfig monorepos remain untested.)
+Without SCIP the tool's monorepo advantage evaporates to zero (and an e2e proves a trusting
+trajectory commits broken). With it, T10 runs T5's playbook across package boundaries.
 
-### 2.5 The response-design lesson (T8, v1→v3)
+### 2.5 What this settled — how languages roll out
 
-The generic (ungated) tier only started winning when the tool's **responses** stopped
-delegating verification. Three iterations on the same Python+Go task:
+Adopted policy (roadmap Batch 8), directly from the data:
+
+1. **TypeScript and Rust keep SCIP permanently.** It's not speed — warm startup is ~0.1s
+   either way — it's what keeps the gate *sound* on barrels and package boundaries without
+   the agent hand-verifying. The ablation modes exist for measurement, not as configurations.
+2. **New languages land as tree-sitter + the language's own compiler gate first** (−36% with
+   zero startup dependencies is most of the win), with a SCIP indexer added later, when that
+   language's users hit monorepos or large repos. The `treesitter-gated` provider is the
+   template.
+3. **The ungated tier is only for languages without a usable checker**, and its replies must
+   keep saying so.
+
+---
+
+## 3. Does it hold up on a big real repo?
+
+The fixtures are tiny by design, so we ran the machinery (no agent) on the TypeScript
+compiler itself — 709 source files, **453k lines, 21,794 symbols**:
+
+| what | measured |
+|---|--:|
+| cold full index (scip + embeddings + persist) | **29.5s** |
+| warm provider startup (content-fingerprint check) | **~0.3s** |
+| `retrieve` per query, end-to-end | **0.26–0.40s** |
+| gated edit on a leaf file (warm) | **0.098s** |
+| gated edit on a hub file (303 real importers) | ~20s |
+
+- Retrieval quality held (a "union type narrowing" query led with `compiler/types.ts`'
+  `UnionType`), and its O(n) scan is a non-issue at 22k chunks.
+- **Gate latency scales with the true blast radius, not repo size** — ~0.1s plus ~65ms per
+  file the edit can affect. The common case (leaf files) stays ~0.1s; a hub edit pays for
+  genuinely re-checking 303 referencing files, still under one full `tsc` run.
+- The repo also stress-tested §2's conclusion at scale: it imports through namespace barrels,
+  so the syntactic graph sees **1** importer of `compiler/core.ts` where SCIP sees **465**
+  real referencers — and the transitive closure a syntactic gate would need is **596 files
+  (the whole repo) for any hub edit** (median inflation 1.0×, p99 298×). At 65ms/file that's
+  a ~40s gate per hub edit without SCIP, vs a bounded true-referencer set with it. On
+  barrel-architected repos at scale, SCIP keeps the gate sound *and* affordable.
+- The test also found (and we fixed, with a regression test) a real bug: the atomic index
+  save was destroying the co-located SCIP cache on every save, silently costing the next
+  startup a full re-index.
+
+Caveats: one machine, single runs; `npm ci` failed in the sandbox (harmless here — the
+compiler's sources are self-contained — but dependency-heavy repos need a working install
+before SCIP indexing); declaration files (`.d.ts`) have no syntactic import edges at all.
+
+---
+
+## 4. How the client and middleware change the numbers
+
+Two findings about the *environment* around the tool, both measured by diffing full
+transcripts — totals alone attributed them to the wrong cause.
+
+### 4.1 The tool-loading turn: your MCP client may cost you a turn per session
+
+MCP clients register a server's tools in one of two ways: **upfront** (tool definitions
+present from the first request) or **deferred** (the agent must call a tool-search tool to
+load them, spending its first turn on discovery). In every measurement above, Claude Code
+deferred Marksman's tools — so **every Marksman number in this file includes one discovery
+turn**. When a run happened to register the tools upfront, every task dropped a turn: renames
+completed in **2 turns at $0.027** (T1: −83% vs baseline instead of −70%).
+
+The server is not the cause — `marksman-mcp` answers `initialize` in 0.13s; registration mode
+is client-side policy/timing. If your client supports eager MCP registration, use it: it's
+worth about one turn and ~2¢ per session.
+
+### 4.2 Token-compression middleware: compatible, and mostly redundant behind Marksman
+
+We ran the full suite through [Headroom](https://github.com/headroomlabs-ai/headroom) (an
+open-source proxy that compresses tool outputs before they reach the model), wrapped vs two
+same-day controls:
+
+- **No interference.** 20/20 wrapped tasks passed; Marksman's replies passed through
+  byte-identical. Headroom's own content router *protects error outputs and skips small
+  content* — which is exactly what Marksman emits (small, dense replies; error-anchored
+  rejects with verbatim fixes). The two designs are structurally disjoint.
+- **Nothing to compress.** Headroom's own telemetry: 5.2% of input tokens ($0.07) across the
+  whole run; 40 of 116 requests had no compressible content. This suite's cost is *turns*,
+  which no proxy can reduce.
+- **Where it would pay:** its single best hit (−73%) was a baseline whole-file read — the
+  waste class Marksman prevents from entering context in the first place. On a grep-and-read
+  agent with big files and long sessions, compression helps; behind Marksman there's little
+  left to compress. Complementary, not competing.
+- **Methodology warning:** wrapping the proxy also flipped the client into upfront tool
+  registration (§4.1) — two variables at once. The apparent "Headroom speedup" of the
+  Marksman arm was entirely §4.1. Attribute middleware effects with transcripts, not totals.
+
+Recipe: `headroom proxy --port 8787`; a shim that exports
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and executes the real claude binary;
+`CLAUDE_BIN=<shim> bash scripts/agent-bench/go.sh …` (the harness honors a pre-set
+`CLAUDE_BIN` and exports `CLAUDE_REAL` for the shim to use).
+
+---
+
+## 5. Tool-response design: the lesson that transfers
+
+The ungated tier (T8: a Python and a Go rename, no compiler) only started winning when the
+tool's **responses** stopped delegating work back to the agent. Three iterations on the same
+task:
 
 | response design | rust $ | turns | outcome |
 |---|--:|--:|---|
-| v1: "…review or run the project's own checks" | 0.1183 | 10 | **loses +24%** — agent re-verifies by hand |
-| v2: + server-side rename scan (file:line evidence) | 0.1202 | 9 | −28%, but 3 failed fix attempts (agent anchored by the now-gone OLD name) |
-| v3: + every hit carries a **verbatim-executable `fix:`** (post-rename anchor) | **0.0622** | **5** | **−63%** |
+| v1: "…review or run the project's own checks" | 0.1183 | 10 | **loses to baseline (+24%)** — the agent pays for the tool, then re-verifies everything by hand anyway |
+| v2: + a server-side rename scan (file:line evidence, "do NOT grep") | 0.1202 | 9 | −28%, but the agent burned 3 failed attempts fixing a flagged site — it addressed the site by its OLD (pre-rename) name |
+| v3: + every finding carries a **verbatim-executable fix** (anchored to the post-rename symbol; only one value left to fill in) | **0.0622** | **5** | **−63%** |
 
-The transferable law (same mechanism as the reject-driven fixes): **a response that leaves the
-agent any "check it yourself" or "figure out the addressing" step is a design bug** — do the
-check server-side, inline the evidence, make every follow-up copy-paste executable. Response
-tokens are cheap (cached input); turns are expensive.
-
-### Also flushed out by the ablation (fixed, regression-tested)
-
-- **Same-file batch corruption:** structural ops resolve spans from pre-batch disk truth, so a
-  schema op + a ready fix in the same file corrupted each other → `commit_edits` applies
-  same-file structural ops bottom-up.
-- **LSP gate blind to created files:** a didOpen overlay at a not-on-disk path is outside the
-  server's project (phantom "cannot find module" on moves) → created paths are materialized
-  transiently for the check, drop-guard removed on reject, invisible to the baseline pass.
+The transferable law — the same mechanism behind the reject-driven flow in §1: **a tool
+response that leaves the agent any "check it yourself" or "figure out the addressing" step is
+a design bug.** Do the check server-side, inline the evidence, and make every suggested
+follow-up copy-paste executable. Response tokens are cheap (they arrive once and cache);
+turns are expensive (they re-send everything).
 
 ---
 
-## 3. What this settles — the provider rollout ladder
+## 6. Component micro-benchmarks
 
-The decisions this data supports, adopted as project policy:
+Machine-level numbers for individual pieces (oracle repo = the ~600-symbol Node.js
+`codeindex` prototype; timings are min-of-3 after a discarded warmup).
 
-1. **TS and Rust keep SCIP, permanently.** `full` is the default and not removable — the
-   ablation modes exist for measurement, not as product configurations. SCIP is cheap once
-   cached (~0.1s warm start) and it is what keeps the gate's blast radius *sound* without
-   hand-verification on barrels, re-exports, and package boundaries.
-2. **New language providers land as tree-sitter + compiler gate first.** That tier is measured
-   at **−36% vs baseline with zero startup dependencies** — already most of the win. The
-   `TsTreeGated` provider is the template: generic tree-sitter reads + the language's real
-   checker as `GateEngine` + the transitive syntactic radius. A SCIP indexer (scip-python,
-   scip-go, …) is the *maturity step*, added when the language's users hit the seams where it
-   is load-bearing: monorepos / cross-package imports (T10) and radius precision on large
-   repos (a transitive syntactic closure over-approximates; scip's one-hop set stays bounded
-   by actual referencers).
-3. **The ungated tier is only for languages without a usable checker** — and its replies must
-   keep saying so (`gated: false`, "NOT type-verified"): the honest weak claim measurably
-   outperforms a false strong one.
-
----
-
-## 4. Micro-benchmarks
-
-Component-level numbers (reproduce: `cargo build --release && python3 scripts/bench.py
-[oracle_repo]`; oracle = the sibling Node `codeindex` repo, TS, ~600 symbols).
-
-### Indexing speed (whole repo, wall-clock, min of 3 after warmup)
+**Indexing speed** — the tree-sitter merge is free, and Rust indexes ~4× faster than the
+prototype:
 
 | variant | time |
 |---|---|
 | Rust · SCIP only (no tree-sitter) | 2.99s |
-| **Rust · SCIP + tree-sitter** | **3.02s** |
-| tree-sitter overhead | **+0.04s (+1.2%)** |
-| Node (bge, the oracle) | 12.68s |
+| **Rust · SCIP + tree-sitter** | **3.02s** (+1.2%) |
+| Node prototype (bge embedder) | 12.68s |
 
-The SCIP + tree-sitter merge is essentially free — the in-process AST (which unlocks
-sub-symbol edits) costs nothing measurable at index time. Rust indexes ~4× faster than the
-Node prototype; the dominant cost is `scip-typescript` + embedding, not the core.
-
-### Startup: cached SCIP index
+**Startup cache** — a content-hash fingerprint (sources + config + pinned tool versions)
+decides load-vs-reindex; hashes, not mtimes, so a `git checkout` still hits the cache:
 
 | | cold (source changed) | warm (fingerprint match) |
 |---|--:|--:|
 | TS provider startup | ~26s (scip-typescript run) | **0.11s** |
 
-A content-hash fingerprint (all sources + tsconfig/package/lockfiles + pinned tool version,
-augmented with the index's own document list) decides load-vs-reindex. Content hashes, not
-mtimes — a `git reset` still hits the cache. Any doubt reindexes: a stale load is a
-correctness bug, a spurious reindex only a slow start.
+Any doubt re-indexes: a stale read would be a correctness bug; a spurious re-index is only a
+slow start.
 
-### Headroom on a real repo (microsoft/TypeScript, no-agent)
+**Retrieval overlap vs the prototype** (same queries, Jaccard overlap of returned files):
+mean ≈ 55% across four tasks (64/50/45/60%) — honest moderate overlap with expected causes:
+a different embedder (potion-code Model2Vec vs bge-small) and a different graph (SCIP
+references vs ts-morph import declarations). The ranking cores (BM25/RRF/weighting) are
+faithful ports.
 
-The fixtures are tiny by design; this measures the same machinery on the TypeScript compiler
-itself — 709 source files, **453k lines, 21,794 symbols** (test corpus excluded, as any real
-user would). One machine, single runs, 2026-07-02:
+**Multi-language indexing**: on a mixed Rust+TS+Python fixture with six labeled retrieval
+tasks, a single-language provider finds 2/6 (files of other languages are never indexed at
+all); the per-file provider registry finds 6/6. The gain is recall into one shared index —
+the retrieval math is language-blind and unchanged.
 
-| what | measured |
-|---|--:|
-| cold full index (scip + embed + persist) | **29.5s** |
-| warm reindex (`marksman index` again) | 13.9s |
-| warm provider open (fingerprint check over the whole repo) | **~0.3s** |
-| `retrieve` per query, end-to-end incl. process + model + index load | **0.26–0.40s** |
-| gated edit, leaf file (warm engine) | **0.098s** |
-| gated edit, hub file — `corePublic.ts`, 303 real importers | ~20s |
-
-- **Retrieval's O(n) is a non-issue at this scale** (22k chunks); results were on-target
-  (the union-type-narrowing query led with `compiler/types.ts`' `UnionType`).
-- **Gate latency scales with the TRUE blast radius, not repo size**: ~0.1s + ~65ms per
-  radius file. A hub edit checking 303 real referencers costs ~20s — the honest price of
-  enumerating every consequence, still under a full `tsc` iterate, and leaf edits (the common
-  case) stay ~0.1s.
-- **The radius data settles the ablation's scale question brutally.** This repo imports
-  through `_namespaces` barrels, so the syntactic graph sees **1** importer of
-  `compiler/core.ts` where scip sees **465** true referencers — and the transitive syntactic
-  closure needed for soundness is **596 files (the entire repo) for any hub edit**
-  (inflation over all files: p50 1.0×, p90 59×, p99 298×). At ~65ms/file that's a ~40s gate
-  per hub edit in `treesitter-gated` mode vs scip's bounded true-referencer set. On barrel-
-  architected repos at scale, scip is what keeps the gate both sound AND affordable.
-- **This test also flushed out a real bug** (fixed + regression-tested): the atomic index
-  save swapped the whole `.marksman` dir, destroying the co-located scip cache + fingerprint
-  on every save — every post-`index` startup silently paid a full scip rerun. The swap now
-  carries over every file it didn't write.
-
-Caveats: single machine/runs; `npm ci` failed in this sandbox (TypeScript's src is
-self-contained so scip was unaffected — on dependency-heavy repos, install first);
-`.d.ts` lib files have no syntactic import edges (scip-only, consistent with the monorepo
-finding). Agent-level A/B on external repos needs repo-specific tasks with objective checks —
-the harness takes `--repo`, tasks live in `scripts/agent-bench/tasks.json`.
-
-### Composition with a context-compression proxy (Headroom, measured)
-
-Marksman and token-compression proxies attack different waste, so we measured the
-composition: the full 10-task suite through [Headroom](https://github.com/headroomlabs-ai/headroom)
-0.28 (`headroom proxy` + `ANTHROPIC_BASE_URL`), single runs vs two same-day unwrapped controls.
-
-| arm | $ (wrapped) | $ (controls) | success |
-|---|--:|--:|--:|
-| baseline | 1.4604 | 1.0090 / 1.1391 | 10/10 |
-| rust (Marksman) | 0.5909 | 0.6470 / 0.7056 | 10/10 |
-
-- **No protocol breakage.** All 20 wrapped tasks passed, including the reject-driven T5/T9/T10.
-  The proxy's own router explains why: it *protects error outputs* and skips small content and
-  tool schemas — Marksman's responses (small, dense, error-anchored, verbatim-executable) are
-  exactly the content classes a well-behaved compressor leaves alone. Structurally disjoint.
-- **No measurable saving on this suite.** Headroom's own accounting: 5.2% of input tokens
-  compressed ($0.07) — 40 of 116 requests had nothing compressible. This suite's contexts are
-  2–4k tokens/request and its cost driver is TURNS, which compression cannot reduce; run-level
-  $ differences are trajectory noise (the wrapped baseline drew expensive T6/T9 runs).
-- **Where composition WOULD pay:** the proxy's single best hit (15.4k → 4.1k tokens, −73%) was
-  a baseline whole-file read — the waste class Marksman eliminates at the source and Headroom
-  compresses after the fact. On long sessions / big files (a `checker.ts` read is ~50k lines),
-  a grep-and-read agent benefits from compression; a Marksman agent mostly never emits the
-  dumps in the first place.
-
-**The wrapped arm's "improvement," explained (transcript-diffed):** the wrapped rust runs
-posted the lowest turn counts ever (2-turn renames, $0.027 T1) — and it was NOT compression.
-Behind the proxy, Claude Code registered the marksman MCP tools **upfront**
-(init: 34 tools, marksman `connected`, zero ToolSearch calls in all 10 transcripts — first
-action is `apply_edits` directly); unwrapped, the tools are **deferred** (29 tools, marksman
-`pending`) and every session pays a ToolSearch discovery turn first. The proxy's first-request
-latency appears to let the MCP handshake win the client's registration race — marksman-mcp
-itself answers `initialize` in 0.13s, so the deferral is client-side policy/timing, not the
-server. Marksman's replies passed through the proxy byte-identical (the T1 tool_result is the
-same 389 chars in both arms). Two implications: (1) wrapped-vs-unwrapped comparisons change
-TWO variables (compression + tool-registration mode) — attribute with transcripts, not totals;
-(2) **every published marksman number in this file INCLUDES a discovery turn** — a client that
-registers MCP tools eagerly gets 2-turn renames (T1 at −83% vs baseline instead of −70%). The
-discovery turn costs ~1 turn + ~2¢/session; eager registration is worth requesting from any
-client that supports it.
-
-Other caveats: single runs; `in_tok` is not comparable across wrapped/unwrapped arms (proxy
-cache alignment shifts the cache-write/read mix). Recipe: `headroom proxy --port 8787`, a shim
-exporting `ANTHROPIC_BASE_URL`, `CLAUDE_BIN=<shim> go.sh …` (go.sh honors a pre-set
-`CLAUDE_BIN` and exports `CLAUDE_REAL` for the shim).
-
-### Retrieval overlap vs the Node prototype (Jaccard, per task)
-
-| task | rust | node | shared | Jaccard |
-|---|--:|--:|--:|--:|
-| merge bm25/vector/symbol with RRF | 18 | 18 | 14 | 64% |
-| ast-anchored structural edits + gate | 14 | 13 | 9 | 50% |
-| package-aware relevance weighting | 15 | 14 | 9 | 45% |
-| import graph + seed expansion | 16 | 16 | 12 | 60% |
-
-Mean ≈ 55% — honest moderate overlap with expected divergence: different embedder
-(potion-code Model2Vec vs bge-small) and different graph (SCIP semantic references vs ts-morph
-import declarations). The cores (BM25/RRF/weighting/expansion) are faithful ports.
-
-### Multi-language retrieval (registry vs single-provider)
-
-Mixed Rust+TS+Python fixture, six labeled tasks (`scripts/multilang-bench/`): single-provider
-(`CI_LANG=rust`) retrieves **2/6** (non-Rust files are never indexed — recall 0 at any rank);
-the extension→provider registry retrieves **6/6** (hit@5). Retrieval itself is unchanged and
-language-blind; the gain is purely that every language's files make it *into* the one index.
-
-### Edit capability (not a timing)
-
-| | SCIP only | **SCIP + tree-sitter** | Node (ts-morph) |
-|---|---|---|---|
-| rename / refs / import graph | ✅ compiler-grade | ✅ | ✅ |
-| whole-symbol edits (replace_node) | ✅ | ✅ | ✅ |
-| move (importer rewrite) | ✅ via LSP willRenameFiles | ✅ | ✅ |
-| **sub-symbol edits** (body/return/param) | ❌ no AST | **✅ tree-sitter** | ✅ |
-| external runtime dep for the AST | — | **none (in-process)** | Node |
-
-Edit-gate latency: the default write engine is **ts-morph** (in-process, kept warm) — a full
-rename + blast-radius gate is **~0.9s** (vs a cold LSP server's ~68s; `CI_EDIT_ENGINE=lsp`
-keeps the generic fallback, which is how the Rust gate drives rust-analyzer).
+**Edit capability & latency**: sub-symbol edits (function body / return type / one
+parameter) require the tree-sitter AST — SCIP alone is symbol-level. The default write
+engine (ts-morph, kept warm) completes a full rename + blast-radius type-check in **~0.9s**
+on the oracle repo; the generic LSP engine (`CI_EDIT_ENGINE=lsp`, how the Rust gate drives
+rust-analyzer) is the slower fallback.
 
 ---
 
-## 5. Reproduce
+## 7. Methodology, trust, and reproduction
+
+What makes the agent A/B trustworthy (`scripts/agent-bench/`, see its README):
+
+- **One variable.** Same model, same prompt, same repo start-state; the only difference
+  between arms is whether the MCP server is loaded. `--strict-mcp-config` on every arm so no
+  other locally-registered server can leak in (that leak happened once; those runs were
+  discarded and the flag added).
+- **Objective checks.** Every task passes/fails by a shell command (greps + the project's
+  own type-checker), not by judgment.
+- **Clean state per run.** `git reset --hard` plus restoring a pristine, base-consistent
+  index snapshot before every run; fixtures are copied to throwaway repos.
+- **Whole-run accounting.** Tokens come from Claude Code's own JSON; subagent spawning is
+  disabled so the reported numbers cover everything; every task is reported, including
+  losses (see §2.2, §5 v1).
+- **No benchmark-tuned prompting.** Tool descriptions are audited for fixture names/values.
+
+Benchmarking doubled as testing — three real product bugs were found by measurement and
+fixed with regression tests: a same-file batch corruption in the edit engine, the LSP gate
+being blind to files a batch creates, and the index save destroying the SCIP cache (§3).
 
 ```bash
 # The agent A/B (needs $ANTHROPIC_API_KEY; rebuilds release binaries first):
 bash scripts/agent-bench/go.sh --runs 3
-# One task:
 bash scripts/agent-bench/go.sh --task T10-monorepo --runs 1
-# The ablation arms:
+
+# The ablation arms (§2):
 CI_TS_MODE=treesitter-gated bash scripts/agent-bench/go.sh --arms rust --runs 1
 CI_TS_MODE=treesitter       bash scripts/agent-bench/go.sh --arms rust --runs 1
-# Where the turns went:
+
+# See where the turns went (per-tool transcript summary):
 bash scripts/agent-bench/go.sh --task T5-schema-field --save-transcript /tmp/tx
 python3 scripts/agent-bench/analyze.py /tmp/tx
 
-# Micro-benchmarks:
+# Micro-benchmarks (§6):
 python3 scripts/bench.py [oracle_repo]
 python3 scripts/multilang-bench/run.py
 ```
-
-Method notes: `--release` binaries; timing micro-benchmarks are `min of 3` after a discarded
-warmup; agent runs reset git + restore a pristine base-consistent index snapshot before every
-run; the fixture repos are copied to throwaway git repos per run.
