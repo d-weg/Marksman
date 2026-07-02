@@ -96,6 +96,9 @@ the ungated tier (T8), a barrel-heavy repo (T9), and a TypeScript workspace mono
   not in these numbers. The measured win is efficiency.
 - Absolute deltas belong to these repos and tasks; the *shape* (structural edits and
   wide-blast-radius changes are the blowouts) is what generalizes.
+- These numbers include a one-turn tool-discovery tax imposed by the client's deferred MCP
+  registration; the same suite measured **−60%** when the tools registered upfront
+  ([§4.1](#41-the-tool-loading-turn-your-mcp-client-may-cost-you-a-turn-per-session)).
 
 *Historical note:* the first 7-task run also carried the frozen Node.js prototype Marksman
 was rewritten from, as a third arm. Marksman won or tied it on every task (−53% vs baseline
@@ -241,8 +244,13 @@ MCP clients register a server's tools in one of two ways: **upfront** (tool defi
 present from the first request) or **deferred** (the agent must call a tool-search tool to
 load them, spending its first turn on discovery). In every measurement above, Claude Code
 deferred Marksman's tools — so **every Marksman number in this file includes one discovery
-turn**. When a run happened to register the tools upfront, every task dropped a turn: renames
-completed in **2 turns at $0.027** (T1: −83% vs baseline instead of −70%).
+turn**. In the one full-suite run where the tools registered upfront, every task dropped a
+turn — renames completed in **2 turns at $0.027** (T1: −83% vs baseline instead of −70%) —
+and the suite-level advantage measured **−60%** ($0.59 vs $1.46, −61/−60/−59/−60 in/out/sec/$,
+10/10; a fair within-run comparison, since both arms ran in the same environment). Read the
+−60% with one caveat: that run's baseline also drew expensive trajectories ($1.46 vs
+$1.01–1.14 in the controls), so the honest statement is **−45% with the discovery tax,
+trending toward −60% without it** — a multi-run confirmation would pin it down.
 
 The server is not the cause — `marksman-mcp` answers `initialize` in 0.13s; registration mode
 is client-side policy/timing. If your client supports eager MCP registration, use it: it's
