@@ -1,0 +1,8 @@
+{
+  "name": "acme",
+  "private": true,
+  "workspaces": ["packages/*"],
+  "scripts": {
+    "typecheck": "npx -y -p typescript@5.6.2 tsc --noEmit"
+  }
+}

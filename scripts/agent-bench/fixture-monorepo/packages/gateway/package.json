@@ -1,0 +1,7 @@
+{
+  "name": "@acme/gateway",
+  "private": true,
+  "dependencies": {
+    "@acme/core": "*"
+  }
+}

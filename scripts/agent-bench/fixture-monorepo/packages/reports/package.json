@@ -1,0 +1,7 @@
+{
+  "name": "@acme/reports",
+  "private": true,
+  "dependencies": {
+    "@acme/core": "*"
+  }
+}

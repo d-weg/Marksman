@@ -719,6 +719,90 @@ mod tests {
         assert!(app.contains("burst: 0"), "consumer updated in the same gated batch:\n{app}");
     }
 
+    // The monorepo seam, verified end-to-end (bench task T10 measures the agent-visible cost):
+    // a workspace consumer imports through a BARE specifier ("@acme/core", resolved by root
+    // tsconfig `paths`). The syntactic resolver follows only RELATIVE specifiers — a bare one is
+    // indistinguishable from a third-party package — so the fallback graph has NO cross-package
+    // edge and no transitive closure can recover it: in gated mode the consumer sits outside the
+    // gate and a breaking commit claims clean. SCIP resolves the alias via the TS compiler, so
+    // in full mode the consumer is one semantic hop away and the reject names it. This residual
+    // is STRUCTURAL for the syntactic tier (an edge-existence problem, not a radius-depth one);
+    // the fix is scip — that's the point. #[ignore]; `cargo test -p lang-ts -- --ignored`.
+    #[test]
+    #[ignore]
+    fn monorepo_bare_specifier_consumer_inside_scip_radius_invisible_to_syntactic() {
+        let write_fixture = |root: &Path| {
+            fs::create_dir_all(root.join("packages/core/src")).unwrap();
+            fs::create_dir_all(root.join("packages/gateway/src")).unwrap();
+            fs::write(root.join("package.json"), r#"{"name":"acme","private":true,"workspaces":["packages/*"]}"#).unwrap();
+            fs::write(
+                root.join("tsconfig.json"),
+                r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true,"baseUrl":".","paths":{"@acme/core":["packages/core/src/index.ts"]}},"include":["packages"]}"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("packages/core/src/policy.ts"),
+                "export interface RetryPolicy {\n  maxAttempts: number;\n}\n\nexport function defaultRetry(): RetryPolicy {\n  return { maxAttempts: 3 };\n}\n",
+            )
+            .unwrap();
+            fs::write(root.join("packages/core/src/index.ts"), "export * from \"./policy\";\n").unwrap();
+            fs::write(
+                root.join("packages/gateway/src/proxy.ts"),
+                "import { RetryPolicy } from \"@acme/core\";\nexport const aggressive: RetryPolicy = { maxAttempts: 6 };\n",
+            )
+            .unwrap();
+        };
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let field = EditOp::InsertMember {
+            node_id: "packages/core/src/policy.ts#RetryPolicy".into(),
+            code: "timeoutMs: number;".into(),
+        };
+
+        // FULL (scip): the bare specifier resolves through the tsconfig alias — the consumer
+        // edges across the package boundary, and the reject names its construction site.
+        let dir = tempfile::tempdir().unwrap();
+        write_fixture(dir.path());
+        let full = TsProvider::index(dir.path()).expect("scip-typescript indexing");
+        let g = full.import_graph().unwrap();
+        let proxy_edges = g.get(&PathBuf::from("packages/gateway/src/proxy.ts")).expect("proxy.ts edges");
+        assert!(
+            proxy_edges.contains(&PathBuf::from("packages/core/src/policy.ts")),
+            "scip must resolve the bare workspace specifier cross-package: {proxy_edges:?}"
+        );
+        match full.apply_edits(std::slice::from_ref(&field), &opts).unwrap() {
+            CommitResult::Rejected { feedback, .. } => assert!(
+                feedback.contains("packages/gateway/src/proxy.ts"),
+                "reject must name the cross-package consumer:\n{feedback}"
+            ),
+            other => panic!("required field consumed cross-package must reject in full mode: {other:?}"),
+        }
+
+        // TREESITTER-GATED: no edge exists for a bare specifier, so the consumer is invisible —
+        // the core-internal reject fires, but fixing only what it shows commits "clean" while
+        // the gateway no longer compiles. Structural residual; scip is the fix.
+        let dir2 = tempfile::tempdir().unwrap();
+        write_fixture(dir2.path());
+        let gated = TsTreeGated::new(dir2.path());
+        let g = gated.import_graph().unwrap();
+        assert!(
+            !g.contains_key(&PathBuf::from("packages/gateway/src/proxy.ts")),
+            "syntactic graph must have no bare-specifier edge (else this test guards nothing): {g:?}"
+        );
+        let batch = [
+            field,
+            EditOp::ReplaceNode {
+                node_id: "packages/core/src/policy.ts#defaultRetry".into(),
+                code: "function defaultRetry(): RetryPolicy {\n  return { maxAttempts: 3, timeoutMs: 1000 };\n}".into(),
+            },
+        ];
+        match gated.apply_edits(&batch, &opts).unwrap() {
+            CommitResult::Ok { .. } => {}
+            other => panic!("the consumer is invisible to the syntactic tier, so this must commit: {other:?}"),
+        }
+        let proxy = fs::read_to_string(dir2.path().join("packages/gateway/src/proxy.ts")).unwrap();
+        assert!(!proxy.contains("timeoutMs"), "consumer untouched — committed 'clean' across a broken package boundary");
+    }
+
     // Real end-to-end for the post-edit read refresh (scip-typescript + node + ts-morph):
     // WITHOUT re-running the indexer, a committed edit must make (a) a NEW symbol visible to
     // structure() — impossible before, reanchor can't invent nodes — and (b) a NEW file's

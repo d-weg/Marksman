@@ -279,8 +279,32 @@ blast radius lives. SCIP resolves workspace/paths aliases into true cross-packag
 edges. Separately, at scale the transitive closure OVER-approximates (one barrel re-exporting
 50 modules puts every importer of any of them in every edit's radius — gate latency grows with
 repo size), while scip's one-hop set stays bounded by actual referencers. Both effects point
-the same way: on big/monorepo TS, `full` isn't margin, it's load-bearing — pending a T10-style
-fixture to measure it.
+the same way: on big/monorepo TS, `full` isn't margin, it's load-bearing — T10-monorepo below
+measures it.
+
+### T10-monorepo — the seam where SCIP is load-bearing (designed + e2e-verified, run pending)
+
+`fixture-monorepo` is a workspace: `packages/core` consumed by `packages/gateway` and
+`packages/reports` via the **bare specifier** `@acme/core` (root-tsconfig `paths` alias — the
+common small-monorepo shape). The task is T9-shaped: add a required `timeoutMs` field to
+`RetryPolicy`, update every construction site *in every package*.
+
+Unlike T9's barrel — a radius-depth problem the transitive closure fixed — this residual is
+**edge-existence**: the syntactic resolver follows only relative specifiers, so `@acme/core`
+is indistinguishable from a third-party package and the fallback graph has *zero*
+cross-package edges. Nothing syntactic can recover them. The
+`monorepo_bare_specifier_consumer_inside_scip_radius_invisible_to_syntactic` e2e verifies both
+sides against real tools: **full** resolves the alias (the consumer edges cross-package;
+the reject names `packages/gateway/src/proxy.ts`), while **treesitter-gated** commits "clean"
+across the broken package boundary. It also verifies the ts-morph gate itself surfaces
+cross-package diagnostics through the root tsconfig — full mode is sound end-to-end on this
+monorepo shape. (Project-references / multi-tsconfig monorepos remain untested.)
+
+Pre-registered predictions: `full` ≈ T9's trajectory (~6 turns, reject → fix batch, all
+packages updated); `treesitter-gated` either fails (trusts the false clean) or pays
+baseline-like hand-verification; baseline correct at its usual grind. Run:
+`bash scripts/agent-bench/go.sh --task T10-monorepo --runs 1`, then the same with
+`CI_TS_MODE=treesitter-gated --arms rust`.
 
 (Designing T9 also surfaced a real batching bug, now fixed with a regression test: structural
 ops resolve spans from pre-batch disk truth, so a schema op + a ready fix in the SAME file —

@@ -58,5 +58,13 @@
     "prompt": "Add a required field `burst: number` to the QuotaPolicy interface in src/core/policy.ts — the extra requests a caller may briefly make above the steady limit — and set it to 0 at every place a QuotaPolicy object is constructed. Keep everything compiling.",
     "check": "grep -Eq 'burst: number' src/core/policy.ts && grep -q burst src/middleware/throttle.ts && grep -q burst src/api/admin.ts && grep -q burst src/reporting/usage.ts && grep -q burst src/cli/config.ts && npm run -s typecheck",
     "why": "SCIP's claimed margin, isolated: every consumer imports QuotaPolicy through a BARREL (core/index.ts `export *`), and the gate expands ONE reverse-import hop. SCIP's semantic graph edges consumers directly to policy.ts (barrel flattened), so the reject enumerates every construction site; a syntactic import graph (CI_TS_MODE=treesitter-gated) sees only consumer->barrel->policy — the barrel itself never errors on a new required field, so the barrel consumers sit OUTSIDE the gate and a commit can claim clean while tsc fails. Run in `full` vs `treesitter-gated` to measure whether the SCIP read path earns its keep; tsc + per-file burst greps are ungameable."
+  },
+  {
+    "id": "T10-monorepo",
+    "fixture": "fixture-monorepo",
+    "arms": ["baseline", "rust"],
+    "prompt": "This is a workspace monorepo (packages/core is imported by the other packages as `@acme/core`). Add a required field `timeoutMs: number` to the RetryPolicy interface in packages/core/src/policy.ts — the per-attempt timeout — and set it to 1000 at every place a RetryPolicy object is constructed, in every package. Keep `npm run typecheck` passing.",
+    "check": "grep -Eq 'timeoutMs: number' packages/core/src/policy.ts && grep -q timeoutMs packages/gateway/src/proxy.ts && grep -q timeoutMs packages/reports/src/digest.ts && npm run -s typecheck",
+    "why": "The MONOREPO seam: consumers import core via a BARE workspace specifier (`@acme/core`, root-tsconfig `paths` alias), which the syntactic resolver cannot follow at all — a bare specifier looks like a third-party package, so the fallback graph has ZERO cross-package edges and no transitive closure recovers them (edge-existence, not radius depth). SCIP resolves the alias through the TS compiler, so full mode's reject enumerates the construction sites in OTHER packages (e2e-verified: monorepo_bare_specifier test in lang-ts). Run `full` vs `CI_TS_MODE=treesitter-gated` — this is where the SCIP read path is load-bearing, not margin."
   }
 ]
