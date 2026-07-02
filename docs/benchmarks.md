@@ -282,7 +282,7 @@ repo size), while scip's one-hop set stays bounded by actual referencers. Both e
 the same way: on big/monorepo TS, `full` isn't margin, it's load-bearing — T10-monorepo below
 measures it.
 
-### T10-monorepo — the seam where SCIP is load-bearing (designed + e2e-verified, run pending)
+### T10-monorepo — the seam where SCIP is load-bearing (measured)
 
 `fixture-monorepo` is a workspace: `packages/core` consumed by `packages/gateway` and
 `packages/reports` via the **bare specifier** `@acme/core` (root-tsconfig `paths` alias — the
@@ -300,11 +300,23 @@ across the broken package boundary. It also verifies the ts-morph gate itself su
 cross-package diagnostics through the root tsconfig — full mode is sound end-to-end on this
 monorepo shape. (Project-references / multi-tsconfig monorepos remain untested.)
 
-Pre-registered predictions: `full` ≈ T9's trajectory (~6 turns, reject → fix batch, all
-packages updated); `treesitter-gated` either fails (trusts the false clean) or pays
-baseline-like hand-verification; baseline correct at its usual grind. Run:
-`bash scripts/agent-bench/go.sh --task T10-monorepo --runs 1`, then the same with
-`CI_TS_MODE=treesitter-gated --arms rust`.
+Pre-registered predictions: `full` ≈ T9's trajectory; `treesitter-gated` either fails
+(trusts the false clean) or pays baseline-like hand-verification. Measured (single runs,
+2026-07-02) — the second branch landed:
+
+| arm | turns | $ | ok | what happened |
+|---|--:|--:|:--:|---|
+| baseline | 9 | 0.1515 | 1/1 | grep + typecheck-iterate across packages |
+| `full` (SCIP) | 6 | 0.1056 | 1/1 | T9's trajectory: cross-package reject → fix batch — **−30%** |
+| `treesitter-gated` | 9 | 0.1519 | 1/1 | correct, but at **exactly baseline cost** (+44% vs full) — the agent hand-verified across the packages the gate couldn't see, doing baseline's work after paying for the tool |
+
+The gated arm got the right answer only because this trajectory happened to re-verify (the
+task text names `npm run typecheck`); the e2e proves a trusting trajectory commits broken.
+Either way the economics are decisive: **on the monorepo seam, the SCIP edges are the entire
+measured advantage** — without them the tool's win evaporates to zero, with them it's −30%.
+Together with T9: the syntactic tier's barrel gap was radius-DEPTH (fixable, fixed); the
+monorepo gap is edge-EXISTENCE (only a compiler can mint cross-package edges). `full` on
+TS monorepos is settled — not margin, load-bearing.
 
 (Designing T9 also surfaced a real batching bug, now fixed with a regression test: structural
 ops resolve spans from pre-batch disk truth, so a schema op + a ready fix in the SAME file —
