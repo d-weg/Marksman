@@ -552,6 +552,7 @@ dependencies = [
  "tree-sitter-javascript",
  "tree-sitter-python",
  "tree-sitter-ruby",
+ "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -582,6 +583,7 @@ dependencies = [
  "ci-scip",
  "ci-treesitter",
  "ignore",
+ "lang-fallback",
  "serde_json",
  "tempfile",
  "tree-sitter",

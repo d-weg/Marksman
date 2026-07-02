@@ -133,6 +133,7 @@ Environment variables:
 | `CI_TSMORPH_DIR` | where the ts-morph sidecar is installed | `<tmp>/ci-tsmorph` |
 | `CI_EDIT_ENGINE` | write engine: `tsmorph` (default) or `lsp` | `tsmorph` |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
+| `CI_TS_MODE` | TypeScript read-path ablation: `full` (default — SCIP + tree-sitter + gate) · `treesitter-gated` (tree-sitter read, same ts-morph gate, no scip/Node at startup) · `treesitter` (pure tree-sitter, ungated) — benchmarking knob, see docs/benchmarks.md | `full` |
 | `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off), e.g. `CI_SCIP_RUST` — Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) vs `mod`-only; generated at index time (≈ a `cargo check`) and content-fingerprinted: files edited since serve fresh tree-sitter edges, and a cache without a fingerprint is refused rather than trusted stale | the `scip.<lang>` config value |
 | `MARKSMAN_ROOT` | repo root for the MCP server (legacy `CODEINDEX_ROOT` still honored) | current directory |
 

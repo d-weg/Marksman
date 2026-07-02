@@ -30,6 +30,10 @@ use tree_sitter::{Node as TsNode, Parser, Point};
 pub enum FbLang {
     Python,
     Js,
+    /// TypeScript through the GENERIC provider — the `CI_TS_MODE` ablation arms only. NOT in
+    /// [`ALL`]: `.ts` files normally belong to lang-ts, so detection/outline dispatch must
+    /// never route them here; this variant is constructed explicitly by the registry builders.
+    Ts,
     Go,
     Java,
     Ruby,
@@ -49,6 +53,7 @@ impl FbLang {
         match name {
             "python" | "py" => Some(FbLang::Python),
             "js" | "javascript" => Some(FbLang::Js),
+            "ts-fallback" => Some(FbLang::Ts), // ablation arms only — never plain "ts"
             "go" => Some(FbLang::Go),
             "java" => Some(FbLang::Java),
             "ruby" | "rb" => Some(FbLang::Ruby),
@@ -67,6 +72,7 @@ impl FbLang {
         match self {
             FbLang::Python => tree_sitter_python::LANGUAGE.into(),
             FbLang::Js => tree_sitter_javascript::LANGUAGE.into(),
+            FbLang::Ts => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             FbLang::Go => tree_sitter_go::LANGUAGE.into(),
             FbLang::Java => tree_sitter_java::LANGUAGE.into(),
             FbLang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
@@ -79,6 +85,7 @@ impl FbLang {
         match self {
             FbLang::Python => &["py", "pyi"],
             FbLang::Js => &["js", "jsx", "mjs", "cjs"],
+            FbLang::Ts => &["ts", "mts", "cts"],
             FbLang::Go => &["go"],
             FbLang::Java => &["java"],
             FbLang::Ruby => &["rb"],
@@ -91,6 +98,7 @@ impl FbLang {
         match self {
             FbLang::Python => "python",
             FbLang::Js => "javascript",
+            FbLang::Ts => "typescript (tree-sitter ablation)",
             FbLang::Go => "go",
             FbLang::Java => "java",
             FbLang::Ruby => "ruby",
@@ -160,10 +168,11 @@ impl LanguageProvider for FallbackProvider {
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
-        // Import resolution is implemented for Python only; other fallback languages honestly
+        // Import resolution exists where the syntax makes it cheap and reliable: Python
+        // (dotted modules) and JS/TS (relative specifiers). Other fallback languages honestly
         // report NO edges (retrieval still works — graph expansion just doesn't) rather than
         // guessing edges from partially-understood import syntax.
-        if self.lang != FbLang::Python {
+        if !matches!(self.lang, FbLang::Python | FbLang::Js | FbLang::Ts) {
             return Ok(BTreeMap::new());
         }
         let mut graph: ImportGraph = BTreeMap::new();
@@ -172,7 +181,10 @@ impl LanguageProvider for FallbackProvider {
                 let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
                 let Some(tree) = self.parse(&content) else { continue };
                 let mut edges: Vec<PathBuf> = Vec::new();
-                collect_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges);
+                match self.lang {
+                    FbLang::Python => collect_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges),
+                    _ => collect_js_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges),
+                }
                 edges.sort();
                 edges.dedup();
                 if !edges.is_empty() {
@@ -211,7 +223,7 @@ pub fn outline(lang: FbLang, content: &str) -> String {
     // languages keep `elide_bodies`' default.
     let fn_kinds: &[&str] = match lang {
         FbLang::Python => &["function_definition"],
-        FbLang::Js => &["function_declaration", "generator_function_declaration", "method_definition"],
+        FbLang::Js | FbLang::Ts => &["function_declaration", "generator_function_declaration", "method_definition"],
         FbLang::Go => &["function_declaration", "method_declaration"],
         FbLang::Java => &["method_declaration", "constructor_declaration"],
         FbLang::Ruby => &["method", "singleton_method"],
@@ -243,8 +255,10 @@ fn classify(lang: FbLang, kind: &str) -> Option<Shape> {
         // JS (grammar includes JSX): classes qualify their methods; arrow-function consts are
         // variable declarators (no name field on the function) and stay out — same tradeoff as
         // scip's Term handling, revisit if it bites.
-        (FbLang::Js, "function_declaration" | "generator_function_declaration" | "method_definition") => Fn,
-        (FbLang::Js, "class_declaration") => Container,
+        (FbLang::Js | FbLang::Ts, "function_declaration" | "generator_function_declaration" | "method_definition") => Fn,
+        (FbLang::Js | FbLang::Ts, "class_declaration") => Container,
+        (FbLang::Ts, "interface_declaration" | "enum_declaration" | "abstract_class_declaration") => Container,
+        (FbLang::Ts, "type_alias_declaration") => Type,
         (FbLang::Go, "function_declaration" | "method_declaration") => Fn,
         (FbLang::Go, "type_spec") => Type,
         (FbLang::Java, "method_declaration" | "constructor_declaration") => Fn,
@@ -287,12 +301,14 @@ fn collect_generic(lang: FbLang, node: TsNode, bytes: &[u8], prefix: &str, out: 
         };
         let Some(name_node) = def_name(&child) else { continue };
         let Ok(name) = name_node.utf8_text(bytes) else { continue };
-        // A C `struct Foo x;` mentions the kind without a body — only DEFINITIONS count. Go's
-        // `type_spec` is the exception: its payload is a `type` field, and it only appears
-        // inside `type_declaration`, so it is always a definition.
+        // A C `struct Foo x;` mentions the kind without a body — only DEFINITIONS count. Two
+        // bodyless exceptions ARE definitions: go's `type_spec` (payload in its `type` field,
+        // only appears inside `type_declaration`) and TS's `type_alias_declaration` (payload
+        // in its `value` field).
         let is_definition = child.child_by_field_name("body").is_some()
             || matches!(shape, Shape::Fn)
-            || (lang == FbLang::Go && child.kind() == "type_spec");
+            || (lang == FbLang::Go && child.kind() == "type_spec")
+            || (lang == FbLang::Ts && child.kind() == "type_alias_declaration");
         if !is_definition {
             continue;
         }
@@ -600,6 +616,57 @@ fn collect_imports(node: TsNode, bytes: &[u8], from_rel: &str, root: &Path, out:
     }
 }
 
+/// JS/TS import edges from RELATIVE specifiers (`import … from './x'`, `export … from '../y'`).
+/// Bare specifiers are packages (skipped); TS convention `./x.js` resolves to `./x.ts`. Resolution
+/// tries the specifier as written, each source extension, then `index.<ext>` — misses cost an
+/// edge, never invent one.
+fn collect_js_imports(node: TsNode, bytes: &[u8], from_rel: &str, root: &Path, out: &mut Vec<PathBuf>) {
+    if matches!(node.kind(), "import_statement" | "export_statement") {
+        if let Some(src) = node.child_by_field_name("source") {
+            let spec = src.utf8_text(bytes).unwrap_or("").trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
+            if spec.starts_with("./") || spec.starts_with("../") {
+                if let Some(p) = resolve_js_specifier(root, from_rel, &spec) {
+                    out.push(p);
+                }
+            }
+        }
+    }
+    let mut c = node.walk();
+    for ch in node.named_children(&mut c) {
+        collect_js_imports(ch, bytes, from_rel, root, out);
+    }
+}
+
+fn resolve_js_specifier(root: &Path, from_rel: &str, spec: &str) -> Option<PathBuf> {
+    // Lexically normalize `./` and `../` so graph keys stay clean repo-relative paths.
+    let joined = Path::new(from_rel).parent().unwrap_or(Path::new("")).join(spec);
+    let mut base = PathBuf::new();
+    for c in joined.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                base.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => base.push(other),
+        }
+    }
+    // `./x.js` in TS source means `./x.ts` on disk — strip a source extension before probing.
+    let stripped = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"]
+        .iter()
+        .find(|e| base.extension().and_then(|x| x.to_str()) == Some(**e))
+        .map(|_| base.with_extension(""))
+        .unwrap_or_else(|| base.clone());
+    const EXTS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+    let mut candidates = vec![base.clone()];
+    for e in EXTS {
+        candidates.push(stripped.with_extension(e));
+    }
+    for e in EXTS {
+        candidates.push(stripped.join(format!("index.{e}")));
+    }
+    candidates.into_iter().find(|c| root.join(c).is_file()).map(|c| norm(&c))
+}
+
 /// `import a.b.c` → try `a/b/c.py`, `a/b/c/__init__.py` from the repo root and `src/`.
 fn push_absolute(root: &Path, parts: &[String], out: &mut Vec<PathBuf>) {
     for base in [PathBuf::new(), PathBuf::from("src")] {
@@ -747,6 +814,33 @@ mod tests {
         let f = nodes.iter().find(|n| n.id == "app.js#formatSpan").unwrap();
         assert!(f.children.iter().any(|c| c.id.ends_with(":body")), "js body sub-node");
         assert!(f.children.iter().any(|c| c.id.ends_with(":doc")), "leading comment -> :doc");
+    }
+
+    // The CI_TS_MODE ablation read path: TS through the generic collector, plus the JS/TS
+    // relative-import resolver (`./x.js` -> `x.ts`, index files, `..` normalization).
+    #[test]
+    fn ts_ablation_structure_and_import_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/util")).unwrap();
+        std::fs::write(
+            root.join("src/rank.ts"),
+            "import { clamp } from \"./util/math.js\";\nexport interface RankRow {\n  score: number;\n}\nexport type RankFn = (r: RankRow) => number;\nexport class Ranker {\n  top(rows: RankRow[]): RankRow[] {\n    return rows;\n  }\n}\nexport function rankAll(rows: RankRow[]): number {\n  return clamp(rows.length);\n}\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/util/math.ts"), "export function clamp(x: number): number {\n  return x;\n}\n").unwrap();
+
+        let prov = FallbackProvider::new(root, FbLang::Ts);
+        let nodes = prov.structure(Path::new("src/rank.ts")).unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"src/rank.ts#RankRow"), "interface: {ids:?}");
+        assert!(ids.contains(&"src/rank.ts#RankFn"), "type alias (bodyless definition): {ids:?}");
+        assert!(ids.contains(&"src/rank.ts#Ranker.top"), "method qualified: {ids:?}");
+        assert!(ids.contains(&"src/rank.ts#rankAll"), "function: {ids:?}");
+
+        let g = prov.import_graph().unwrap();
+        let edges = g.get(&PathBuf::from("src/rank.ts")).expect("rank.ts edges");
+        assert_eq!(edges, &vec![PathBuf::from("src/util/math.ts")], ".js specifier resolved to .ts: {edges:?}");
     }
 
     #[test]

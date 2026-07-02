@@ -72,6 +72,24 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
         "ts" => {
+            // CI_TS_MODE ablation arms (docs/benchmarks.md): serve TS from tree-sitter instead
+            // of SCIP — "treesitter" is the generic UNGATED provider (needs nothing external),
+            // "treesitter-gated" keeps the warm ts-morph gate on a tree-sitter read path.
+            match std::env::var("CI_TS_MODE").as_deref() {
+                Ok("treesitter") => {
+                    eprintln!("[marksman] language: typescript (ABLATION: generic tree-sitter, UNGATED — CI_TS_MODE=treesitter)");
+                    return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Ts)));
+                }
+                Ok("treesitter-gated") => {
+                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
+                        eprintln!("[marksman] typescript DISABLED (gated ablation still needs the gate's toolchain):\n{missing}");
+                        return ProviderBuild::Unavailable(missing);
+                    }
+                    eprintln!("[marksman] language: typescript (ABLATION: tree-sitter read + ts-morph gate — CI_TS_MODE=treesitter-gated)");
+                    return ProviderBuild::Ready(Arc::new(lang_ts::TsTreeGated::new(root)));
+                }
+                _ => {}
+            }
             // Check the toolchain BEFORE running any of it: a missing Node is one actionable
             // message (what + why + install), not a cryptic npx spawn error mid-index.
             if let Some(missing) = lang_ts::toolchain().describe_missing() {

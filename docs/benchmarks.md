@@ -181,6 +181,32 @@ servers; future runs can't leak.
   improved retrieval and edit-workflow design, not only Rust speed. And it is **TypeScript-only**
   by design — its totals exclude T7 (see the table note).
 
+### Read-path ablation — is SCIP worth it? (pending)
+
+`CI_TS_MODE` swaps the TypeScript provider's read path so the SAME T1–T6 tasks can measure
+what each layer buys:
+
+| mode | read path | gate | external deps at startup |
+|---|---|---|---|
+| `full` (default) | SCIP + tree-sitter deepen | warm ts-morph | Node (scip-typescript index) |
+| `treesitter-gated` | tree-sitter structure + relative-import graph | warm ts-morph | none (Node only on first edit) |
+| `treesitter` | tree-sitter (generic provider) | **none** (`gated: false` + rename scan) | none |
+
+Run each mode as its own invocation (the index is rebuilt per run under the mode's env, so
+index and server always agree):
+
+```bash
+bash scripts/agent-bench/go.sh --arms baseline,rust --runs 3                          # full
+CI_TS_MODE=treesitter-gated bash scripts/agent-bench/go.sh --arms rust --runs 3
+CI_TS_MODE=treesitter       bash scripts/agent-bench/go.sh --arms rust --runs 3
+```
+
+Predictions to check against reality: T1–T4 (single-file-ish edits) should be close — ts-morph's
+rename is compiler-driven in both gated modes; T5/T6 should expose SCIP's semantic reference
+graph (blast-radius rejects across barrels; the tree-sitter import graph is syntactic and
+misses re-export flattening); `treesitter` pays for no gate on any task where the first edit
+isn't perfect. **Not yet measured.**
+
 ### T8-fallback — the generic (UNGATED) provider, and a lesson in tool ergonomics
 
 T8 exercises the generic tree-sitter fallback: a Python and a Go rename in one session —

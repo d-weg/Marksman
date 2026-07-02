@@ -16,6 +16,8 @@ serde_json.workspace = true
 ignore.workspace = true
 tree-sitter = { workspace = true }
 tree-sitter-typescript = "0.23.2"
+# Read path of the CI_TS_MODE=treesitter-gated ablation provider.
+lang-fallback = { path = "../lang-fallback" }
 
 [[bin]]
 name = "marksman-provider-ts"

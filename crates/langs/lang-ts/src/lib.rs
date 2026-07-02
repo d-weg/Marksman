@@ -403,6 +403,76 @@ impl LanguageProvider for TsProvider {
     }
 }
 
+// ── the CI_TS_MODE=treesitter-gated ablation provider ────────────────────────
+
+/// TypeScript with a tree-sitter READ path (the generic fallback's TS collector + its
+/// relative-import graph — no scip, no index build, no Node at startup) and the SAME warm
+/// ts-morph GATE as the full provider. Exists to measure end to end what SCIP's
+/// compiler-accurate symbols and reference graph actually buy (see docs/benchmarks.md); the
+/// registry builders construct it only under `CI_TS_MODE=treesitter-gated`. Note ts-morph's
+/// `rename` is still project-wide (the compiler finds references) — the ablated piece is the
+/// read/blast-radius fidelity, not the rename.
+#[derive(Clone)]
+pub struct TsTreeGated {
+    root: PathBuf,
+    read: lang_fallback::FallbackProvider,
+    engine: WarmEngine,
+}
+
+impl TsTreeGated {
+    pub fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            read: lang_fallback::FallbackProvider::new(root, lang_fallback::FbLang::Ts),
+            engine: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
+impl LanguageProvider for TsTreeGated {
+    fn granularity(&self) -> Granularity {
+        Granularity::Ast
+    }
+
+    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
+        self.read.structure(file)
+    }
+
+    fn import_graph(&self) -> Result<ImportGraph> {
+        self.read.import_graph()
+    }
+
+    fn prewarm(&self) {
+        let slot = self.engine.clone();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let Ok(mut guard) = slot.lock() else { return };
+            if guard.is_some() {
+                return;
+            }
+            if let Ok(mut engine) = start_engine(&root) {
+                let _ = engine.diagnostics(&[]);
+                *guard = Some(engine);
+            }
+        });
+    }
+
+    fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
+        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some(start_engine(&self.root)?);
+        }
+        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
+        let structure_of = |f: &str| self.read.structure(Path::new(f)).unwrap_or_default();
+        // Blast radius from the tree-sitter relative-import graph — syntactically derived,
+        // so barrels/re-exports don't flatten like SCIP's semantic edges. That fidelity gap
+        // is part of what this ablation measures.
+        let reverse = ci_core::reverse_import_map(&self.read.import_graph().unwrap_or_default());
+        let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
+        ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +573,45 @@ mod tests {
         .unwrap();
         let refreshed = TsProvider::open(root).expect("open after edit reindexes");
         assert!(refreshed.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.name.as_deref() == Some("sub")));
+    }
+
+    // The treesitter-gated ablation provider: no scip anywhere, tree-sitter reads, and the
+    // SAME warm ts-morph gate — a type-breaking edit must reject, a cross-file rename must
+    // still land everywhere (the compiler finds references even though reads are syntactic).
+    // #[ignore]; `cargo test -p lang-ts -- --ignored`.
+    #[test]
+    #[ignore]
+    fn treesitter_gated_gates_and_renames() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/math.ts"), "export function add(a: number, b: number): number {\n  return a + b;\n}\n").unwrap();
+        fs::write(root.join("src/app.ts"), "import { add } from \"./math\";\nexport const r = add(1, 2);\n").unwrap();
+
+        let p = TsTreeGated::new(root);
+        // tree-sitter read path sees the symbols with no scip index anywhere.
+        assert!(!root.join(".marksman/index.scip").exists());
+        assert!(p.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.id == "src/math.ts#add"));
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        // Type-breaking edit -> REJECTED (the gate is real).
+        let bad = p
+            .apply_edits(&[EditOp::SetBody { node_id: "src/math.ts#add".into(), body: "{\n  \"nope\"\n}".into() }], &opts)
+            .unwrap();
+        assert!(matches!(bad, CommitResult::Rejected { .. }), "type error must reject: {bad:?}");
+
+        // Cross-file rename -> both files rewritten (ts-morph finds references).
+        let ok = p
+            .apply_edits(&[EditOp::Rename { node_id: "src/math.ts#add".into(), new_name: "sum".into() }], &opts)
+            .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "rename commits: {ok:?}");
+        assert!(fs::read_to_string(root.join("src/app.ts")).unwrap().contains("sum(1, 2)"), "caller renamed");
+        assert!(!fs::read_to_string(root.join("src/math.ts")).unwrap().contains("add"), "definition renamed");
     }
 
     // Real end-to-end for the post-edit read refresh (scip-typescript + node + ts-morph):

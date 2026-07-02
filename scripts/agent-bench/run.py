@@ -45,8 +45,12 @@ def mcp_config_for(arm):
         return None
     if arm == "rust":
         env = {"CI_NPM_CACHE": os.environ.get("CI_NPM_CACHE", "/tmp/ci-npm-cache")}
-        if os.environ.get("CI_MODEL_DIR"):
-            env["CI_MODEL_DIR"] = os.environ["CI_MODEL_DIR"]
+        # Pass ablation/config knobs through to the server (CI_TS_MODE runs the tree-sitter
+        # arms of the read-path ablation — see docs/benchmarks.md; the index build inherits
+        # the same shell env, so index and server always agree on the mode).
+        for k in ("CI_MODEL_DIR", "CI_TS_MODE"):
+            if os.environ.get(k):
+                env[k] = os.environ[k]
         cfg = {"mcpServers": {"marksman": {"command": str(ROOT / "target/release/marksman-mcp"), "env": env}}}
     else:  # ts — the Node oracle
         cfg = {"mcpServers": {"marksman": {
@@ -286,7 +290,8 @@ def main():
         ctxs[None] = prepare_repo(os.path.abspath(args.repo), arms)
     for name in sorted({t["fixture"] for t in tasks if "fixture" in t}):
         ctxs[name] = prepare_repo(materialize_fixture(name), arms)
-    print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model}")
+    mode = os.environ.get("CI_TS_MODE", "full")
+    print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model} · CI_TS_MODE: {mode}")
     for name, c in ctxs.items():
         print(f"repo[{name or 'main'}]: {c['repo']} @ {c['base'][:8]}")
     print()
