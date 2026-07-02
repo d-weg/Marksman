@@ -13,7 +13,7 @@ Marksman is a local-first [Model Context Protocol](https://modelcontextprotocol.
 Written in Rust: a language-blind core plus per-language providers, in two support tiers:
 
 - **First-class (type-checked, gated edits):** **TypeScript** and **Rust** — every edit is verified by the language's own compiler before it lands.
-- **Best-effort (generic provider):** **Python, JavaScript, Go, Java, Ruby, C, C++** — full retrieval, outlines, and structural edits via an in-process tree-sitter provider. Edits are *not* compile-verified (every response says `gated: false`), renames are within-file but come with a **server-side repo-wide verification scan** plus ready-to-copy fixes for anything the rename couldn't reach. Useful, honest — not the first-class experience.
+- **Best-effort (generic provider):** **Python, JavaScript, Go, Java, Ruby, C, C++** — full retrieval, outlines, and structural edits via an in-process tree-sitter provider. Edits are **syntax-gated** (a change that no longer parses is rejected — tree-sitter never refuses input, so new ERROR nodes are the signal) but *not* type-verified (every response says `gated: false`); renames are within-file but come with a **server-side repo-wide verification scan** plus ready-to-copy fixes for anything the rename couldn't reach. Useful, honest — not the first-class experience.
 
 ## Why
 

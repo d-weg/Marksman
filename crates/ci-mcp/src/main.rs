@@ -894,8 +894,9 @@ impl Server {
                     "\nRun the project's own checks if correctness is uncertain.\n".to_string()
                 };
                 Ok(format!(
-                    "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — no type-checker \
-                     is wired for the edited language(s), so the edits were NOT compile-verified.{scan}Files changed:\n{}",
+                    "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — syntax-checked \
+                     (the result parses; edits introducing syntax errors are rejected) but NOT type-verified: no \
+                     type-checker is wired for the edited language(s).{scan}Files changed:\n{}",
                     if dry_run { " (dry run — nothing written yet)" } else { "" },
                     changed_files.len(),
                     changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),

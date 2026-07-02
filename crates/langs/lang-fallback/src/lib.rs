@@ -389,8 +389,20 @@ impl NoGate {
 }
 
 impl GateEngine for NoGate {
-    fn diagnostics(&mut self, _files: &[(String, String)]) -> Result<Vec<Diag>> {
-        Ok(vec![]) // ungated: no type-checker for this language
+    /// tree-sitter can't type-check, but it CAN parse — and since it never refuses input
+    /// (error-RECOVERING: any bytes yield a tree, breakage becomes ERROR/missing nodes), the
+    /// way to "ask" it whether the edited content is acceptable is to count those nodes.
+    /// `commit_edits`' baseline-diff then rejects any edit introducing a NEW syntax error
+    /// (the unbalanced brace a bad set_body leaves behind) while pre-existing breakage never
+    /// blocks an unrelated edit. Honest limit: a syntax gate, not a compiler — some invalid
+    /// code still parses clean.
+    fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
+        let mut out = Vec::new();
+        for (path, content) in files {
+            let Some(tree) = self.parse(content) else { continue };
+            collect_syntax_errors(tree.root_node(), content, path, &mut out);
+        }
+        Ok(out)
     }
 
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
@@ -428,6 +440,36 @@ impl GateEngine for NoGate {
 /// (go/c/cpp/java), ruby's `constant`.
 fn is_ident(n: &TsNode) -> bool {
     n.kind().ends_with("identifier") || n.kind() == "constant"
+}
+
+/// ERROR / missing nodes → `Diag`s. The message embeds a short source excerpt rather than the
+/// line number, so a pre-existing error whose line SHIFTS under an edit keeps an identical
+/// message — baseline-diff keys on (file, code, message) and must not re-flag it as new.
+/// ERROR subtrees are not descended (nested noise); capped per file.
+fn collect_syntax_errors(root: TsNode, content: &str, file: &str, out: &mut Vec<Diag>) {
+    let mut stack = vec![root];
+    let mut count = 0;
+    while let Some(n) = stack.pop() {
+        if count >= 10 {
+            return;
+        }
+        if n.is_error() || n.is_missing() {
+            let line = n.start_position().row as u32 + 1;
+            let message = if n.is_missing() {
+                format!("syntax error: missing `{}`", n.kind())
+            } else {
+                let excerpt: String = content[n.byte_range()].chars().take(40).collect();
+                format!("syntax error near `{}`", excerpt.trim())
+            };
+            out.push(Diag { file: file.to_string(), code: 0, message, line });
+            count += 1;
+            continue; // don't descend into an ERROR subtree
+        }
+        let mut c = n.walk();
+        for ch in n.children(&mut c) {
+            stack.push(ch);
+        }
+    }
 }
 
 fn collect_identifier_edits(node: TsNode, bytes: &[u8], old: &str, new: &str, out: &mut Vec<Value>) {
@@ -814,6 +856,39 @@ mod tests {
         let f = nodes.iter().find(|n| n.id == "app.js#formatSpan").unwrap();
         assert!(f.children.iter().any(|c| c.id.ends_with(":body")), "js body sub-node");
         assert!(f.children.iter().any(|c| c.id.ends_with(":doc")), "leading comment -> :doc");
+    }
+
+    // The tree-sitter SYNTAX gate: an edit that no longer parses must REJECT (tree-sitter
+    // never refuses input, so "unparseable" = new ERROR/missing nodes, baseline-diffed), and
+    // a file's PRE-EXISTING breakage must never block an unrelated edit.
+    #[test]
+    fn syntax_gate_rejects_broken_edits_but_not_preexisting_breakage() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("svc.go"), "package svc\n\nfunc probe(url string) bool {\n\treturn true\n}\n").unwrap();
+        // A SECOND file that is already broken — must not block edits to svc.go.
+        fs::write(root.join("broken.go"), "package svc\n\nfunc oops( {\n").unwrap();
+        let p = FallbackProvider::new(root, FbLang::Go);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        // Unbalanced-brace body -> REJECTED, disk untouched.
+        let before = fs::read_to_string(root.join("svc.go")).unwrap();
+        let bad = p
+            .apply_edits(&[EditOp::SetBody { node_id: "svc.go#probe".into(), body: "{\n\treturn (true\n".into() }], &opts)
+            .unwrap();
+        assert!(matches!(bad, CommitResult::Rejected { .. }), "broken syntax must reject: {bad:?}");
+        assert_eq!(fs::read_to_string(root.join("svc.go")).unwrap(), before, "disk untouched on reject");
+
+        // A clean edit to the same file still commits (broken.go's errors are baseline).
+        let ok = p
+            .apply_edits(&[EditOp::SetBody { node_id: "svc.go#probe".into(), body: "{\n\treturn false\n}".into() }], &opts)
+            .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "clean edit commits despite unrelated pre-existing breakage: {ok:?}");
+        assert!(fs::read_to_string(root.join("svc.go")).unwrap().contains("return false"));
+
+        // Editing the BROKEN file without fixing it: its old errors are baseline, so a clean
+        // structural change... skip — its structure is unparseable; the contract that matters
+        // is above: pre-existing breakage elsewhere never blocks.
     }
 
     // The CI_TS_MODE ablation read path: TS through the generic collector, plus the JS/TS

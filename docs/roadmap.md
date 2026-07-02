@@ -14,7 +14,8 @@ batch, checkboxes ticked here.
   edit-gate *orchestration* need nothing but Rust. Any runtime dependency (Node, an indexer, a
   language server) belongs to a **language provider**, never the core. Load-bearing.
 - **Gated edits stay gated.** Every code edit is type-checked over the blast radius before it lands;
-  the tree-sitter fallback applies edits **ungated** and must report `gated: false`.
+  the tree-sitter fallback applies edits **syntax-gated only** (new parse errors reject; no type
+  check) and must report `gated: false`.
 - **Address by handle.** A node id (`file#Scope.name`, optionally `:body`/`:doc`/`:param.N`) is
   unique AND self-locating — resolve cheapest-precision first, never make the agent re-locate.
 - **No ranking change without an eval.** Once the labeled eval lands (Batch 5), any change to a
