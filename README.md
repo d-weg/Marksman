@@ -42,7 +42,7 @@ On a 7-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an
 
 Dependencies are **per language, checked only for languages your repo actually contains** — a
 Rust-only repo never needs (or touches) Node, and a TS-only repo never needs rust-analyzer.
-Run `codeindex-rs doctor <repo>` any time to see exactly what your repo needs, what's
+Run `marksman doctor <repo>` any time to see exactly what your repo needs, what's
 installed, and how to install what's missing.
 
 - **Rust** (stable) — to build Marksman itself. <https://rustup.rs>
@@ -61,7 +61,7 @@ language's files) — it never half-works or silently degrades.
 git clone https://github.com/d-weg/Marksman.git
 cd Marksman
 cargo build --release
-# produces: target/release/codeindex-rs (CLI) and target/release/codeindex-rs-mcp (MCP server)
+# produces: target/release/marksman (CLI) and target/release/marksman-mcp (MCP server)
 ```
 
 ### 2. Get the embedding model
@@ -81,8 +81,8 @@ The directory must contain `model.safetensors`, `tokenizer.json`, and `config.js
 ### 3. Index a repo
 ```bash
 export CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M"
-target/release/codeindex-rs index /path/to/your/ts-repo            # writes .codeindex-rs/ into the repo
-target/release/codeindex-rs retrieve /path/to/your/ts-repo "where is the rate limiter"   # sanity check
+target/release/marksman index /path/to/your/ts-repo               # writes .marksman/ into the repo
+target/release/marksman retrieve /path/to/your/ts-repo "where is the rate limiter"   # sanity check
 ```
 
 ### 4. Register the MCP server with your agent
@@ -91,7 +91,7 @@ Add Marksman to your MCP client's config (Claude Code, Cursor, or any MCP client
 {
   "mcpServers": {
     "marksman": {
-      "command": "/absolute/path/to/Marksman/target/release/codeindex-rs-mcp",
+      "command": "/absolute/path/to/Marksman/target/release/marksman-mcp",
       "env": {
         "CI_MODEL_DIR": "/home/you/.marksman/models/potion-code-16M",
         "CI_NPM_CACHE": "/tmp/ci-npm-cache"
@@ -100,21 +100,21 @@ Add Marksman to your MCP client's config (Claude Code, Cursor, or any MCP client
   }
 }
 ```
-The server indexes the repo it is launched in (its working directory); or pass `--root /path/to/repo`, or set `CODEINDEX_ROOT`. Build the index once with `codeindex-rs index` (step 3) before first use.
+The server indexes the repo it is launched in (its working directory); or pass `--root /path/to/repo`, or set `MARKSMAN_ROOT`. Build the index once with `marksman index` (step 3) before first use.
 
 For **Claude Code**:
 ```bash
 claude mcp add marksman \
   --env CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M" \
-  -- /absolute/path/to/Marksman/target/release/codeindex-rs-mcp
+  -- /absolute/path/to/Marksman/target/release/marksman-mcp
 ```
 
 ## CLI
 
 ```
-codeindex-rs index    <repo>                              # build / refresh the index (.codeindex-rs/)
-codeindex-rs retrieve <repo> "<task>" [--top N] [--json]  # query the index
-codeindex-rs doctor   [<repo>]                            # per-language dependency report: what this
+marksman index    <repo>                              # build / refresh the index (.marksman/)
+marksman retrieve <repo> "<task>" [--top N] [--json]  # query the index
+marksman doctor   [<repo>]                            # per-language dependency report: what this
                                                           # repo needs, what's installed, what's missing
                                                           # (with install commands); exit 1 if unhealthy
 ```
@@ -131,9 +131,9 @@ Environment variables:
 | `CI_EDIT_ENGINE` | write engine: `tsmorph` (default) or `lsp` | `tsmorph` |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
 | `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off), e.g. `CI_SCIP_RUST` — Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) vs `mod`-only; generated at index time (≈ a `cargo check`) and content-fingerprinted: files edited since serve fresh tree-sitter edges, and a cache without a fingerprint is refused rather than trusted stale | the `scip.<lang>` config value |
-| `CODEINDEX_ROOT` | repo root for the MCP server | current directory |
+| `MARKSMAN_ROOT` | repo root for the MCP server (legacy `CODEINDEX_ROOT` still honored) | current directory |
 
-An optional `codeindex.config.json` in the repo root overrides retrieval / index settings (top-N, RRF k, weights, …). For example, `{ "scip": { "rust": true } }` builds the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) instead of the `mod`-only tree-sitter graph (`scip` is a per-language map; `CI_SCIP_RUST` overrides it per-run).
+An optional `marksman.config.json` in the repo root (the legacy `codeindex.config.json` name is still read) overrides retrieval / index settings (top-N, RRF k, weights, …). For example, `{ "scip": { "rust": true } }` builds the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) instead of the `mod`-only tree-sitter graph (`scip` is a per-language map; `CI_SCIP_RUST` overrides it per-run).
 
 ## Status
 

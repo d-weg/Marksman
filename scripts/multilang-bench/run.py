@@ -25,7 +25,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 FIX = os.path.join(HERE, "fixture")
-RUST = os.path.join(ROOT, "target/release/codeindex-rs")
+RUST = os.path.join(ROOT, "target/release/marksman")
 K = 5
 
 # (task, the file that should surface, its language)

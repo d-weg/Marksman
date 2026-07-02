@@ -100,7 +100,7 @@ impl RustProvider {
 
     /// The cached `rust-analyzer scip` index (the optional compiler-accurate graph source).
     fn scip_cache(&self) -> PathBuf {
-        self.root.join(".codeindex-rs").join("rust.scip")
+        self.root.join(".marksman").join("rust.scip")
     }
 
     /// The `use`/reference import graph from the cached SCIP index, kept honest: the base
@@ -161,13 +161,13 @@ impl RustProvider {
     }
 }
 
-/// Generate the cached SCIP index (`<root>/.codeindex-rs/rust.scip`) by running
+/// Generate the cached SCIP index (`<root>/.marksman/rust.scip`) by running
 /// `rust-analyzer scip` — the source for the optional compiler-accurate `use` graph
 /// (`CI_RUST_SCIP`). Run at index time (a batch step); `import_graph` then reads it. Slow (≈ a
 /// `cargo check`), so it's never on the live path. Errors propagate so the caller can warn and
 /// fall back to the tree-sitter `mod` graph.
 pub fn refresh_scip(root: &Path) -> Result<()> {
-    let out = root.join(".codeindex-rs").join("rust.scip");
+    let out = root.join(".marksman").join("rust.scip");
     if let Some(d) = out.parent() {
         std::fs::create_dir_all(d).map_err(|e| Error::Driver(format!("scip cache dir: {e}")))?;
     }
@@ -696,7 +696,7 @@ mod tests {
 
         // SCIP graph: the `use crate::lexer::Token` dependency IS captured.
         refresh_scip(root).expect("rust-analyzer scip");
-        let cache = root.join(".codeindex-rs/rust.scip");
+        let cache = root.join(".marksman/rust.scip");
         assert!(cache.is_file(), "scip cache written");
         let scip_g = ci_scip::ScipIndex::load(&cache).unwrap().import_graph().unwrap();
         let edges = scip_g.get(&PathBuf::from("src/parser.rs")).expect("parser.rs edges from scip");
@@ -774,7 +774,7 @@ mod tests {
         assert!(has_edge(&p2.import_graph().unwrap()), "drift overlay serves the edge across sessions");
 
         // No fingerprint -> the cache is refused (mod-graph fallback), never served stale.
-        fs::remove_file(root.join(".codeindex-rs/rust.scip.fingerprint.json")).unwrap();
+        fs::remove_file(root.join(".marksman/rust.scip.fingerprint.json")).unwrap();
         let p3 = RustProvider::new(root).with_scip(true);
         assert!(!has_edge(&p3.import_graph().unwrap()), "fingerprint-less cache must not be trusted");
     }

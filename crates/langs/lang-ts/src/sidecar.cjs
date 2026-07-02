@@ -1,5 +1,5 @@
 // ts-morph sidecar — a persistent Node process that holds the TS project in memory and
-// answers the GateEngine operations (diagnostics / rename / willRename) for codeindex-rs.
+// answers the GateEngine operations (diagnostics / rename / willRename) for Marksman.
 // Protocol: newline-delimited JSON on stdin/stdout. One request -> one response, echoing `id`.
 //
 //   {"id":1,"op":"diagnostics","files":[{"path":"src/a.ts","content":"..."}]}

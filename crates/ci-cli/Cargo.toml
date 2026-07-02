@@ -3,10 +3,10 @@ name = "ci-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "codeindex-rs CLI: index + retrieve (TS via SCIP + native Model2Vec)."
+description = "Marksman CLI: index / retrieve / doctor."
 
 [[bin]]
-name = "codeindex-rs"
+name = "marksman"
 path = "src/main.rs"
 
 [dependencies]

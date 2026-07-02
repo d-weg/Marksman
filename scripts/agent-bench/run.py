@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Agent A/B/C benchmark — same agent, same tasks, same repo, across arms:
-  baseline  (no codeindex)   ·   rust (codeindex-rs MCP)   ·   ts (codeindex Node MCP)
+  baseline  (no marksman)   ·   rust (marksman MCP)   ·   ts (the Node prototype MCP)
 
 Trustworthy by construction (see README.md): the only thing that varies between arms is
 which MCP server is loaded; model, prompt, and repo start-state are identical; every run
@@ -18,23 +18,23 @@ import argparse, json, os, pathlib, shutil, statistics, subprocess, sys, tempfil
 HERE = pathlib.Path(__file__).parent
 TASKS = json.loads((HERE / "tasks.json").read_text())
 ROOT = HERE.parent.parent
-RUST = str(ROOT / "target/release/codeindex-rs")
+RUST = str(ROOT / "target/release/marksman")
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 TS_DIR = os.environ.get("CODEINDEX_TS_DIR", os.path.expanduser("~/codeindex"))
 
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
-    "mcp__codeindex__retrieve_context",
-    "mcp__codeindex__describe_architecture",
-    "mcp__codeindex__find_symbols",
-    "mcp__codeindex__list_anchors",
-    "mcp__codeindex__read_node",
-    "mcp__codeindex__apply_edits",
+    "mcp__marksman__retrieve_context",
+    "mcp__marksman__describe_architecture",
+    "mcp__marksman__find_symbols",
+    "mcp__marksman__list_anchors",
+    "mcp__marksman__read_node",
+    "mcp__marksman__apply_edits",
 ])
 
-# The three arms; "baseline" runs with no codeindex MCP. Configs are GENERATED at runtime
+# The three arms; "baseline" runs with no marksman MCP. Configs are GENERATED at runtime
 # (see mcp_config_for) so the repo carries no machine-specific absolute paths. Both servers
-# are named "codeindex" so the same mcp__codeindex__* tool allow-list works for either.
+# are named "marksman" so the same mcp__marksman__* tool allow-list works for either.
 ARMS = ("baseline", "rust", "ts")
 
 
@@ -47,9 +47,9 @@ def mcp_config_for(arm):
         env = {"CI_NPM_CACHE": os.environ.get("CI_NPM_CACHE", "/tmp/ci-npm-cache")}
         if os.environ.get("CI_MODEL_DIR"):
             env["CI_MODEL_DIR"] = os.environ["CI_MODEL_DIR"]
-        cfg = {"mcpServers": {"codeindex": {"command": str(ROOT / "target/release/codeindex-rs-mcp"), "env": env}}}
+        cfg = {"mcpServers": {"marksman": {"command": str(ROOT / "target/release/marksman-mcp"), "env": env}}}
     else:  # ts — the Node oracle
-        cfg = {"mcpServers": {"codeindex": {
+        cfg = {"mcpServers": {"marksman": {
             "command": os.path.join(TS_DIR, "node_modules/.bin/tsx"),
             "args": [os.path.join(TS_DIR, "src/mcp.ts")],
         }}}
@@ -66,11 +66,11 @@ def sh(cmd, cwd=None, env=None):
 # Index dirs are NOT plain build artifacts: apply_edits reindexes-on-commit, so a run that
 # edits the repo mutates its index. If we merely preserved them across resets, run N+1 would
 # search an index that reflects run N's edits (e.g. a symbol already renamed) while the SOURCE
-# was reset — a stale, source-inconsistent index that silently penalizes the codeindex arms.
+# was reset — a stale, source-inconsistent index that silently penalizes the marksman arms.
 # So we snapshot the freshly-built, base-consistent indexes ONCE and RESTORE them on every
 # reset (a file copy, not a reindex — no API cost). Every run starts from an identical index
 # that matches the reset source.
-INDEX_DIRS = [".codeindex", ".codeindex-rs"]
+INDEX_DIRS = [".codeindex", ".marksman"]
 
 
 def snapshot_indexes(repo):
@@ -110,14 +110,14 @@ def materialize_fixture(name):
     return tmp
 
 
-# Nudge the codeindex arms to actually USE the tools — otherwise the benchmark
+# Nudge the marksman arms to actually USE the tools — otherwise the benchmark
 # measures the agent's whim (it often defaults to grep + manual edits) instead of the
 # tool. The baseline gets no such nudge; it uses its standard tools.
 PREAMBLE = (
-    "You have codeindex MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
-    "names (a bare name like `select:apply_edits` FAILS — it must be `mcp__codeindex__apply_edits`):\n"
-    "  ToolSearch  query=\"select:mcp__codeindex__apply_edits,mcp__codeindex__find_symbols,"
-    "mcp__codeindex__retrieve_context,mcp__codeindex__read_node,mcp__codeindex__list_anchors\"\n"
+    "You have marksman MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
+    "names (a bare name like `select:apply_edits` FAILS — it must be `mcp__marksman__apply_edits`):\n"
+    "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__find_symbols,"
+    "mcp__marksman__retrieve_context,mcp__marksman__read_node,mcp__marksman__list_anchors\"\n"
     "What they do: apply_edits (structural + surgical edits — rename / move_file / replace_text / "
     "set_body / replace_node target:body|return|param.N / insert_member — all type-checked before they "
     "land), find_symbols (name -> node-id handles; to disambiguate a name apply_edits called ambiguous), "
@@ -232,7 +232,7 @@ def preflight():
 
 def build_indexes(repo, arms):
     if "rust" in arms and os.path.exists(RUST):
-        print("  building Rust index (.codeindex-rs) …")
+        print("  building marksman index (.marksman) …")
         sh([RUST, "index", repo], env={**os.environ, "CI_NPM_CACHE": "/tmp/ci-npm-cache"})
     if "ts" in arms and os.path.isdir(TS_DIR):
         print("  building TS index (.codeindex) …")
@@ -243,7 +243,7 @@ def prepare_repo(repo, arms):
     """Reset to a pristine base, build the indexes from scratch, snapshot them. Returns the
     context every run of every task against this repo starts from."""
     base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
-    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `codeindex-rs
+    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `marksman
     # index` updates INCREMENTALLY (mtime-keyed), so a stale index left by a prior run — or a
     # dirty working tree — would be snapshotted and then restored on every reset, leaving the
     # index inconsistent with the reset SOURCE (the T6 postmortem). Reset tracked source to

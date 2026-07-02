@@ -1,7 +1,7 @@
-//! codeindex-rs MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the
+//! Marksman MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the
 //! input tools (retrieve_context, describe_architecture, find_symbols) and the
 //! output tools (list_anchors, read_node, apply_edits). Launch per repo:
-//!   codeindex-rs-mcp --root /path/to/repo   (or $CODEINDEX_ROOT, or cwd)
+//!   marksman-mcp --root /path/to/repo   (or $MARKSMAN_ROOT, or cwd)
 //!
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
@@ -30,16 +30,16 @@ use std::sync::{Arc, Mutex};
 fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
         if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
-            eprintln!("[codeindex-rs-mcp] language: {lang} (sidecar process — protobuf wire)");
+            eprintln!("[marksman-mcp] language: {lang} (sidecar process — protobuf wire)");
             match ProcessProvider::spawn(cmd) {
                 Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
-                    eprintln!("[codeindex-rs-mcp] sidecar {lang} failed to start ({e}); skipping");
+                    eprintln!("[marksman-mcp] sidecar {lang} failed to start ({e}); skipping");
                     return ProviderBuild::Failed(e.to_string());
                 }
             }
         }
-        eprintln!("[codeindex-rs-mcp] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
+        eprintln!("[marksman-mcp] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
     }
     match lang {
         "rust" => {
@@ -47,9 +47,9 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             // up. rust-analyzer gates only WRITES: warn now if missing, and apply_edits repeats
             // the same install hint if actually invoked.
             if let Some(missing) = lang_rust::toolchain().describe_missing() {
-                eprintln!("[codeindex-rs-mcp] warning: {missing}\n  (rust reads work; type-checked edits will fail until installed)");
+                eprintln!("[marksman-mcp] warning: {missing}\n  (rust reads work; type-checked edits will fail until installed)");
             }
-            eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
+            eprintln!("[marksman-mcp] language: rust (tree-sitter, in-process — no Node)");
             ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
         "ts" => {
@@ -57,16 +57,16 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             // toolchain = the language is off, loudly and actionably — never a half-working
             // provider or an ungated fallback.
             if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                eprintln!("[codeindex-rs-mcp] typescript DISABLED:\n{missing}");
+                eprintln!("[marksman-mcp] typescript DISABLED:\n{missing}");
                 return ProviderBuild::Unavailable(missing);
             }
             // `open` loads the cached .codeindex/index.scip when the source fingerprint still
             // matches (ms), and re-runs scip-typescript only when it doesn't (~20s).
-            eprintln!("[codeindex-rs-mcp] language: typescript — opening scip index for {} …", root.display());
+            eprintln!("[marksman-mcp] language: typescript — opening scip index for {} …", root.display());
             match TsProvider::open(root) {
                 Ok(p) => ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
-                    eprintln!("[codeindex-rs-mcp] typescript indexing failed ({e}); skipping TS files");
+                    eprintln!("[marksman-mcp] typescript indexing failed ({e}); skipping TS files");
                     ProviderBuild::Failed(e.to_string())
                 }
             }
@@ -76,7 +76,7 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
         other => match FbLang::from_name(other) {
             Some(fb) => {
                 eprintln!(
-                    "[codeindex-rs-mcp] language: {} (generic tree-sitter fallback, in-process — edits are ungated)",
+                    "[marksman-mcp] language: {} (generic tree-sitter fallback, in-process — edits are ungated)",
                     fb.label()
                 );
                 ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
@@ -90,7 +90,7 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
 /// so a mixed repo reads/edits fully. Absent/disabled languages register nothing.
 fn build_registry_for(root: &Path) -> Result<ProviderRegistry, String> {
     let mut config = Config::load(root).unwrap_or_default();
-    config.index_dir = ".codeindex-rs".into();
+    config.index_dir = ".marksman".into();
     let cfg = config.clone();
     let built = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg)).map_err(|e| e.to_string())?;
     // A language that's present + enabled but whose provider failed to construct (e.g.
@@ -117,7 +117,8 @@ fn resolve_root() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var("CODEINDEX_ROOT")
+    std::env::var("MARKSMAN_ROOT")
+        .or_else(|_| std::env::var("CODEINDEX_ROOT")) // legacy name, still honored
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
 }
@@ -148,14 +149,14 @@ impl Server {
     fn new(root: PathBuf) -> Self {
         let mut config = Config::load(&root).unwrap_or_default();
         config.embedding_model = "minishlab/potion-code-16M".into();
-        config.index_dir = ".codeindex-rs".into();
+        config.index_dir = ".marksman".into();
         Server { root, config, registry: Arc::new(Mutex::new(None)), embedder: None, index_cache: Mutex::new(None) }
     }
 
     /// The retrieval index, cached in memory and keyed on index.pb's mtime. Every tool call
     /// used to re-read + re-parse the whole store and rebuild BM25/graph — pure per-call
     /// waste, linear in repo size. `save_index` rewrites index.pb, so its mtime is the
-    /// generation marker: our own reindex_after_edit and an external `codeindex-rs index`
+    /// generation marker: our own reindex_after_edit and an external `marksman index`
     /// both invalidate. The mtime is read BEFORE loading, so a writer racing the load causes
     /// a re-load on the next call rather than a stale cache entry.
     fn index_data(&self) -> Result<Arc<IndexData>, String> {
@@ -219,7 +220,7 @@ impl Server {
     fn retrieve_context(&mut self, args: &Value) -> Result<String, String> {
         let task = args["task"].as_str().ok_or("`task` is required")?.to_string();
         if !index_exists(&self.root, &self.config) {
-            return Err("no index — run `codeindex-rs index <root>` first".into());
+            return Err("no index — run `marksman index <root>` first".into());
         }
         let index = self.index_data()?;
         let model = self.config.embedding_model.clone();
@@ -295,7 +296,7 @@ impl Server {
         }
         let substring = args["substring"].as_bool().unwrap_or(false);
         if !index_exists(&self.root, &self.config) {
-            return Err("no index — run `codeindex-rs index` first".into());
+            return Err("no index — run `marksman index` first".into());
         }
         let index = self.index_data()?;
         const CAP: usize = 200;
@@ -473,7 +474,7 @@ impl Server {
     ) -> Result<String, String> {
         let id_in = |f: &str, n: &str| resolve_in(&registry.structure(Path::new(f)).unwrap_or_default(), n);
         if !index_exists(&self.root, &self.config) {
-            return Err("no index — run `codeindex-rs index` first, or address by name/id".into());
+            return Err("no index — run `marksman index` first, or address by name/id".into());
         }
         // 1) an exact symbol name that appears as a token in the query.
         let index = self.index_data()?;
@@ -777,7 +778,7 @@ impl Server {
         if let ci_core::CommitResult::Ok { changed_files, .. } = &res {
             if !dry_run && !changed_files.is_empty() {
                 if let Err(e) = self.reindex_after_edit(changed_files) {
-                    eprintln!("[codeindex-rs-mcp] post-edit reindex failed (index may be stale until next `index`): {e}");
+                    eprintln!("[marksman-mcp] post-edit reindex failed (index may be stale until next `index`): {e}");
                 }
             }
         }
@@ -1040,7 +1041,7 @@ fn ensure_index_matches(meta_model: &str, meta_dims: usize, model: &str, dim: us
     if meta_model != model || meta_dims != dim {
         return Err(format!(
             "index was built with model {meta_model:?} (dim {meta_dims}) but this server uses \
-             {model:?} (dim {dim}) — re-run `codeindex-rs index`"
+             {model:?} (dim {dim}) — re-run `marksman index`"
         ));
     }
     Ok(())
@@ -1054,7 +1055,7 @@ fn main() {
     let mut server = Server::new(resolve_root());
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    eprintln!("[codeindex-rs-mcp] ready for {}", server.root.display());
+    eprintln!("[marksman-mcp] ready for {}", server.root.display());
     // Build the provider + warm the TS language server in the background now, so the
     // first apply_edits is fast instead of paying a cold project load inline.
     server.start_prewarm();

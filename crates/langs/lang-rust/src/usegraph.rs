@@ -18,7 +18,7 @@ const FP_VERSION: u64 = 1;
 pub(crate) type Fingerprint = BTreeMap<String, String>;
 
 pub(crate) fn fingerprint_path(root: &Path) -> PathBuf {
-    root.join(".codeindex-rs").join("rust.scip.fingerprint.json")
+    root.join(".marksman").join("rust.scip.fingerprint.json")
 }
 
 /// FNV-1a 64-bit — detects accidental drift, not tampering (same rationale as lang-ts).

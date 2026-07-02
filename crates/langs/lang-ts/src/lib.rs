@@ -151,14 +151,14 @@ fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
 }
 
 impl TsProvider {
-    /// Open a provider for `root`, loading the cached `.codeindex/index.scip` (milliseconds)
+    /// Open a provider for `root`, loading the cached `.marksman/index.scip` (milliseconds)
     /// when the source is byte-identical to what produced it, else reindexing (~20s). The
     /// freshness check is the full source fingerprint (see `fingerprint.rs`), so content
     /// edits, import changes, and added/removed/moved files all invalidate; anything doubtful
     /// (no fingerprint, unreadable index) reindexes — a stale load is a correctness bug, a
     /// spurious reindex only a slow start.
     pub fn open(root: &Path) -> Result<Self> {
-        let out = root.join(".codeindex").join("index.scip");
+        let out = root.join(".marksman").join("index.scip");
         let current = source_fingerprint(root);
         if out.exists() {
             match load_fingerprint(&fingerprint_path(root)) {
@@ -189,7 +189,7 @@ impl TsProvider {
     /// `open` sees a mismatch and reindexes (conservative), rather than blessing an index that
     /// missed the mid-run edit.
     fn index_with(root: &Path, fp: Fingerprint) -> Result<Self> {
-        let out = root.join(".codeindex").join("index.scip");
+        let out = root.join(".marksman").join("index.scip");
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -415,8 +415,8 @@ mod tests {
     fn fresh_overrides_shadow_the_scip_index() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join(".codeindex")).unwrap();
-        let idx = root.join(".codeindex/index.scip");
+        fs::create_dir_all(root.join(".marksman")).unwrap();
+        let idx = root.join(".marksman/index.scip");
         fs::write(&idx, b"").unwrap(); // valid, empty SCIP index
         fs::write(root.join("a.ts"), "export function add(a: number): number {\n  return a;\n}\n").unwrap();
 
@@ -489,7 +489,7 @@ mod tests {
 
         // Unchanged source -> `open` loads the cached index.scip instead of re-running scip
         // (the file's mtime must not move — reindexing rewrites it).
-        let scip = root.join(".codeindex/index.scip");
+        let scip = root.join(".marksman/index.scip");
         let cached_mtime = fs::metadata(&scip).unwrap().modified().unwrap();
         let reopened = TsProvider::open(root).expect("open from cache");
         assert_eq!(fs::metadata(&scip).unwrap().modified().unwrap(), cached_mtime, "open() re-ran the indexer on unchanged source");

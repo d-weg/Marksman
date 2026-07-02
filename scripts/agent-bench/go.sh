@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot runner: paste your API key into scripts/agent-bench/.key (gitignored),
+# One-shot runner (marksman agent-bench): paste your API key into scripts/agent-bench/.key (gitignored),
 # then run this. It wires up CLAUDE_BIN + the model and calls the harness against
 # the prepared /tmp/bench-target clone.
 #

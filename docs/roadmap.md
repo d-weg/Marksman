@@ -136,7 +136,7 @@ or Python repo gets degraded weighting even once indexing is multi-language.
       Rust (axum/actix/rocket/sqlx/diesel/sea-orm, leptos/yew) and Python (django/flask/fastapi/
       sqlalchemy/celery/…). Tested: Cargo+pyproject dep parsing, `[workspace]`-root skip, and a
       crate with an `axum` dep persisting `role: "backend"`.
-- [x] **5c — labeled eval harness (done).** `codeindex-rs eval <root> <eval.json> [--top N]` runs a
+- [x] **5c — labeled eval harness (done).** `marksman eval <root> <eval.json> [--top N]` runs a
       labeled set (`{task, expectFiles}`) against `retrieve` and reports overlap@k + MRR — the gate
       for any future weight change (see Invariants). Scoring (`score_case`: reciprocal rank + hit@k)
       is a pure, unit-tested function; a seed set on Marksman's own crates lives at
@@ -247,7 +247,7 @@ existing hub/expansion tests plus the eval are the gate.
       (`#[serde(default)]`). In `retrieve`, fold a bounded, **rank-normalized** centrality multiplier
       (`1.0 + centrality_weight · normrank(pr[file])`, `normrank`∈[0,1] over the candidate set — rank
       is robust to one hub dominating raw PR) into the same `weighted_fused` multiply that applies
-      `weight_for`. **Per the "no ranking change without an eval" invariant:** run `codeindex-rs eval
+      `weight_for`. **Per the "no ranking change without an eval" invariant:** run `marksman eval
       <root> docs/eval/marksman.json` at weight ∈ {0, 0.1, 0.2, 0.3}; commit the default that
       maximizes overlap@k + MRR **without regressing** baseline. If nothing beats weight=0, ship the
       mechanism with default `0.0` (off) + a note — the knob still helps hub-heavy repos and the

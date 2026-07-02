@@ -177,7 +177,7 @@ servers; future runs can't leak.
   numbers** — insurance doesn't pay out on the happy path. The measured win is efficiency.
 - **Scope:** 7 tasks (6 on one single-package TS repo + 1 on a small mixed fixture), sonnet 4.6.
   The *shape* is robust; absolute deltas are this-repo/these-tasks.
-- The `ts` arm runs the original codeindex's **current** ranker; part of rust's edge may be its
+- The `ts` arm runs the original Node `codeindex`'s **current** ranker; part of rust's edge may be its
   improved retrieval and edit-workflow design, not only Rust speed. And it is **TypeScript-only**
   by design — its totals exclude T7 (see the table note).
 

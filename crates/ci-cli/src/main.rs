@@ -1,8 +1,8 @@
-//! codeindex-rs CLI — `index` and `retrieve`. v1: TypeScript via SCIP
+//! Marksman CLI — `index` and `retrieve`. v1: TypeScript via SCIP
 //! (scip-typescript) + native Model2Vec embeddings.
 //!
-//!   codeindex-rs index    <root>
-//!   codeindex-rs retrieve <root> "<task>" [--top N] [--json]
+//!   marksman index    <root>
+//!   marksman retrieve <root> "<task>" [--top N] [--json]
 //!
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
@@ -34,7 +34,7 @@ fn model_dir() -> PathBuf {
 fn rust_config(root: &Path) -> Config {
     let mut c = Config::load(root).unwrap_or_default();
     c.embedding_model = "minishlab/potion-code-16M".into();
-    c.index_dir = ".codeindex-rs".into();
+    c.index_dir = ".marksman".into();
     c
 }
 
@@ -51,40 +51,40 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
     // `CI_PROVIDER=sidecar`: index over the protobuf wire via a `marksman-provider-<lang>` process.
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
         if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
-            eprintln!("[codeindex-rs] language: {lang} (sidecar process — protobuf wire)");
+            eprintln!("[marksman] language: {lang} (sidecar process — protobuf wire)");
             match ProcessProvider::spawn(cmd) {
                 Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
-                    eprintln!("[codeindex-rs] sidecar {lang} failed to start ({e}); skipping");
+                    eprintln!("[marksman] sidecar {lang} failed to start ({e}); skipping");
                     return ProviderBuild::Failed(e.to_string());
                 }
             }
         }
-        eprintln!("[codeindex-rs] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
+        eprintln!("[marksman] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
     }
     match lang {
         "rust" => {
             // Reads are in-process (no external deps); rust-analyzer gates only writes.
             if let Some(missing) = lang_rust::toolchain().describe_missing() {
-                eprintln!("[codeindex-rs] warning: {missing}\n  (rust indexing/reads work; type-checked edits will fail until installed)");
+                eprintln!("[marksman] warning: {missing}\n  (rust indexing/reads work; type-checked edits will fail until installed)");
             }
-            eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
+            eprintln!("[marksman] language: rust (tree-sitter, in-process — no Node)");
             ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
         "ts" => {
             // Check the toolchain BEFORE running any of it: a missing Node is one actionable
             // message (what + why + install), not a cryptic npx spawn error mid-index.
             if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                eprintln!("[codeindex-rs] typescript DISABLED:\n{missing}");
+                eprintln!("[marksman] typescript DISABLED:\n{missing}");
                 return ProviderBuild::Unavailable(missing);
             }
             // `open` reuses the cached .codeindex/index.scip when the source fingerprint still
             // matches; scip-typescript re-runs only when the source actually changed.
-            eprintln!("[codeindex-rs] language: typescript — opening scip index for {} …", root.display());
+            eprintln!("[marksman] language: typescript — opening scip index for {} …", root.display());
             match TsProvider::open(root) {
                 Ok(p) => ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
-                    eprintln!("[codeindex-rs] typescript indexing failed ({e}); skipping TS files");
+                    eprintln!("[marksman] typescript indexing failed ({e}); skipping TS files");
                     ProviderBuild::Failed(e.to_string())
                 }
             }
@@ -93,7 +93,7 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
         // path, ungated edits, zero external dependencies.
         other => match FbLang::from_name(other) {
             Some(fb) => {
-                eprintln!("[codeindex-rs] language: {} (generic tree-sitter fallback, in-process — ungated edits)", fb.label());
+                eprintln!("[marksman] language: {} (generic tree-sitter fallback, in-process — ungated edits)", fb.label());
                 ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
             }
             None => ProviderBuild::Failed(format!("unknown language '{other}'")),
@@ -117,7 +117,7 @@ fn cmd_index(root: &Path) {
     // proceed — but warn, since those files won't be indexed until the toolchain is fixed.
     if !built.failed.is_empty() {
         eprintln!(
-            "[codeindex-rs] warning: skipping language(s) whose provider failed to start: {} — their files are NOT indexed",
+            "[marksman] warning: skipping language(s) whose provider failed to start: {} — their files are NOT indexed",
             built.failed.join(", ")
         );
     }
@@ -128,13 +128,13 @@ fn cmd_index(root: &Path) {
     // (≈ cargo check); off by default. Only when a Rust provider is actually active.
     let rust_active = registry.provider_for(Path::new("_.rs")).is_some();
     if rust_active && config.scip_enabled("rust") {
-        eprintln!("[codeindex-rs] scip[rust] enabled: generating rust-analyzer scip graph (one-time, ~cargo check) …");
+        eprintln!("[marksman] scip[rust] enabled: generating rust-analyzer scip graph (one-time, ~cargo check) …");
         if let Err(e) = lang_rust::refresh_scip(root) {
-            eprintln!("[codeindex-rs] scip graph unavailable ({e}); using the tree-sitter mod graph");
+            eprintln!("[marksman] scip graph unavailable ({e}); using the tree-sitter mod graph");
         }
     }
 
-    eprintln!("[codeindex-rs] embedding + indexing …");
+    eprintln!("[marksman] embedding + indexing …");
     let index = build_index(root, &config, &registry, |t| {
         embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim])
     })
@@ -142,7 +142,7 @@ fn cmd_index(root: &Path) {
 
     save_index(root, &config, &index).unwrap_or_else(|e| die(e));
     eprintln!(
-        "[codeindex-rs] done: {} symbols · {} chunks · dim {} -> {}/",
+        "[marksman] done: {} symbols · {} chunks · dim {} -> {}/",
         index.symbols.len(),
         index.chunks.len(),
         index.meta.dims,
@@ -220,7 +220,7 @@ fn cmd_doctor(root: &Path) {
     if index_exists(root, &config) {
         println!("  ok       {}/{}", root.display(), config.index_dir);
     } else {
-        println!("  none     run `codeindex-rs index {}`", root.display());
+        println!("  none     run `marksman index {}`", root.display());
     }
 
     if unhealthy {
@@ -409,7 +409,7 @@ fn main() {
             cmd_eval(Path::new(&root), Path::new(&eval), k);
         }
         _ => {
-            eprintln!("usage:\n  codeindex-rs index <root>\n  codeindex-rs retrieve <root> \"<task>\" [--top N] [--json]\n  codeindex-rs doctor [<root>]\n  codeindex-rs eval <root> <eval.json> [--top N]");
+            eprintln!("usage:\n  marksman index <root>\n  marksman retrieve <root> \"<task>\" [--top N] [--json]\n  marksman doctor [<root>]\n  marksman eval <root> <eval.json> [--top N]");
             exit(2);
         }
     }

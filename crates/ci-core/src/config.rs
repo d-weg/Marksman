@@ -1,4 +1,5 @@
-//! Config compatible with the TS tool's `codeindex.config.json` (camelCase keys),
+//! Config (`marksman.config.json`, camelCase keys — the legacy `codeindex.config.json`
+//! names are still read),
 //! merged over defaults so a partial file only overrides what it sets.
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
@@ -91,12 +92,13 @@ impl Default for Config {
                 "**/build/**".into(),
                 "**/*.d.ts".into(),
                 "**/.codeindex/**".into(),
+                "**/.marksman/**".into(),
             ],
             languages: vec!["ts".into(), "tsx".into()],
             adjacency_bonus: 0.4,
             rrf_k: 60.0,
             symbol_match_bonus: default_symbol_match_bonus(),
-            index_dir: ".codeindex".into(),
+            index_dir: ".marksman".into(),
             query_embed_prefix: "Represent this sentence for searching relevant code: ".into(),
             query_layer_weighting: QueryLayerWeighting::default(),
             package_weights: BTreeMap::new(),
@@ -107,10 +109,11 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load `codeindex.config.json` (or `.codeindexrc.json`) merged over defaults.
+    /// Load `marksman.config.json` (or the legacy `codeindex.config.json`/`.codeindexrc.json`)
+    /// merged over defaults.
     /// Missing file → defaults.
     pub fn load(root: &Path) -> Result<Config> {
-        for name in ["codeindex.config.json", ".codeindexrc.json"] {
+        for name in ["marksman.config.json", "codeindex.config.json", ".codeindexrc.json"] {
             let p = root.join(name);
             if let Ok(raw) = std::fs::read_to_string(&p) {
                 let over: serde_json::Value = serde_json::from_str(&raw)?;

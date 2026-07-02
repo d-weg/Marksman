@@ -9,7 +9,7 @@ import os, re, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OLD = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("CODEINDEX_TS_DIR", os.path.expanduser("~/codeindex"))
-RUST = os.path.join(ROOT, "target/release/codeindex-rs")
+RUST = os.path.join(ROOT, "target/release/marksman")
 ENV = {**os.environ, "CI_NPM_CACHE": "/tmp/ci-npm-cache"}
 FILE_RE = re.compile(r"(?:src|scripts)/[\w./-]+\.tsx?")
 

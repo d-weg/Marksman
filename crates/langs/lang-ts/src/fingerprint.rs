@@ -21,7 +21,7 @@ const TOOL_KEY: &str = "//scip-typescript";
 pub(crate) type Fingerprint = BTreeMap<String, String>;
 
 pub(crate) fn fingerprint_path(root: &Path) -> PathBuf {
-    root.join(".codeindex").join("index.scip.fingerprint.json")
+    root.join(".marksman").join("index.scip.fingerprint.json")
 }
 
 /// FNV-1a 64-bit. Non-cryptographic is fine: this detects accidental drift, not tampering.

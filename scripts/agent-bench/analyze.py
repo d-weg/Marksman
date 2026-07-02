@@ -16,7 +16,7 @@ EDIT_TOOLS = {"Edit", "Write", "ci:apply_edits"}
 
 
 def short(nm):
-    return nm.replace("mcp__codeindex__", "ci:")
+    return nm.replace("mcp__marksman__", "ci:")
 
 
 def load(path):

@@ -169,15 +169,15 @@ mod tests {
 
     // Timing utility, not a correctness test:
     //   CI_TIMING_DIR=/path/to/repo cargo test -p ci-index --release -- --ignored load_timing --nocapture
-    // (expects `<dir>/.codeindex-rs`). Used to compare store formats (JSON → protobuf).
+    // (expects `<dir>/.marksman`). Used to compare store formats (JSON → protobuf).
     #[test]
     #[ignore]
     fn load_timing() {
         let Ok(root) = std::env::var("CI_TIMING_DIR") else {
-            eprintln!("set CI_TIMING_DIR to a repo with a .codeindex-rs index");
+            eprintln!("set CI_TIMING_DIR to a repo with a .marksman index");
             return;
         };
-        let config = Config { index_dir: ".codeindex-rs".into(), ..Default::default() };
+        let config = Config { index_dir: ".marksman".into(), ..Default::default() };
         let mut best = std::time::Duration::MAX;
         for _ in 0..20 {
             let t = std::time::Instant::now();
@@ -299,14 +299,14 @@ mod tests {
     #[test]
     fn index_lock_is_exclusive_then_released() {
         let dir = tempfile::tempdir().unwrap();
-        let l1 = IndexLock::acquire(dir.path(), ".codeindex-rs").expect("first lock acquires");
+        let l1 = IndexLock::acquire(dir.path(), ".marksman").expect("first lock acquires");
         assert!(
-            IndexLock::acquire(dir.path(), ".codeindex-rs").is_err(),
+            IndexLock::acquire(dir.path(), ".marksman").is_err(),
             "a second writer is blocked while the first holds the lock"
         );
         drop(l1);
         assert!(
-            IndexLock::acquire(dir.path(), ".codeindex-rs").is_ok(),
+            IndexLock::acquire(dir.path(), ".marksman").is_ok(),
             "lock is released on drop"
         );
     }

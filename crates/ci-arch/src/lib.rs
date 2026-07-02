@@ -83,6 +83,7 @@ pub fn build_architecture(root: &Path) -> Result<Vec<ArchNode>> {
             || rel_s.contains("/build/")
             || rel_s.starts_with("build/")
             || rel_s.contains(".codeindex")
+            || rel_s.contains(".marksman")
         {
             continue;
         }
