@@ -181,6 +181,11 @@ servers; future runs can't leak.
   improved retrieval and edit-workflow design, not only Rust speed. And it is **TypeScript-only**
   by design — its totals exclude T7 (see the table note).
 
+**Pending — T8-fallback.** The suite now also carries a task for the GENERIC tree-sitter
+fallback provider: a Python and a Go rename in one session (neither language has a native
+integration; edits are structural and honestly reported `gated: false`). Not yet measured —
+run `bash scripts/agent-bench/go.sh --task T8-fallback --runs 3` and add the row here.
+
 Reproduce: `bash scripts/agent-bench/go.sh --runs 3` (needs `$ANTHROPIC_API_KEY`; rebuilds the
 release binaries first, so results always reflect the current source). Add
 `--save-transcript <dir>` then `python3 scripts/agent-bench/analyze.py <dir>` to see *why* an arm

@@ -1,4 +1,4 @@
-# codeindex-rs — current state
+# Marksman — architecture
 
 A from-scratch Rust rewrite of the TS tool `codeindex`: local, zero-API code retrieval +
 gated structural edits, **language-agnostic** via a provider seam.
@@ -82,7 +82,9 @@ Agent / CLI / MCP  (pure Rust)
 | `ci-vfs` | in-memory overlay transaction | ✅ |
 | `ci-lsp` | **generic** LSP transport (provider supplies the command) | ✅ |
 | `ci-edit` | gated atomic edits + anchored repair | ✅ |
-| `lang-ts` | TS provider: SCIP + tree-sitter read, LSP+VFS write | ✅ |
+| `lang-ts` | TS provider: SCIP + tree-sitter read, ts-morph/LSP gated write | ✅ |
+| `lang-rust` | Rust provider: tree-sitter read, rust-analyzer gated write | ✅ |
+| `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Java, Ruby, C, C++): read path + ungated edits | ✅ |
 | `ci-cli` | `index` / `retrieve` binaries | ✅ |
 | `ci-arch` | zero-API architecture map (detects module templates) | ✅ |
 | `ci-mcp` | Rust MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits | ✅ |

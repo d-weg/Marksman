@@ -61,12 +61,12 @@ reproduce, and keep the honesty notes (single-run caveats, contamination, arm sc
 
 1. One logical change per PR; include the test that fails without it when fixing a bug.
 2. Say which test tiers you ran (unit / which e2e suites).
-3. Docs move with behavior: `docs/state.md` describes the current architecture — if your PR
+3. Docs move with behavior: `docs/architecture.md` describes the current architecture — if your PR
    changes an invariant described there, update it in the same PR.
 
 ## Architecture orientation
 
-Start with [docs/state.md](docs/state.md) (current design + invariants), then
+Start with [docs/architecture.md](docs/architecture.md) (current design + invariants), then
 [docs/roadmap.md](docs/roadmap.md). The one-paragraph version: a language-blind Rust core
 (retrieval, index, VFS, gated edits) behind a `LanguageProvider` trait; each language crate
 (`crates/langs/lang-*`) owns all of its language's external tooling; `ci-mcp` exposes the whole

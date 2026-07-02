@@ -1,15 +1,8 @@
 # Marksman — roadmap
 
-Directions **with a delivery plan.** The open work is organized into **batches** you execute one at
-a time — same rhythm as [code-review-plan.md](code-review-plan.md): read the seams, make the
-smallest safe change, keep the suite green, one commit per batch, tick the boxes here.
-
-## How to run a batch
-1. Read the files/seams the batch names; jot the concrete change.
-2. Implement the smallest change that satisfies each item; add a test for every new branch.
-3. `cargo test --workspace` green + `cargo clippy --workspace --all-targets` clean.
-4. One commit per batch (`feat(<area>): …` / `fix(<area>): …`); update the checkboxes + a one-line
-   note here. Optionally `/code-review` the diff first.
+Directions with a delivery plan: the open work is organized into **batches**, executed one at a
+time — smallest safe change, suite stays green, a test for every new branch, one commit per
+batch, checkboxes ticked here.
 
 ## Invariants (the bar every batch holds)
 - **Code only.** Marksman indexes and edits **source code** — nothing else. No docs (`.md`), no
