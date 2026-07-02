@@ -709,9 +709,9 @@ impl Server {
         // group turns out UNGATED, the server re-verifies these repo-wide itself and puts the
         // evidence in the response (see `scan_word`) — the agent must never burn turns
         // grepping to check a rename the server can check in milliseconds.
-        let mut renames: Vec<(String, String)> = Vec::new();
+        let mut renames: Vec<(String, String, String)> = Vec::new(); // (ext, old leaf, new name)
         for op in &ops {
-            if let ci_core::EditOp::Rename { node_id, .. } = op {
+            if let ci_core::EditOp::Rename { node_id, new_name } = op {
                 let file = file_of(node_id);
                 let leaf = node_id
                     .rsplit('#')
@@ -725,8 +725,8 @@ impl Server {
                     .unwrap_or("")
                     .to_string();
                 let ext = Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("").to_string();
-                if !leaf.is_empty() && !ext.is_empty() && !renames.contains(&(ext.clone(), leaf.clone())) {
-                    renames.push((ext, leaf));
+                if !leaf.is_empty() && !ext.is_empty() && !renames.iter().any(|(e, o, _)| e == &ext && o == &leaf) {
+                    renames.push((ext, leaf, new_name.clone()));
                 }
             }
         }
@@ -830,23 +830,46 @@ impl Server {
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
                 let scan = if !dry_run && !renames.is_empty() {
                     let mut lines = Vec::new();
-                    for (ext, old) in &renames {
+                    let mut any_hits = false;
+                    for (ext, old, new) in &renames {
                         let hits = scan_word(&self.root, ext, old);
                         if hits.is_empty() {
                             lines.push(format!("  '{old}': no remaining occurrences in any .{ext} file ✓"));
-                        } else {
-                            lines.push(format!(
-                                "  '{old}': {} line(s) still mention it —\n    {}",
-                                hits.len(),
-                                hits.join("\n    ")
-                            ));
+                            continue;
+                        }
+                        any_hits = true;
+                        lines.push(format!("  '{old}': {} line(s) still mention it —", hits.len()));
+                        for (rel, ln, text) in &hits {
+                            lines.push(format!("    {rel}:{ln}: {text}"));
+                            // Ready-to-copy fix, anchored to the line's ENCLOSING symbol with the
+                            // POST-RENAME name — the agent's own attempts anchor by the old name
+                            // (gone) and burn turns discovering that. Full-line oldText for
+                            // uniqueness; target:doc when the line is a doc comment.
+                            if let Some((anchor, target)) = enclosing_anchor(&registry, rel, *ln) {
+                                let mut fix = json!({
+                                    "action": "replace_text",
+                                    "name": anchor,
+                                    "oldText": text,
+                                    "newText": text.replace(old.as_str(), new.as_str()),
+                                });
+                                if let Some(t) = target {
+                                    fix["target"] = json!(t);
+                                }
+                                lines.push(format!("      fix (ready to copy): {fix}"));
+                            }
                         }
                     }
+                    let guidance = if any_hits {
+                        "The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
+                         to verify the rename(s). Comment/string mentions are fine to LEAVE (only update them if \
+                         asked); code references should be fixed. To fix any line, re-issue its `fix` action \
+                         VERBATIM — all of them in ONE apply_edits batch."
+                    } else {
+                        "The scan above already re-checked the whole repo — the rename(s) are COMPLETE. Do NOT \
+                         grep, re-read, or run checks to verify."
+                    };
                     format!(
-                        "\nrename verification (server-side scan of EVERY file of that language):\n{}\n\
-                         The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
-                         to verify the rename(s). Remaining mentions (if any) are comments/strings (usually fine \
-                         to leave, or update with replace_text) or cross-file references to fix per file.\n",
+                        "\nrename verification (server-side scan of EVERY file of that language):\n{}\n{guidance}\n",
                         lines.join("\n")
                     )
                 } else {
@@ -940,9 +963,9 @@ fn file_of(id: &str) -> &str {
 /// Word-boundary occurrences of `name` across every `.{ext}` file (gitignore-aware) — the
 /// server-side verification behind an UNGATED rename's response. Textual truth on purpose:
 /// comments and strings count (they're exactly what an identifier rename leaves behind), and
-/// the agent gets file:line evidence instead of an instruction to go grep. Capped, one hit
-/// per line.
-fn scan_word(root: &Path, ext: &str, name: &str) -> Vec<String> {
+/// the agent gets file:line evidence instead of an instruction to go grep. Returns
+/// `(repo-relative file, 1-based line, trimmed line text)`; capped, one hit per line.
+fn scan_word(root: &Path, ext: &str, name: &str) -> Vec<(String, u32, String)> {
     let mut hits = Vec::new();
     let is_word = |b: Option<u8>| b.is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_');
     for entry in ignore::WalkBuilder::new(root).build().flatten() {
@@ -963,7 +986,7 @@ fn scan_word(root: &Path, ext: &str, name: &str) -> Vec<String> {
                 let before = if i == 0 { None } else { Some(bytes[i - 1]) };
                 let after = bytes.get(i + name.len()).copied();
                 if !is_word(before) && !is_word(after) {
-                    hits.push(format!("{rel}:{}: {}", ln + 1, line.trim()));
+                    hits.push((rel.clone(), (ln + 1) as u32, line.trim().to_string()));
                     break; // one hit per line is enough evidence
                 }
                 start = i + name.len();
@@ -974,6 +997,39 @@ fn scan_word(root: &Path, ext: &str, name: &str) -> Vec<String> {
         }
     }
     hits
+}
+
+/// The symbol anchor a scan hit belongs to: the SMALLEST symbol in `rel` whose range contains
+/// `line`, as `(node_id, Some("doc"))` when the line sits in that symbol's `:doc` sub-node,
+/// else `(node_id, None)`. `None` = the line is outside every symbol (e.g. a file-header
+/// comment) — no ready-to-copy fix can be offered, only the evidence line.
+fn enclosing_anchor(registry: &ProviderRegistry, rel: &str, line: u32) -> Option<(String, Option<&'static str>)> {
+    let nodes = registry.structure(Path::new(rel)).ok()?;
+    let mut best: Option<(&Node, u32)> = None; // (symbol, span) — smallest containing span wins
+    let mut stack: Vec<&Node> = nodes.iter().collect();
+    while let Some(n) = stack.pop() {
+        let contains_sym = n.range.start_line <= line && line <= n.range.end_line;
+        // A `:doc` comment sits ABOVE its symbol's range — check children regardless.
+        if matches!(n.kind, NodeKind::Symbol(_)) {
+            let in_doc = n
+                .children
+                .iter()
+                .any(|c| c.id.ends_with(":doc") && c.range.start_line <= line && line <= c.range.end_line);
+            if contains_sym || in_doc {
+                let span = n.range.end_line.saturating_sub(n.range.start_line);
+                if best.map(|(_, s)| span < s).unwrap_or(true) {
+                    best = Some((n, span));
+                }
+            }
+        }
+        stack.extend(n.children.iter());
+    }
+    let (node, _) = best?;
+    let in_doc = node
+        .children
+        .iter()
+        .any(|c| c.id.ends_with(":doc") && c.range.start_line <= line && line <= c.range.end_line);
+    Some((node.id.clone(), in_doc.then_some("doc")))
 }
 
 /// The file an op edits — what decides WHICH language provider handles it (`None` only for a
@@ -1199,7 +1255,23 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_index_matches, tools_list};
+    use super::{ensure_index_matches, scan_word, tools_list};
+
+    // The post-rename scan is word-boundary and per-extension: `rollup_day` must not match
+    // `daily_rollup_day2` or a `.go` file, and a comment mention IS a hit (that's the point —
+    // it's exactly what an identifier rename leaves behind for the agent to decide on).
+    #[test]
+    fn scan_word_is_word_boundary_and_ext_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.py"), "# rollup_day is folded here\nx = rollup_day2()\nrollup_day()\n").unwrap();
+        std::fs::write(root.join("b.go"), "// rollup_day mentioned in go\n").unwrap();
+        let hits = scan_word(root, "py", "rollup_day");
+        let lines: Vec<u32> = hits.iter().map(|(_, l, _)| *l).collect();
+        assert_eq!(lines, vec![1, 3], "comment + call hit; rollup_day2 and .go excluded: {hits:?}");
+        assert!(hits.iter().all(|(f, _, _)| f == "a.py"));
+        assert!(scan_word(root, "py", "absent_name").is_empty());
+    }
 
     // The schema's `action` enum and the edit engine's dispatch are maintained separately; this
     // pins them together — every action the schema advertises must be one action_to_op accepts

@@ -23,3 +23,6 @@ lang-rust = { path = "../langs/lang-rust" }
 lang-fallback = { path = "../langs/lang-fallback" }
 serde_json.workspace = true
 ignore = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

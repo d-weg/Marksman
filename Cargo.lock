@@ -172,6 +172,7 @@ dependencies = [
  "lang-rust",
  "lang-ts",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
