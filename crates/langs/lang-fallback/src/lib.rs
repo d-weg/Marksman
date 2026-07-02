@@ -1,8 +1,13 @@
-//! lang-fallback — a tree-sitter [`LanguageProvider`] for languages that don't yet have a
-//! SCIP/LSP integration (Python today; Go/Ruby next). It delivers the read path —
-//! `structure()` (functions / classes / methods + fn sub-nodes), `import_graph()` (import
-//! resolution), and skeletal `outline()` — entirely in-process, plus **UNGATED** structural
-//! edits.
+//! lang-fallback — the GENERIC tree-sitter [`LanguageProvider`]: any language without a native
+//! SCIP/LSP integration falls back here (Python, Go, Java, Ruby, C, C++ today). It delivers
+//! the read path — `structure()` (functions / types / methods + fn sub-nodes), skeletal
+//! `outline()`, and (Python) `import_graph()` — entirely in-process, plus **UNGATED**
+//! structural edits.
+//!
+//! Two collectors: Python keeps its specialized walk (docstrings, decorated defs, dotted-name
+//! import resolution); every other language shares ONE generic collector driven by the
+//! tree-sitter field convention (`name` / `parameters` / `body`) plus a small per-language
+//! kind table — adding a language is a grammar dependency + a few table rows, no new walker.
 //!
 //! The honest tradeoff: there is no type-check engine here, so edits are applied through the
 //! same VFS/blast-radius machinery as the gated providers but with a no-op gate — they are
@@ -19,44 +24,73 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::{Node as TsNode, Parser, Point};
 
-/// A language served by the tree-sitter fallback. New languages are a data addition here plus
-/// the per-kind mapping in [`collect_items`] — no core changes.
+/// A language served by the tree-sitter fallback. Adding one = a grammar dependency, a variant
+/// here, and rows in [`classify`]/[`outline`]'s tables — no core changes, no new walker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FbLang {
     Python,
+    Go,
+    Java,
+    Ruby,
+    C,
+    Cpp,
 }
+
+pub const ALL: &[FbLang] = &[FbLang::Python, FbLang::Go, FbLang::Java, FbLang::Ruby, FbLang::C, FbLang::Cpp];
 
 impl FbLang {
     /// Pick a fallback language for `root` by the source files actually present.
     pub fn detect(root: &Path) -> Option<FbLang> {
-        if has_ext(root, "py") {
-            return Some(FbLang::Python);
-        }
-        None
+        ALL.iter().copied().find(|l| l.exts().iter().any(|e| has_ext(root, e)))
     }
 
     pub fn from_name(name: &str) -> Option<FbLang> {
         match name {
             "python" | "py" => Some(FbLang::Python),
+            "go" => Some(FbLang::Go),
+            "java" => Some(FbLang::Java),
+            "ruby" | "rb" => Some(FbLang::Ruby),
+            "c" => Some(FbLang::C),
+            "cpp" | "c++" | "cxx" => Some(FbLang::Cpp),
             _ => None,
         }
+    }
+
+    /// The fallback language owning `ext`, if any (the outline/read dispatch key).
+    pub fn from_ext(ext: &str) -> Option<FbLang> {
+        ALL.iter().copied().find(|l| l.exts().contains(&ext))
     }
 
     fn ts_language(self) -> tree_sitter::Language {
         match self {
             FbLang::Python => tree_sitter_python::LANGUAGE.into(),
+            FbLang::Go => tree_sitter_go::LANGUAGE.into(),
+            FbLang::Java => tree_sitter_java::LANGUAGE.into(),
+            FbLang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            FbLang::C => tree_sitter_c::LANGUAGE.into(),
+            FbLang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
         }
     }
 
-    fn ext(self) -> &'static str {
+    fn exts(self) -> &'static [&'static str] {
         match self {
-            FbLang::Python => "py",
+            FbLang::Python => &["py", "pyi"],
+            FbLang::Go => &["go"],
+            FbLang::Java => &["java"],
+            FbLang::Ruby => &["rb"],
+            FbLang::C => &["c", "h"],
+            FbLang::Cpp => &["cpp", "cc", "cxx", "hpp", "hh"],
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             FbLang::Python => "python",
+            FbLang::Go => "go",
+            FbLang::Java => "java",
+            FbLang::Ruby => "ruby",
+            FbLang::C => "c",
+            FbLang::Cpp => "cpp",
         }
     }
 }
@@ -111,21 +145,34 @@ impl LanguageProvider for FallbackProvider {
         let bytes = content.as_bytes();
         let mut out = Vec::new();
         let prefix = format!("{rel}#");
-        collect_items(tree.root_node(), bytes, &prefix, SymbolKind::Function, &mut out);
+        match self.lang {
+            // Python keeps its specialized walk (docstrings, decorated definitions).
+            FbLang::Python => collect_items(tree.root_node(), bytes, &prefix, SymbolKind::Function, &mut out),
+            // Everything else shares the generic field-convention collector.
+            lang => collect_generic(lang, tree.root_node(), bytes, &prefix, &mut out),
+        }
         Ok(out)
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
+        // Import resolution is implemented for Python only; other fallback languages honestly
+        // report NO edges (retrieval still works — graph expansion just doesn't) rather than
+        // guessing edges from partially-understood import syntax.
+        if self.lang != FbLang::Python {
+            return Ok(BTreeMap::new());
+        }
         let mut graph: ImportGraph = BTreeMap::new();
-        for rel in source_files(&self.root, self.lang.ext()) {
-            let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
-            let Some(tree) = self.parse(&content) else { continue };
-            let mut edges: Vec<PathBuf> = Vec::new();
-            collect_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges);
-            edges.sort();
-            edges.dedup();
-            if !edges.is_empty() {
-                graph.insert(PathBuf::from(&rel), edges);
+        for ext in self.lang.exts() {
+            for rel in source_files(&self.root, ext) {
+                let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
+                let Some(tree) = self.parse(&content) else { continue };
+                let mut edges: Vec<PathBuf> = Vec::new();
+                collect_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges);
+                edges.sort();
+                edges.dedup();
+                if !edges.is_empty() {
+                    graph.insert(PathBuf::from(&rel), edges);
+                }
             }
         }
         Ok(graph)
@@ -155,9 +202,139 @@ pub fn outline(lang: FbLang, content: &str) -> String {
         return content.to_string();
     }
     let Some(tree) = parser.parse(content, None) else { return content.to_string() };
-    // Fold every `function_definition` body (any body kind); Python uses `...` as the placeholder.
-    let bodies = ci_treesitter::body_ranges(tree.root_node(), &["function_definition"], &[]);
-    ci_core::elide_bodies_with(content, bodies, "...")
+    // Fold every function-like body; Python's placeholder is `...` (valid, idiomatic), brace
+    // languages keep `elide_bodies`' default.
+    let fn_kinds: &[&str] = match lang {
+        FbLang::Python => &["function_definition"],
+        FbLang::Go => &["function_declaration", "method_declaration"],
+        FbLang::Java => &["method_declaration", "constructor_declaration"],
+        FbLang::Ruby => &["method", "singleton_method"],
+        FbLang::C | FbLang::Cpp => &["function_definition"],
+    };
+    let bodies = ci_treesitter::body_ranges(tree.root_node(), fn_kinds, &[]);
+    if lang == FbLang::Python {
+        ci_core::elide_bodies_with(content, bodies, "...")
+    } else {
+        ci_core::elide_bodies(content, bodies)
+    }
+}
+
+// ── the generic collector (every fallback language except Python) ───────────
+
+/// What a matched node kind IS, per language: a function/method (emits with sub-nodes, no
+/// recursion into its body), a named type (leaf — struct/enum/type alias), or a container
+/// (class/module/namespace — emits, then recurses into its body with a qualified prefix).
+enum Shape {
+    Fn,
+    Type,
+    Container,
+}
+
+/// The per-language kind table — the ONLY language-specific part of the generic collector.
+fn classify(lang: FbLang, kind: &str) -> Option<Shape> {
+    use Shape::*;
+    Some(match (lang, kind) {
+        (FbLang::Go, "function_declaration" | "method_declaration") => Fn,
+        (FbLang::Go, "type_spec") => Type,
+        (FbLang::Java, "method_declaration" | "constructor_declaration") => Fn,
+        (FbLang::Java, "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") => Container,
+        (FbLang::Ruby, "method" | "singleton_method") => Fn,
+        (FbLang::Ruby, "class" | "module") => Container,
+        (FbLang::C | FbLang::Cpp, "function_definition") => Fn,
+        (FbLang::C | FbLang::Cpp, "struct_specifier" | "enum_specifier" | "union_specifier") => Type,
+        (FbLang::Cpp, "class_specifier") => Container,
+        (FbLang::Cpp, "namespace_definition") => Container,
+        _ => return None,
+    })
+}
+
+/// The definition's name node: the `name` field, else (C/C++) the first identifier-ish node
+/// down the `declarator` chain (`function_definition → function_declarator → identifier`).
+fn def_name<'a>(node: &TsNode<'a>) -> Option<TsNode<'a>> {
+    if let Some(n) = node.child_by_field_name("name") {
+        return Some(n);
+    }
+    let mut d = node.child_by_field_name("declarator")?;
+    for _ in 0..6 {
+        if d.kind().ends_with("identifier") {
+            return Some(d);
+        }
+        d = d.child_by_field_name("declarator")?;
+    }
+    None
+}
+
+/// Walk the tree emitting definitions per [`classify`]. Function bodies are NOT descended into
+/// (locals are not symbols); container bodies are, with a `Container.` qualified prefix.
+/// Unmatched nodes are transparent wrappers (declaration lists, export statements, preproc…).
+fn collect_generic(lang: FbLang, node: TsNode, bytes: &[u8], prefix: &str, out: &mut Vec<Node>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let Some(shape) = classify(lang, child.kind()) else {
+            collect_generic(lang, child, bytes, prefix, out);
+            continue;
+        };
+        let Some(name_node) = def_name(&child) else { continue };
+        let Ok(name) = name_node.utf8_text(bytes) else { continue };
+        // A C `struct Foo x;` mentions the kind without a body — only DEFINITIONS count. Go's
+        // `type_spec` is the exception: its payload is a `type` field, and it only appears
+        // inside `type_declaration`, so it is always a definition.
+        let is_definition = child.child_by_field_name("body").is_some()
+            || matches!(shape, Shape::Fn)
+            || (lang == FbLang::Go && child.kind() == "type_spec");
+        if !is_definition {
+            continue;
+        }
+        // Inside a container the prefix is `file#Scope.` — a trailing `.` marks a member.
+        let kind = match shape {
+            Shape::Fn if prefix.ends_with('.') => SymbolKind::Method,
+            Shape::Fn => SymbolKind::Function,
+            Shape::Type | Shape::Container => SymbolKind::Class,
+        };
+        let mut n = Node {
+            id: format!("{prefix}{name}"),
+            name: Some(name.to_string()),
+            kind: NodeKind::Symbol(kind),
+            range: ts_range(&child),
+            name_range: Some(ts_range(&name_node)),
+            children: vec![],
+        };
+        // Leading comment → the `:doc` anchor (parity with the gated providers). The comment
+        // may sit above a single-child WRAPPER instead (`// doc` above go's `type Bucket …`
+        // annotates the `type_declaration`, we emit its inner `type_spec`) — climb one level
+        // when the parent wraps exactly this definition.
+        let is_comment = |c: &TsNode| matches!(c.kind(), "comment" | "line_comment" | "block_comment");
+        let doc = ci_treesitter::leading_comment_range(&child, is_comment).or_else(|| {
+            child
+                .parent()
+                .filter(|p| p.named_child_count() == 1)
+                .and_then(|p| ci_treesitter::leading_comment_range(&p, is_comment))
+        });
+        if let Some(r) = doc {
+            n.children.push(Node {
+                id: format!("{}:doc", n.id),
+                name: None,
+                kind: NodeKind::Syntax("doc".into()),
+                range: r,
+                name_range: None,
+                children: vec![],
+            });
+        }
+        match shape {
+            Shape::Fn => {
+                add_fn_subnodes(&mut n, &child, bytes);
+                out.push(n);
+            }
+            Shape::Type => out.push(n),
+            Shape::Container => {
+                let inner = format!("{prefix}{name}.");
+                out.push(n);
+                if let Some(body) = child.child_by_field_name("body") {
+                    collect_generic(lang, body, bytes, &inner, out);
+                }
+            }
+        }
+    }
 }
 
 // ── the no-op gate (ungated edits) ───────────────────────────────────────────
@@ -200,12 +377,12 @@ impl GateEngine for NoGate {
             .named_descendant_for_point_range(pt, pt)
             .ok_or_else(|| Error::Driver("rename: no node at position".into()))?;
         // Walk out to the enclosing identifier if the point landed on a child token.
-        let ident = if at.kind() == "identifier" { at } else { at.parent().filter(|p| p.kind() == "identifier").unwrap_or(at) };
+        let ident = if is_ident(&at) { at } else { at.parent().filter(is_ident).unwrap_or(at) };
         let old = ident
             .utf8_text(bytes)
             .map_err(|_| Error::Driver("rename: bad utf8".into()))?
             .to_string();
-        if old.is_empty() || ident.kind() != "identifier" {
+        if old.is_empty() || !is_ident(&ident) {
             return Ok(json!({})); // not a renameable identifier → empty (commit_edits rejects loudly)
         }
         // Every identifier in THIS file with the same text (best-effort, ungated).
@@ -220,8 +397,14 @@ impl GateEngine for NoGate {
     }
 }
 
+/// Identifier-ish token across grammars: `identifier`, `field_identifier`, `type_identifier`
+/// (go/c/cpp/java), ruby's `constant`.
+fn is_ident(n: &TsNode) -> bool {
+    n.kind().ends_with("identifier") || n.kind() == "constant"
+}
+
 fn collect_identifier_edits(node: TsNode, bytes: &[u8], old: &str, new: &str, out: &mut Vec<Value>) {
-    if node.kind() == "identifier" && node.utf8_text(bytes).map(|t| t == old).unwrap_or(false) {
+    if is_ident(&node) && node.utf8_text(bytes).map(|t| t == old).unwrap_or(false) {
         let s = node.start_position();
         let e = node.end_position();
         out.push(json!({
@@ -300,7 +483,19 @@ fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Op
 }
 
 fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
-    if let Some(params) = item.child_by_field_name("parameters") {
+    // The parameter list: a `parameters` field, else (C/C++) the one inside the declarator
+    // chain (`function_definition → function_declarator(parameters: …)`).
+    let params_node = item.child_by_field_name("parameters").or_else(|| {
+        let mut d = item.child_by_field_name("declarator")?;
+        for _ in 0..6 {
+            if let Some(p) = d.child_by_field_name("parameters") {
+                return Some(p);
+            }
+            d = d.child_by_field_name("declarator")?;
+        }
+        None
+    });
+    if let Some(params) = params_node {
         // The whole `(...)` list — the insertion anchor for `add_parameter` / a missing return type.
         n.children.push(syntax_node(&format!("{}:params", n.id), None, "params", &params));
         let mut cursor = params.walk();
@@ -313,7 +508,13 @@ fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
             n.children.push(syntax_node(&format!("{}:param.{i}", n.id), name, "parameter", &p));
         }
     }
-    if let Some(rt) = item.child_by_field_name("return_type") {
+    // Return type field name varies by grammar: `return_type` (python/ruby), `result` (go),
+    // `type` (java's method_declaration return).
+    if let Some(rt) = item
+        .child_by_field_name("return_type")
+        .or_else(|| item.child_by_field_name("result"))
+        .or_else(|| item.child_by_field_name("type"))
+    {
         n.children.push(syntax_node(&format!("{}:return", n.id), None, "returnType", &rt));
     }
     if let Some(body) = item.child_by_field_name("body") {
@@ -512,6 +713,97 @@ fn has_ext(root: &Path, ext: &str) -> bool {
 mod tests {
     use super::*;
     use std::fs;
+
+    /// One structure() round-trip per generic language: write a source file, assert the
+    /// expected ids/kinds/sub-nodes come out of the shared collector.
+    fn generic_structure(lang: FbLang, file: &str, content: &str) -> Vec<Node> {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(file), content).unwrap();
+        FallbackProvider::new(dir.path(), lang).structure(Path::new(file)).unwrap()
+    }
+
+    #[test]
+    fn go_structure_functions_methods_types() {
+        let nodes = generic_structure(
+            FbLang::Go,
+            "svc.go",
+            "package svc\n\n// Latency bucket.\ntype Bucket struct {\n\tp99 float64\n}\n\nfunc Probe(url string) bool {\n\treturn true\n}\n\nfunc (b Bucket) Worst() float64 {\n\treturn b.p99\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"svc.go#Bucket"), "go type: {ids:?}");
+        assert!(ids.contains(&"svc.go#Probe"), "go func: {ids:?}");
+        assert!(ids.contains(&"svc.go#Worst"), "go method: {ids:?}");
+        let probe = nodes.iter().find(|n| n.id == "svc.go#Probe").unwrap();
+        let kinds: Vec<&str> = probe.children.iter().filter_map(|c| match &c.kind { NodeKind::Syntax(s) => Some(s.as_str()), _ => None }).collect();
+        assert!(kinds.contains(&"body") && kinds.contains(&"params"), "go sub-nodes: {kinds:?}");
+        let bucket = nodes.iter().find(|n| n.id == "svc.go#Bucket").unwrap();
+        assert!(bucket.children.iter().any(|c| c.id.ends_with(":doc")), "leading comment -> :doc: {:?}", bucket.children);
+    }
+
+    #[test]
+    fn java_structure_class_members_qualified() {
+        let nodes = generic_structure(
+            FbLang::Java,
+            "Svc.java",
+            "public class Svc {\n  private int hits;\n  public Svc() {}\n  public int probe(String url) {\n    return 1;\n  }\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"Svc.java#Svc"), "class: {ids:?}");
+        assert!(ids.contains(&"Svc.java#Svc.probe"), "method qualified by class: {ids:?}");
+        let probe = nodes.iter().find(|n| n.id == "Svc.java#Svc.probe").unwrap();
+        assert!(matches!(probe.kind, NodeKind::Symbol(SymbolKind::Method)), "member kind: {:?}", probe.kind);
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":body")), "java body sub-node");
+        assert!(!ids.contains(&"Svc.java#hits"), "fields are not emitted (no local noise): {ids:?}");
+    }
+
+    #[test]
+    fn ruby_structure_class_and_methods() {
+        let nodes = generic_structure(
+            FbLang::Ruby,
+            "svc.rb",
+            "class Svc\n  def probe(url)\n    true\n  end\nend\n\ndef helper\n  1\nend\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"svc.rb#Svc"), "ruby class: {ids:?}");
+        assert!(ids.contains(&"svc.rb#Svc.probe"), "ruby method qualified: {ids:?}");
+        assert!(ids.contains(&"svc.rb#helper"), "ruby top-level def: {ids:?}");
+    }
+
+    #[test]
+    fn c_structure_functions_and_structs() {
+        let nodes = generic_structure(
+            FbLang::C,
+            "probe.c",
+            "struct bucket {\n  double p99;\n};\n\nstatic int probe(const char *url) {\n  return 1;\n}\n\nstruct bucket use_only(struct bucket b) {\n  return b;\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"probe.c#bucket"), "struct definition: {ids:?}");
+        assert!(ids.contains(&"probe.c#probe"), "fn name via declarator descent: {ids:?}");
+        assert!(ids.contains(&"probe.c#use_only"), "fn returning a struct: {ids:?}");
+        // `struct bucket` in the parameter/return positions must NOT re-emit the type.
+        assert_eq!(ids.iter().filter(|i| **i == "probe.c#bucket").count(), 1, "reference != definition: {ids:?}");
+        let probe = nodes.iter().find(|n| n.id == "probe.c#probe").unwrap();
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":params")), "params found inside declarator");
+    }
+
+    #[test]
+    fn cpp_structure_class_namespace() {
+        let nodes = generic_structure(
+            FbLang::Cpp,
+            "svc.cpp",
+            "namespace net {\nclass Svc {\n public:\n  int probe();\n};\nint Svc::probe() { return 1; }\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"svc.cpp#net"), "namespace: {ids:?}");
+        assert!(ids.contains(&"svc.cpp#net.Svc"), "class in namespace: {ids:?}");
+    }
+
+    #[test]
+    fn generic_outline_folds_function_bodies() {
+        let o = outline(FbLang::Go, "package a\n\nfunc big() int {\n\tx := 1\n\ty := 2\n\treturn x + y\n}\n");
+        assert!(o.contains("func big() int"), "signature kept: {o}");
+        assert!(!o.contains("x := 1"), "body folded: {o}");
+    }
 
     fn py_project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();

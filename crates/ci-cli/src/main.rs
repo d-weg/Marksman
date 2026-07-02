@@ -7,7 +7,7 @@
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
 use ci_build::{build_index, build_registry, ProviderBuild};
-use ci_core::{Config, LanguageProvider, Manifest};
+use ci_core::{Config, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
@@ -71,10 +71,6 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
             ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
-        "python" => {
-            eprintln!("[codeindex-rs] language: python (tree-sitter fallback, in-process — ungated edits)");
-            ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Python)))
-        }
         "ts" => {
             // Check the toolchain BEFORE running any of it: a missing Node is one actionable
             // message (what + why + install), not a cryptic npx spawn error mid-index.
@@ -93,7 +89,15 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
                 }
             }
         }
-        _ => ProviderBuild::Failed(format!("unknown language '{lang}'")),
+        // Every other supported language rides the generic tree-sitter fallback: full read
+        // path, ungated edits, zero external dependencies.
+        other => match FbLang::from_name(other) {
+            Some(fb) => {
+                eprintln!("[codeindex-rs] language: {} (generic tree-sitter fallback, in-process — ungated edits)", fb.label());
+                ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
+            }
+            None => ProviderBuild::Failed(format!("unknown language '{other}'")),
+        },
     }
 }
 
@@ -181,10 +185,25 @@ fn cmd_doctor(root: &Path) {
     if has(ci_walk::Lang::Rust) {
         section(lang_rust::toolchain(), Some("reads (structure/import graph) are in-process and need nothing external"));
     }
-    if has(ci_walk::Lang::Python) {
-        println!("[python]\n  ok       no external tooling (in-process tree-sitter; edits are ungated)\n");
+    let fallback_langs: Vec<&str> = [
+        (ci_walk::Lang::Python, "python"),
+        (ci_walk::Lang::Go, "go"),
+        (ci_walk::Lang::Java, "java"),
+        (ci_walk::Lang::Ruby, "ruby"),
+        (ci_walk::Lang::C, "c"),
+        (ci_walk::Lang::Cpp, "cpp"),
+    ]
+    .iter()
+    .filter(|(l, _)| has(*l))
+    .map(|(_, n)| *n)
+    .collect();
+    if !fallback_langs.is_empty() {
+        println!(
+            "[{}]\n  ok       no external tooling (generic in-process tree-sitter; edits are ungated)\n",
+            fallback_langs.join(", ")
+        );
     }
-    if !(has(ci_walk::Lang::Ts) || has(ci_walk::Lang::Tsx) || has(ci_walk::Lang::Rust) || has(ci_walk::Lang::Python)) {
+    if present.iter().all(|l| !l.is_code()) {
         println!("no supported source languages detected under {}\n", root.display());
     }
 

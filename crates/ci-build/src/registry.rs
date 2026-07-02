@@ -131,6 +131,17 @@ const SUPPORTED: &[LangSpec] = &[
         langs: &[Lang::Python],
         excludes: &[],
     },
+    // The generic tree-sitter fallback languages (lang-fallback): read path + ungated edits.
+    LangSpec { name: "go", globs: &["**/*.go"], langs: &[Lang::Go], excludes: &["**/vendor/**"] },
+    LangSpec { name: "java", globs: &["**/*.java"], langs: &[Lang::Java], excludes: &[] },
+    LangSpec { name: "ruby", globs: &["**/*.rb"], langs: &[Lang::Ruby], excludes: &[] },
+    LangSpec { name: "c", globs: &["**/*.c", "**/*.h"], langs: &[Lang::C], excludes: &[] },
+    LangSpec {
+        name: "cpp",
+        globs: &["**/*.cpp", "**/*.cc", "**/*.cxx", "**/*.hpp", "**/*.hh"],
+        langs: &[Lang::Cpp],
+        excludes: &[],
+    },
 ];
 
 /// The single language `CI_LANG` forces, if set (`rust` / `ts`|`typescript` / `python`|`py`).

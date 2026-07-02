@@ -8,6 +8,11 @@ pub enum Lang {
     Tsx,
     Rust,
     Python,
+    Go,
+    Java,
+    Ruby,
+    C,
+    Cpp,
     Other,
 }
 
@@ -22,13 +27,18 @@ impl Lang {
             Some("tsx") => Lang::Tsx,
             Some("rs") => Lang::Rust,
             Some("py") | Some("pyi") => Lang::Python,
+            Some("go") => Lang::Go,
+            Some("java") => Lang::Java,
+            Some("rb") => Lang::Ruby,
+            Some("c") | Some("h") => Lang::C,
+            Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") => Lang::Cpp,
             _ => Lang::Other,
         }
     }
 
     /// True for languages a provider handles (indexed as code, editable).
     pub fn is_code(self) -> bool {
-        matches!(self, Lang::Ts | Lang::Tsx | Lang::Rust | Lang::Python)
+        !matches!(self, Lang::Other)
     }
 }
 

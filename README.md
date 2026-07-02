@@ -10,7 +10,7 @@ Marksman is a local-first [Model Context Protocol](https://modelcontextprotocol.
 - **Find** the exact code for a task — compiler-accurate symbols + an import graph, fused with semantic and keyword search, returned as a **line-ranged manifest** (not a pile of whole files to read).
 - **Change** it safely — structured edits (rename / move / replace) applied atomically and **type-checked over the blast radius before they land**. A cross-file rename is *one* call, not N hand-edits, and nothing commits if it would break the build.
 
-Written in Rust: a language-blind core plus per-language providers. **TypeScript and Rust are fully type-checked; Python is supported via an in-process tree-sitter fallback (ungated edits).**
+Written in Rust: a language-blind core plus per-language providers. **TypeScript and Rust are fully type-checked; Python, Go, Java, Ruby, C, and C++ ride a generic in-process tree-sitter provider** (full retrieval + structural edits, honestly reported as un-type-checked).
 
 ## Why
 
@@ -137,7 +137,7 @@ An optional `codeindex.config.json` in the repo root overrides retrieval / index
 
 ## Status
 
-- **Languages:** **TypeScript** (`scip-typescript` + `ts-morph`) and **Rust** (in-process tree-sitter + rust-analyzer) — both with type-checked, blast-radius-gated edits. **Python** rides an in-process tree-sitter fallback: full retrieval + skeletal outline + structural edits, but *ungated* (`gated: false`) until its LSP/indexer lands. The core (`ci-*` crates) is language-blind; a new language is a new provider implementing the same `LanguageProvider` trait.
+- **Languages:** **TypeScript** (`scip-typescript` + `ts-morph`) and **Rust** (in-process tree-sitter + rust-analyzer) — both with type-checked, blast-radius-gated edits. **Python, Go, Java, Ruby, C, and C++** ride the generic in-process tree-sitter provider: full retrieval + skeletal outline + structural edits, but *ungated* (`gated: false`) until a language's LSP/indexer lands. Adding a fallback language is a grammar dependency plus a few table rows; upgrading one to gated is a new provider implementing the same `LanguageProvider` trait. The core (`ci-*` crates) is language-blind.
 - 16-crate Rust workspace, ~50 unit tests plus real-tool integration tests. See [docs/](docs/) for architecture, roadmap, and benchmarks.
 
 ## Contributing

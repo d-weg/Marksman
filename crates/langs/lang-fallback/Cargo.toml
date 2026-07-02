@@ -3,7 +3,7 @@ name = "lang-fallback"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Tree-sitter fallback LanguageProvider for languages without a SCIP/LSP integration yet (Python today). Read path + UNGATED structural edits (gated: false)."
+description = "Generic tree-sitter LanguageProvider for languages without a SCIP/LSP integration (Python, Go, Java, Ruby, C, C++). Read path + UNGATED structural edits (gated: false)."
 
 [dependencies]
 ci-core = { path = "../../ci-core" }
@@ -12,6 +12,11 @@ ci-treesitter = { path = "../../ci-treesitter" }
 serde_json = { workspace = true }
 tree-sitter = { workspace = true }
 tree-sitter-python = "0.23"
+tree-sitter-go = "0.25"
+tree-sitter-java = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
 ignore = "0.4"
 
 [dev-dependencies]

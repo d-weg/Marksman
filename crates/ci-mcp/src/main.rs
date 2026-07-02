@@ -7,7 +7,7 @@
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
 use ci_build::{build_registry, ProviderBuild, ProviderRegistry};
-use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind};
+use ci_core::{Config, EditOpts, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_all_in, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_dir, index_exists, load_index, save_index, IndexData};
@@ -52,10 +52,6 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
             ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
-        "python" => {
-            eprintln!("[codeindex-rs-mcp] language: python (tree-sitter fallback, in-process — edits are ungated)");
-            ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Python)))
-        }
         "ts" => {
             // TypeScript needs Node for BOTH paths (scip-typescript index + the gate). Missing
             // toolchain = the language is off, loudly and actionably — never a half-working
@@ -75,7 +71,18 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
                 }
             }
         }
-        _ => ProviderBuild::Failed(format!("unknown language '{lang}'")),
+        // Every other supported language rides the generic tree-sitter fallback: full read
+        // path, ungated edits, zero external dependencies.
+        other => match FbLang::from_name(other) {
+            Some(fb) => {
+                eprintln!(
+                    "[codeindex-rs-mcp] language: {} (generic tree-sitter fallback, in-process — edits are ungated)",
+                    fb.label()
+                );
+                ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
+            }
+            None => ProviderBuild::Failed(format!("unknown language '{other}'")),
+        },
     }
 }
 
@@ -949,8 +956,8 @@ fn outline_for(file: &str, content: &str) -> String {
         lang_rust::outline(content)
     } else if file.ends_with(".ts") || file.ends_with(".tsx") || file.ends_with(".mts") || file.ends_with(".cts") {
         lang_ts::outline(content)
-    } else if file.ends_with(".py") || file.ends_with(".pyi") {
-        lang_fallback::outline(FbLang::Python, content)
+    } else if let Some(fb) = Path::new(file).extension().and_then(|e| e.to_str()).and_then(FbLang::from_ext) {
+        lang_fallback::outline(fb, content)
     } else {
         content.to_string()
     }
