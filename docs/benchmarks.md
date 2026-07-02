@@ -187,11 +187,20 @@ servers; future runs can't leak.
 layer buys. Single runs, 2026-07-02, same-day baseline ($0.666, 8/8); the two tree-sitter
 runs PRE-DATE the field-anchor + move-rewrite fallback fixes (54e2ba8), noted per task.
 
-| mode | read path | gate | $ | success | verdict |
-|---|---|--:|--:|--:|---|
-| `full` | SCIP + tree-sitter | ts-morph | 0.425 | 8/8 | −36% vs baseline |
-| `treesitter-gated` | tree-sitter + syntactic imports | ts-morph | 0.523 | 8/8 | ≈ full (see below) |
-| `treesitter` | tree-sitter only | **none** | 1.032 | **6/8** | **loses to baseline** |
+| mode | read path | gate | $ | post-fix rerun $ | success | verdict |
+|---|---|--:|--:|--:|--:|---|
+| `full` | SCIP + tree-sitter | ts-morph | 0.425 | 0.426 | 8/8 | −36% / −45% vs same-day baseline |
+| `treesitter-gated` | tree-sitter + syntactic imports | ts-morph | 0.523 | **0.386** | 8/8 | **dead tie with full** (see below) |
+| `treesitter` | tree-sitter only | **none** | 1.032 | 1.017† | 6/8 → 7/8 | **still loses to baseline** |
+
+The rerun (single runs, 2026-07-02, after the field-anchor + move-rewrite fixes; same-day
+baseline $0.779) settled the open questions. **Gated ties full turn-for-turn** — 3,3,3,3,4,3,4,4
+vs full's 3,3,3,3,4,3,4,5 — the predicted T3 close happened, and gated is marginally cheaper
+(no SCIP startup). **Pure tree-sitter improved exactly where syntax could help and nowhere
+else:** T2 went 9→3 turns (move importer-rewrite), T1 fail→pass (9 turns) — but T5 still fails
+(12 turns) and T6 still costs 25 turns: consequence enumeration stays unwinnable without a
+compiler. †Excludes T9-barrel, which only this run included: ungated *passed* it at 11
+turns/$0.124 — its honest "not type-verified" reply made the agent hand-verify like a baseline.
 
 **treesitter-gated ≈ full.** Turn-for-turn ties on T1/T2/T4/T6/T7/T8 (3-5 turns each). The
 apparent $ gap is two artifacts: T1's cost diverges at IDENTICAL token counts (cache-creation
@@ -208,7 +217,8 @@ consequence enumeration — the one thing nothing syntactic can recover), T6 pas
 turns / $0.31 (double baseline). T4 and T8 stayed fine — consistent with T8's −63%: the
 ungated tier is right where the language itself has no checker (Python/Go…), and wrong where
 a compiler exists but isn't used. (T2's 9-turn import-fixing slog is since fixed by the
-syntactic move importer-rewrite; T1/T6 would improve with the same fixes; T5 would not.)
+syntactic move importer-rewrite; T1/T6 would improve with the same fixes; T5 would not —
+all three predictions confirmed by the rerun above.)
 
 **Decision this supports:** keep `full` as the TS default (SCIP is cheap once cached and its
 semantic margin is exactly the un-benched cases: barrels, re-exports, big repos), keep
