@@ -32,6 +32,14 @@ pub trait GateEngine {
         let _ = files;
         Ok(None)
     }
+    /// Restore every in-memory buffer the engine holds to the CURRENT on-disk content. Called
+    /// before computing any edit: a prior dry-run or rejected gate pushed overlay content into
+    /// the engine, and a rename computed against that phantom state returns spans that slice
+    /// the wrong text on disk (only by luck — equal-length names — does it land). Default no-op
+    /// for engines that hold no cross-call state.
+    fn sync_disk(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// LSP request errors that mean "the server is still loading the project" rather than a real
@@ -51,6 +59,9 @@ fn is_transient_lsp_error(msg: &str) -> bool {
 impl GateEngine for LspClient {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
         LspClient::diagnostics(self, files)
+    }
+    fn sync_disk(&mut self) -> Result<()> {
+        LspClient::sync_disk(self)
     }
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
         // Warm: opening the file loads the project, so rename sees every reference (a cold
@@ -825,6 +836,11 @@ pub fn commit_edits(
     reverse_imports: &impl Fn(&str) -> Vec<String>,
 ) -> Result<CommitResult> {
     let mut vfs = Vfs::new(root);
+
+    // The engine must see DISK truth before we compute anything: a prior dry-run/rejected gate
+    // left overlay content in its buffers, and rename/willRename edits computed against that
+    // phantom state produce wrong spans (silently, when name lengths happen to match).
+    engine.sync_disk()?;
 
     for (i, op) in ops.iter().enumerate() {
         // Trust boundary: reject before any VFS mutation if the op targets a path outside the repo.

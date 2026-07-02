@@ -234,6 +234,7 @@ rl.on("line", (line) => {
     else if (req.op === "rename") res = rename(req.file, req.line, req.character, req.newName);
     else if (req.op === "willRename") res = willRename(req.from, req.to);
     else if (req.op === "fileInfo") res = fileInfo(req.files || []);
+    else if (req.op === "reset") { restoreDirtyExcept(new Set()); res = { ok: true }; }
     else if (req.op === "ping") res = { ok: true };
     else res = { error: "unknown op: " + req.op };
   } catch (e) {

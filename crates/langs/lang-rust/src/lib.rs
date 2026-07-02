@@ -679,6 +679,35 @@ mod tests {
         assert!(edges.contains(&PathBuf::from("src/lexer.rs")), "scip use edge parser->lexer: {edges:?}");
     }
 
+    // Regression (poisoned engine buffers): a DRY-RUN gate pushes renamed overlay content into
+    // rust-analyzer; without the pre-edit `sync_disk`, the subsequent REAL rename sees the
+    // caller file already renamed in-buffer, finds no references, and silently renames only the
+    // definition (spans against phantom state; caught by T7's first bench run). #[ignore].
+    #[test]
+    #[ignore]
+    fn rename_after_dry_run_hits_all_references() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\npub fn run() -> i32 {\n    add(1, 2)\n}\n",
+        )
+        .unwrap();
+        let p = RustProvider::new(root);
+        let op = [EditOp::Rename { node_id: "src/lib.rs#add".into(), new_name: "sum".into() }];
+
+        let dry = p.apply_edits(&op, &EditOpts { write: false, dry_run: true, tsconfig: None }).unwrap();
+        assert!(matches!(dry, CommitResult::Ok { .. }), "dry run gates clean: {dry:?}");
+        assert!(fs::read_to_string(root.join("src/lib.rs")).unwrap().contains("pub fn add"), "dry run wrote nothing");
+
+        let real = p.apply_edits(&op, &EditOpts { write: true, dry_run: false, tsconfig: None }).unwrap();
+        assert!(matches!(real, CommitResult::Ok { .. }), "real run commits: {real:?}");
+        let after = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(after.contains("pub fn sum"), "definition renamed: {after}");
+        assert!(after.contains("sum(1, 2)"), "CALL SITE renamed too — buffers were synced to disk: {after}");
+        assert!(!after.contains("add"), "no stale 'add' anywhere: {after}");
+    }
+
     // Freshness parity with lang-ts: the scip-backed graph must (a) pick up a committed
     // edit's new `use` edge IN-SESSION without re-running rust-analyzer, (b) let a fresh
     // provider (next session) see the same edge via the fingerprint-driven overlay, and

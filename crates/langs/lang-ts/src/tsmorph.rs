@@ -220,6 +220,12 @@ impl GateEngine for TsMorphClient {
         Ok(json!({ "changes": res.get("changes").cloned().unwrap_or_else(|| json!({})) }))
     }
 
+    fn sync_disk(&mut self) -> Result<()> {
+        // Restore every overlaid file to disk content ("reset" = restoreDirtyExcept(∅)), so a
+        // rename computed after a dry-run/rejected gate can't see phantom buffer state.
+        self.call(json!({ "op": "reset" })).map(|_| ())
+    }
+
     fn file_summaries(&mut self, files: &[String]) -> Result<Option<Vec<FileSummary>>> {
         let res = self.call(json!({ "op": "fileInfo", "files": files }))?;
         let mut out = Vec::new();

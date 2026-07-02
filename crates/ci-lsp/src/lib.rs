@@ -252,6 +252,32 @@ impl LspClient {
         Ok(out)
     }
 
+    /// Re-push the CURRENT on-disk content of every document this client has opened, restoring
+    /// the server's buffers after a dry-run/rejected gate left overlay content in them. A file
+    /// gone from disk is closed. (The edit layer calls this before computing rename edits —
+    /// spans computed against phantom buffer state slice the wrong text on disk.)
+    pub fn sync_disk(&mut self) -> Result<()> {
+        let uris: Vec<String> = self.open.keys().cloned().collect();
+        for uri in uris {
+            let path = PathBuf::from(uri.strip_prefix("file://").unwrap_or(&uri));
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    let v = self.open.get(&uri).copied().unwrap_or(1) + 1;
+                    self.open.insert(uri.clone(), v);
+                    self.send_notification(
+                        "textDocument/didChange",
+                        json!({"textDocument": {"uri": uri, "version": v}, "contentChanges": [{"text": content}]}),
+                    )?;
+                }
+                Err(_) => {
+                    self.open.remove(&uri);
+                    self.send_notification("textDocument/didClose", json!({"textDocument": {"uri": uri}}))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Generic request (e.g. `textDocument/rename`) -> the response `result`.
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.send_request(method, params)?;
