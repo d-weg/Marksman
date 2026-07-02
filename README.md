@@ -13,7 +13,7 @@ Written in Rust: a language-blind core plus per-language providers. **TypeScript
 
 Agents burn tokens grepping for context and break builds with blind string edits. Marksman hands the agent the *right* line-ranges and lets it make *type-checked* structural changes in one shot.
 
-On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** Marksman used **~39% fewer tokens and finished ~38% faster** than without — and edged out the mature TypeScript tool it's a rewrite of. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
+On a 6-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an agent **with** Marksman cost **~55% less and finished ~40% faster** than without, 6/6 correct — repo-wide type rename: **3 turns vs the baseline's 21**. The tool descriptions are audited to contain zero benchmark-specific content. Details and honest caveats: [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Capabilities (MCP tools)
 
@@ -21,13 +21,16 @@ On a 3-task agent benchmark (median of 3, Claude Sonnet), an agent **with** Mark
 |---|---|
 | `retrieve_context` | A line-ranged manifest of the code relevant to a task. Hybrid index (BM25 + Model2Vec embeddings + symbol match) fused with RRF and expanded along the import graph. No API calls. |
 | `describe_architecture` | A per-directory file-kind / module map of the repo. |
+| `find_symbols` | Exact/substring search over indexed symbol names → self-locating node-id handles that feed straight into `read_node` / `apply_edits`. |
 | `list_anchors` | A file's symbols and sub-nodes (params / return / body) — the anchors you target with `apply_edits`. |
-| `apply_edits` | Structured edits (`rename`, `replace_node`, `insert_before`, `move_file`, `create_file`, `delete_file`), applied atomically and **type-checked over the blast radius** — nothing lands if it introduces a new type error, including in files that import what changed. |
+| `read_node` | The full source of one anchor (a symbol or its `:body` / `:param.N` / `:return` / `:doc` sub-node). |
+| `apply_edits` | Structured edits (`rename`, `move_file`, `replace_text`, `replace_node`, `set_body`, `insert_member`, `insert_in_body`, `add_parameter`, …), applied atomically and **type-checked over the blast radius** — nothing lands if it introduces a new type error, including in files that import what changed. Symbols are addressed by name (ambiguity auto-resolves from the edit's own text where possible). For wide changes, a rejection lists **every** affected site with its source and a ready-to-copy fix — the type-checker is the site-finder. |
 
 ## How it works
 
-- **Read:** `scip-typescript` (compiler-accurate symbols + cross-file references) merged with in-process **tree-sitter** (sub-symbol AST), embedded by a native **Model2Vec** (`potion-code-16M`) embedder — no GPU, no embedding server — then indexed (BM25 + flat vector store + import graph) and retrieved with **Reciprocal Rank Fusion** + graph expansion.
+- **Read:** `scip-typescript` (compiler-accurate symbols + cross-file references) merged with in-process **tree-sitter** (sub-symbol AST), embedded by a native **Model2Vec** (`potion-code-16M`) embedder — no GPU, no embedding server — then indexed (BM25 + flat vector store + import graph, persisted as protobuf) and retrieved with **Reciprocal Rank Fusion** + graph expansion.
 - **Write:** a persistent, warmed **ts-morph** engine applies edits behind an in-memory VFS, gated by a baseline-diff of type diagnostics over the **blast radius** (the changed files + their importers). A generic LSP path is the fallback (`CI_EDIT_ENGINE=lsp`).
+- **Fast startup:** the SCIP index is cached and validated by a content-hash fingerprint of the source (plus pinned tool versions) — a warm start on an unchanged repo is **~0.1s instead of ~26s**; any doubt reindexes, never a stale load. Symbol ranges are re-anchored against the current file content on every read, so edits made mid-session (by the tool or by you) never leave the anchors stale.
 
 ## Install
 

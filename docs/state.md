@@ -29,7 +29,7 @@ Agent / CLI / MCP  (pure Rust)
         ▼
    lang-ts  (TypeScript provider, owns the external tooling)
      READ   ── SCIP (scip-typescript -> index.scip)  + tree-sitter (in-process)  ── merged
-     WRITE  ── VFS overlay (ci-vfs) + LSP gate (ci-lsp -> tsls) + SCIP rename
+     WRITE  ── VFS overlay (ci-vfs) + type-check gate (ts-morph sidecar, warm; ci-lsp -> tsls fallback)
 ```
 
 ### Read = SCIP **+** tree-sitter (merged)
@@ -72,7 +72,7 @@ Agent / CLI / MCP  (pure Rust)
 | `ci-arch` | zero-API architecture map (detects module templates) | ✅ |
 | `ci-mcp` | Rust MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits | ✅ |
 
-**~35 unit tests + real-tool e2e** (scip-typescript indexing, LSP gate, edit gate, the
+**~60 unit tests + real-tool e2e** (scip-typescript indexing, LSP gate, edit gate, the
 SCIP+tree-sitter deepen).
 
 ## Done vs pending

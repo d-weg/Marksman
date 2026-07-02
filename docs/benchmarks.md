@@ -92,63 +92,90 @@ headless, sonnet 4.6) on the same tasks**, with and without Marksman, fully acco
 per-task `check`, clean git + index reset each run, tokens straight from Claude Code's JSON,
 every task reported). Three arms: **baseline** (no tool), **rust** (Marksman MCP), **ts** (the
 Node `codeindex` MCP — the mature tool Marksman is a rewrite of). Target repo: the Node
-`codeindex` itself (~600-symbol TS). **Median of 3 runs.** `sec` = wall-clock; `$` = Claude
-Code's `total_cost_usd` (the true economic score — it bakes in prompt caching + output pricing,
-so it can diverge from raw `in_tok`).
+`codeindex` itself (~600-symbol TS). `sec` = wall-clock; `$` = Claude Code's `total_cost_usd`
+(the true economic score — it bakes in prompt caching + output pricing, so it can diverge from
+raw `in_tok`). Results below: 6 tasks, single run (2026-07-01); re-run with `--runs 3` for
+medians.
 
 | task | arm | in_tok | out_tok | turns | sec | $ | ok |
 |---|---|--:|--:|--:|--:|--:|:--:|
-| T1-rename | baseline | 162316 | 1072 | 10 | 26 | 0.0890 | 3/3 |
-|  | **rust** | **100548** | **569** | **4** | **15** | **0.0486** | 3/3 |
-|  | ts | 103159 | 563 | 4 | 19 | 0.0535 | 3/3 |
-| T2-move | baseline | 203942 | 1317 | 11 | 32 | 0.1010 | 3/3 |
-|  | **rust** | **73625** | **394** | **3** | **12** | **0.0349** | 3/3 |
-|  | ts | 73097 | 357 | 3 | 13 | 0.0325 | 3/3 |
-| T3-locate-edit | baseline | 122909 | 468 | 5 | 13 | 0.0515 | 3/3 |
-|  | rust | 125141 | 529 | 5 | 15 | 0.0570 | 3/3 |
-|  | ts | 126021 | 552 | 5 | 18 | 0.0565 | 3/3 |
-| T4-body-edit | baseline | 100160 | 448 | 4 | 15 | 0.0455 | 3/3 |
-|  | **rust** | **73402** | **411** | **3** | **11** | **0.0308** | 3/3 |
-|  | ts | 124772 | 586 | 5 | 18 | 0.0525 | 3/3 |
+| T1-rename | baseline | 218201 | 1697 | 12 | 37 | 0.1932 | 1/1 |
+|  | **rust** | **73417** | **474** | **3** | **18** | **0.0499** | 1/1 |
+|  | ts | 121556 | 708 | 5 | 27 | 0.0613 | 1/1 |
+| T2-move | baseline | 183938 | 1083 | 8 | 31 | 0.0853 | 1/1 |
+|  | **rust** | **73374** | **468** | **3** | **18** | **0.0497** | 1/1 |
+|  | ts | 69279 | 412 | 3 | 17 | 0.0326 | 1/1 |
+| T3-locate-edit | baseline | 114156 | 481 | 5 | 17 | 0.0546 | 1/1 |
+|  | **rust** | **73314** | **408** | **3** | **15** | **0.0486** | 1/1 |
+|  | ts | 177462 | 883 | 7 | 32 | 0.0855 | 1/1 |
+| T4-body-edit | baseline | 93373 | 462 | 4 | 17 | 0.0496 | 1/1 |
+|  | rust | 73531 | 433 | 3 | 15 | 0.0495 | 1/1 |
+|  | ts | 69498 | 391 | 3 | 17 | 0.0325 | 1/1 |
+| T5-schema-field | baseline | 272856 | 1637 | 12 | 39 | 0.1379 | 1/1 |
+|  | **rust** | **101248** | **836** | **4** | **23** | **0.0677** | 1/1 |
+|  | ts | 379669 | 3533 | 17 | 74 | 0.2131 | 1/1 |
+| T6-type-rename | baseline | 281323 | 2448 | 21 | 39 | 0.1929 | 1/1 |
+|  | **rust** | **73580** | **603** | **3** | **18** | **0.0522** | 1/1 |
+|  | ts | 69356 | 427 | 3 | 18 | 0.0330 | 1/1 |
 
-### Totals (median per task, summed)
+### Totals
 
 | arm | input tok | output tok | sec | $ cost | vs baseline (in / out / sec / $) | success |
 |---|--:|--:|--:|--:|---|--:|
-| baseline | 589327 | 3305 | 86 | 0.2869 | — | 12/12 |
-| **rust** | **372716** | **1903** | **53** | **0.1713** | **−37% / −42% / −38% / −40%** | 12/12 |
-| ts | 427049 | 2058 | 69 | 0.1949 | −28% / −38% / −20% / −32% | 12/12 |
+| baseline | 1163847 | 7808 | 180 | 0.7135 | — | 6/6 |
+| **rust** | **468464** | **3222** | **107** | **0.3176** | **−60% / −59% / −40% / −55%** | 6/6 |
+| ts | 886820 | 6354 | 184 | 0.4579 | −24% / −19% / +2% / −36% | 6/6 |
 
 **Headlines:**
-- **An agent with Marksman costs ~40% less and finishes ~38% faster**, all 12/12 — and now
-  **beats the mature TS tool it's a rewrite of on every axis** (rust −40% cost vs ts −32%).
+- **An agent with Marksman costs ~55% less and finishes ~40% faster, 6/6 correct** — and wins or
+  ties the mature TS tool it's a rewrite of on every task.
 - **`$` is the truest score.** It reflects prompt caching (re-sent context bills at ~10% as
   cache reads) and output's higher per-token price. The dominant cost driver is **turns**: each
   turn re-sends the whole context, and more turns means more (pricey) output. Rust takes the
-  fewest turns on every task — that's the win.
-- **Concentrated in structural + surgical edits.** T1-rename 4 turns vs baseline's 10 (one
-  `apply_edits` rename rewrites every reference); T2-move 3 vs 11. And T4-body-edit is the clearest
-  rust-vs-ts split: **rust −27% vs ts +25%** — because rust exposes `replace_text` (swap an exact
-  substring, gated, no read, no body re-emit), so its agent does the edit in one call while the
-  Node tool's agent reads and re-emits the whole function.
+  fewest turns on every task.
+- **Repo-wide structural edits are the blowouts.** T6-type-rename: **3 turns vs baseline's 21**
+  (one gated `rename` rewrites the interface and every reference/import; baseline read five whole
+  files and made 12 hand-edits). T1-rename 3 vs 12; T2-move 3 vs 8.
+- **Wide-blast-radius edits ride the reject-driven protocol.** T5 (add a required field to an
+  interface + set it at every construction site): the rust agent makes the anchor edit alone,
+  the type-check gate *rejects* with **every** affected site — each with its current source and
+  a ready-to-copy `fix:` action — and one batch later it's done. 4 turns / 836 output tokens vs
+  baseline's 12 / 1637, and no grep can miss a site: the compiler enumerates them.
+- **T3-locate went from parity to a win** via constraint-based disambiguation: the agent edits a
+  field by bare name with no locate step; when the name collides, the server resolves it from the
+  edit's own `oldText` (only one candidate contains it) instead of asking back.
 
 **Honest caveats:**
-- **T3-locate is parity, by construction** (rust +2%, noise). It's a trivially-greppable one-line
-  field edit — grep's home turf. An MCP arm pays a fixed tool-discovery turn or two that a
-  one-line edit can't amortize, so the realistic floor here is *parity*, not a win. Keeping a task
-  the tool does not win is what makes the average credible. (Earlier runs spiked when a real bug —
-  field nodes having a name-only edit range — made `replace_text` on a field fail; that's fixed,
-  and the variance with it.)
-- **All 12/12 succeeded, so the type-check gate's resilience value is NOT in these numbers** — a
-  gated edit is insurance against broken edits, and insurance doesn't pay out on the happy path.
-  The measured win is efficiency; catching an edit that breaks a caller in another file would
-  surface only on harder, error-prone tasks.
-- **Scope:** 4 tasks, one single-package TS repo, sonnet 4.6, median of 3. The *shape* is robust;
-  absolute deltas are this-repo/these-tasks.
+- **Single run** (model nondeterminism not averaged; historical medians of 3 showed the same
+  shape). Trajectory variance is real: on T5 the agent sometimes pre-explores before the first
+  edit, landing at 7–9 turns instead of 4 — still well under baseline, and every path converges
+  through the same self-sufficient reject.
+- **No benchmark-tuned prompting.** The MCP tool descriptions are audited to contain **zero
+  fixture names or task values** (an earlier revision leaked near-verbatim task answers into
+  description examples; those runs were discarded and the examples replaced with
+  fixture-foreign ones). What the tool teaches, it teaches generically.
+- **All 6/6 succeeded, so the type-check gate's resilience value is NOT in these numbers** —
+  insurance doesn't pay out on the happy path. The measured win is efficiency.
+- **Scope:** 6 tasks, one single-package TS repo, sonnet 4.6. The *shape* is robust; absolute
+  deltas are this-repo/these-tasks.
 - The `ts` arm runs the original codeindex's **current** ranker; part of rust's edge may be its
-  improved retrieval ranking, not only Rust speed. A clean read-vs-write isolation needs ranker
-  parity.
+  improved retrieval and edit-workflow design, not only Rust speed.
 
-Reproduce: `bash scripts/agent-bench/go.sh --runs 3` (needs `$ANTHROPIC_API_KEY`). Add
+Reproduce: `bash scripts/agent-bench/go.sh --runs 3` (needs `$ANTHROPIC_API_KEY`; rebuilds the
+release binaries first, so results always reflect the current source). Add
 `--save-transcript <dir>` then `python3 scripts/agent-bench/analyze.py <dir>` to see *why* an arm
 spent its turns (tool sequence, edit actions chosen, read-before-edit).
+
+### Startup: cached SCIP index
+
+MCP server startup on an already-indexed repo, measured on the bench target (wall-clock):
+
+| | cold (source changed) | warm (fingerprint match) |
+|---|--:|--:|
+| TS provider startup | ~26s (scip-typescript run) | **0.11s** |
+
+A content-hash fingerprint (all `.ts*`/`.js*` sources + tsconfig/package/lockfiles + the pinned
+scip-typescript version, augmented with the index's own document list) decides load-vs-reindex.
+Content hashes, not mtimes — a `git reset`/checkout rewrites mtimes but not bytes and still hits
+the cache. Any doubt (missing/corrupt fingerprint, tool-version bump) reindexes; a stale load is
+treated as a correctness bug, a spurious reindex as only a slow start.

@@ -25,10 +25,19 @@ metric. It's built to be trustworthy, not to look good.
 5. **No cherry-picking.** Every task in `tasks.json` is reported, including ties and losses.
    Run with `--runs N` to median over N repetitions and damp model nondeterminism.
 6. **One command, reproducible.** Anyone can re-run it and get the same shape of result.
+   `go.sh` rebuilds the release binaries first, so a run can never measure a stale build.
+7. **No benchmark-tuned prompting.** The MCP tool descriptions and the preamble contain **zero
+   fixture names or task values** — every example uses identifiers verified absent from the
+   target repo. (An earlier revision leaked near-verbatim task answers into description
+   examples; those runs were discarded.) When adding an example to a tool description, grep the
+   fixture for it first.
 
 ## Run it (step by step)
 
 Three arms: **baseline** (no codeindex) · **rust** (codeindex-rs MCP) · **ts** (Node codeindex MCP).
+Each arm is a single agent — the subagent-spawn tool is disallowed, so the top-level token/cost
+numbers describe the whole run (a delegated run would otherwise report the main agent's tokens while
+`$` billed the hidden subagent too).
 
 ```bash
 # 1. Auth — headless Claude Code needs an API key (org policy disables subscription headless).
@@ -77,4 +86,9 @@ totals (input/output token deltas, success counts).
 |---|---|---|
 | T1-rename | rename a function repo-wide | `apply_edits` rename vs N manual edits |
 | T2-move | move a file + fix imports | `move_file` / willRenameFiles |
-| T3-locate-edit | flip one default value | the *find* cost (retrieve vs grep) |
+| T3-locate-edit | flip one default value | the *find* cost (edit-by-name + oldText disambiguation vs grep) |
+| T4-body-edit | change two length checks inside one function | surgical sub-symbol edits (`replace_text`) vs read + re-emit |
+| T5-schema-field | add a required field to an interface + set it at every construction site | the wide-blast-radius protocol: anchor edit → gate reject enumerates every site with ready-to-copy fixes → one batch |
+| T6-type-rename | rename an interface repo-wide (definition + all references/imports) | gated cross-file rename at type level — the biggest baseline blowout (3 turns vs ~21) |
+
+Latest results and analysis live in [docs/benchmarks.md](../../docs/benchmarks.md).
