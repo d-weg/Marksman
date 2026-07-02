@@ -181,31 +181,39 @@ servers; future runs can't leak.
   improved retrieval and edit-workflow design, not only Rust speed. And it is **TypeScript-only**
   by design — its totals exclude T7 (see the table note).
 
-### Read-path ablation — is SCIP worth it? (pending)
+### Read-path ablation — is SCIP worth it? (measured)
 
-`CI_TS_MODE` swaps the TypeScript provider's read path so the SAME T1–T6 tasks can measure
-what each layer buys:
+`CI_TS_MODE` swaps the TypeScript provider's read path so the SAME tasks measure what each
+layer buys. Single runs, 2026-07-02, same-day baseline ($0.666, 8/8); the two tree-sitter
+runs PRE-DATE the field-anchor + move-rewrite fallback fixes (54e2ba8), noted per task.
 
-| mode | read path | gate | external deps at startup |
-|---|---|---|---|
-| `full` (default) | SCIP + tree-sitter deepen | warm ts-morph | Node (scip-typescript index) |
-| `treesitter-gated` | tree-sitter structure + relative-import graph | warm ts-morph | none (Node only on first edit) |
-| `treesitter` | tree-sitter (generic provider) | **none** (`gated: false` + rename scan) | none |
+| mode | read path | gate | $ | success | verdict |
+|---|---|--:|--:|--:|---|
+| `full` | SCIP + tree-sitter | ts-morph | 0.425 | 8/8 | −36% vs baseline |
+| `treesitter-gated` | tree-sitter + syntactic imports | ts-morph | 0.523 | 8/8 | ≈ full (see below) |
+| `treesitter` | tree-sitter only | **none** | 1.032 | **6/8** | **loses to baseline** |
 
-Run each mode as its own invocation (the index is rebuilt per run under the mode's env, so
-index and server always agree):
+**treesitter-gated ≈ full.** Turn-for-turn ties on T1/T2/T4/T6/T7/T8 (3-5 turns each). The
+apparent $ gap is two artifacts: T1's cost diverges at IDENTICAL token counts (cache-creation
+vs cache-read pricing — turns is the robust column), and T3 (5 vs 3 turns) hit the generic
+collector's missing field anchors — a fallback bug fixed after this run, not a tree-sitter
+limit. Most telling: **T5's reject-driven flow worked identically** (4 turns) — the syntactic
+relative-import graph found the same blast radius, because this repo imports directly. SCIP's
+semantic edges would only separate on barrel re-exports / large-repo ambiguity, which this
+suite doesn't contain. **On tasks like these, the compiler GATE carries the value; the SCIP
+read path is margin insurance.**
 
-```bash
-bash scripts/agent-bench/go.sh --arms baseline,rust --runs 3                          # full
-CI_TS_MODE=treesitter-gated bash scripts/agent-bench/go.sh --arms rust --runs 3
-CI_TS_MODE=treesitter       bash scripts/agent-bench/go.sh --arms rust --runs 3
-```
+**Pure tree-sitter LOSES on a typed language.** T1 failed, T5 failed (no compiler = no
+consequence enumeration — the one thing nothing syntactic can recover), T6 passed but at 25
+turns / $0.31 (double baseline). T4 and T8 stayed fine — consistent with T8's −63%: the
+ungated tier is right where the language itself has no checker (Python/Go…), and wrong where
+a compiler exists but isn't used. (T2's 9-turn import-fixing slog is since fixed by the
+syntactic move importer-rewrite; T1/T6 would improve with the same fixes; T5 would not.)
 
-Predictions to check against reality: T1–T4 (single-file-ish edits) should be close — ts-morph's
-rename is compiler-driven in both gated modes; T5/T6 should expose SCIP's semantic reference
-graph (blast-radius rejects across barrels; the tree-sitter import graph is syntactic and
-misses re-export flattening); `treesitter` pays for no gate on any task where the first edit
-isn't perfect. **Not yet measured.**
+**Decision this supports:** keep `full` as the TS default (SCIP is cheap once cached and its
+semantic margin is exactly the un-benched cases: barrels, re-exports, big repos), keep
+`treesitter-gated` as a supported zero-dependency-at-startup mode, and never present the
+ungated tier as adequate for a language that has a compiler.
 
 ### T8-fallback — the generic (UNGATED) provider, and a lesson in tool ergonomics
 
