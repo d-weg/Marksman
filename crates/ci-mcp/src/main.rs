@@ -586,15 +586,6 @@ impl Server {
         let actions = args["actions"].as_array().ok_or("`actions` array is required")?.clone();
         let registry = self.registry()?;
 
-        // Which file this batch edits, so we dispatch to the right language's edit engine. Set from
-        // the first action's path, else the file of the first resolved node_id (`file#…`).
-        let mut target_file: Option<String> = None;
-        let mut note_target = |f: &str| {
-            if target_file.is_none() && !f.is_empty() {
-                target_file = Some(f.to_string());
-            }
-        };
-
         let mut ops = Vec::new();
         for (ai, a) in actions.iter().enumerate() {
             // Reject unknown fields UP FRONT: a misspelled field (`old_text`, `after`) would
@@ -623,7 +614,6 @@ impl Server {
             }
             let act = a["action"].as_str().unwrap_or("");
             let path = a["path"].as_str().unwrap_or("").to_string();
-            note_target(&path);
             let mut name = a["name"].as_str().map(str::to_string);
             // The op's containment constraint, for auto-disambiguation of fuzzy addressing:
             // replace_text/delete_in_body's oldText and insert_in_body's `after` anchor must all
@@ -654,12 +644,6 @@ impl Server {
                     name = Some(self.resolve_symbol(&registry, &path, reference, op_needle)?);
                 }
             }
-            // A resolved node_id (`file#…`) also pins the target file.
-            if let Some(n) = name.as_deref() {
-                if n.contains('#') {
-                    note_target(file_of(n));
-                }
-            }
             let action = Action {
                 path,
                 action: act.to_string(),
@@ -683,20 +667,78 @@ impl Server {
             ops.push(action_to_op(&action, resolve).map_err(|e| e.to_string())?);
         }
 
-        // Dispatch to the edit engine for the TARGET FILE's language — strictly. Never fall back to
-        // another language's provider: a `.ts` edit handled by, say, the Python fallback would apply
-        // garbage structurally + ungated. If the target's language has no active provider (e.g. its
-        // toolchain didn't come up), say so loudly instead. Only a truly path-less batch uses the
-        // first provider.
-        let provider = match target_file.as_deref() {
-            Some(f) => registry.provider_for(Path::new(f)).ok_or_else(|| {
-                format!("no language provider for '{f}' — its language isn't active in this repo (is its toolchain available?)")
-            })?,
-            None => registry.providers().next().ok_or("no language provider available for this repo")?,
-        };
+        // Dispatch STRICTLY per file's language — never fall back to another language's provider
+        // (a `.ts` edit handled by, say, the Python fallback would apply garbage structurally +
+        // ungated). A batch may legally MIX languages (a multilanguage repo: one batch renaming a
+        // Rust and a TS symbol), so ops are GROUPED per provider, every group is gated first
+        // (dry-run), and only when all gates pass does anything commit — cross-language batches
+        // stay all-or-nothing. If an op's language has no active provider, say so loudly. A truly
+        // path-less batch uses the first provider.
+        if registry.providers().next().is_none() {
+            return Err("no language provider available for this repo".into());
+        }
+        let mut groups: Vec<(usize, Vec<ci_core::EditOp>)> = Vec::new();
+        for op in ops {
+            let slot = match op_file(&op) {
+                Some(f) => registry.entry_for(Path::new(&f)).ok_or_else(|| {
+                    format!("no language provider for '{f}' — its language isn't active in this repo (is its toolchain available?)")
+                })?,
+                None => 0, // path-less op: first provider, as before
+            };
+            match groups.iter_mut().find(|(s, _)| *s == slot) {
+                Some((_, v)) => v.push(op),
+                None => groups.push((slot, vec![op])),
+            }
+        }
+        if groups.is_empty() {
+            return Ok("Applied 0 edit(s); no file changes were necessary.".into());
+        }
+        let provider_of = |slot: usize| registry.entry_at(slot).expect("slot from entry_for");
 
+        let all_gated = groups.iter().all(|(slot, _)| provider_of(*slot).gated());
         let opts = EditOpts { write: !dry_run, dry_run, tsconfig: None };
-        let res = provider.apply_edits(&ops, &opts).map_err(|e| e.to_string())?;
+        let res = if groups.len() == 1 {
+            provider_of(groups[0].0).apply_edits(&groups[0].1, &opts).map_err(|e| e.to_string())?
+        } else {
+            // Multi-language batch. Gate phase: every group dry-runs; the first rejection wins
+            // and NOTHING has been written. (Feedback op numbers are within that language's
+            // sub-batch.) Languages can't type-depend on each other, so a commit in one can't
+            // change another's gate verdict.
+            let gate = EditOpts { write: false, dry_run: true, tsconfig: None };
+            let rejection = groups
+                .iter()
+                .map(|(slot, gops)| provider_of(*slot).apply_edits(gops, &gate).map_err(|e| e.to_string()))
+                .find(|r| !matches!(r, Ok(ci_core::CommitResult::Ok { .. })))
+                .transpose()?;
+            match rejection {
+                Some(rej) => rej,
+                None => {
+                    // Every gate passed — commit each group (skipped on dry_run) and merge.
+                    let mut applied = 0usize;
+                    let mut changed: Vec<PathBuf> = Vec::new();
+                    for (gi, (slot, gops)) in groups.iter().enumerate() {
+                        match provider_of(*slot).apply_edits(gops, &opts).map_err(|e| e.to_string())? {
+                            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
+                                applied += applied_ops;
+                                changed.extend(changed_files);
+                            }
+                            ci_core::CommitResult::Rejected { feedback, .. } => {
+                                // Gate passed but the write-run rejected (nondeterministic
+                                // tooling). Earlier groups ARE committed — report honestly.
+                                return Err(format!(
+                                    "partial: {applied} edit(s) already committed ({} file(s): {}) before sub-batch #{gi} was rejected:\n{feedback}",
+                                    changed.len(),
+                                    changed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "),
+                                ));
+                            }
+                        }
+                    }
+                    changed.sort();
+                    changed.dedup();
+                    ci_core::CommitResult::Ok { applied_ops: applied, changed_files: changed, repair_rounds: 0 }
+                }
+            }
+        };
         // Keep the index true: after a real (written) commit, incrementally reindex the changed
         // files so the same session's next retrieve_context/list_anchors sees the new state. A
         // reindex hiccup must NOT fail the (already-committed) edit — log and carry on stale.
@@ -714,7 +756,7 @@ impl Server {
                     if dry_run { " (dry run)" } else { "" }
                 ))
             }
-            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if provider.gated() => Ok(format!(
+            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if all_gated => Ok(format!(
                 "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
                  including files that import what changed. rename/move already updated every reference/import across the \
                  whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.\nFiles changed:\n{}",
@@ -722,12 +764,14 @@ impl Server {
                 changed_files.len(),
                 changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
             )),
-            // Ungated (tree-sitter fallback): structural edit, NOT type-checked. Be honest so the
-            // agent knows to verify — and that rename was best-effort within the edited file only.
+            // Ungated (tree-sitter fallback — or a mixed batch touching one such language):
+            // structural edit, NOT type-checked. Be honest so the agent knows to verify — and
+            // that rename was best-effort within the edited file only.
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => Ok(format!(
-                "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — this language has no \
-                 type-checker wired up, so the edit was NOT verified to compile, and `rename` rewrote matching identifiers \
-                 within the edited file only (not cross-file references). Review or run the project's own checks to confirm.\nFiles changed:\n{}",
+                "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — at least one edited \
+                 language has no type-checker wired up, so those edits were NOT verified to compile, and their `rename` \
+                 rewrote matching identifiers within the edited file only (not cross-file references). Review or run the \
+                 project's own checks to confirm.\nFiles changed:\n{}",
                 if dry_run { " (dry run — nothing written yet)" } else { "" },
                 changed_files.len(),
                 changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
@@ -807,6 +851,27 @@ fn render_summary(m: &Manifest) -> String {
 /// The file portion of a node id (`src/a.ts#Foo.bar:body` -> `src/a.ts`).
 fn file_of(id: &str) -> &str {
     id.split('#').next().unwrap_or(id)
+}
+
+/// The file an op edits — what decides WHICH language provider handles it (`None` only for a
+/// pathological empty id; the caller then falls back to the first provider).
+fn op_file(op: &ci_core::EditOp) -> Option<String> {
+    use ci_core::EditOp::*;
+    let f = match op {
+        SetBody { node_id, .. }
+        | ReplaceNode { node_id, .. }
+        | ReplaceText { node_id, .. }
+        | InsertBefore { node_id, .. }
+        | InsertInBody { node_id, .. }
+        | DeleteInBody { node_id, .. }
+        | InsertMember { node_id, .. }
+        | AddParameter { node_id, .. }
+        | SetReturnType { node_id, .. }
+        | Rename { node_id, .. } => file_of(node_id).to_string(),
+        MoveFile { from, .. } => from.to_string_lossy().replace('\\', "/"),
+        CreateFile { path, .. } | DeleteFile { path } => path.to_string_lossy().replace('\\', "/"),
+    };
+    (!f.is_empty()).then_some(f)
 }
 
 /// Ask the agent to re-issue with one of the candidate node ids (the disambiguation reply shared

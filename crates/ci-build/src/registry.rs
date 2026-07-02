@@ -52,6 +52,18 @@ impl ProviderRegistry {
         self.entries.iter().map(|(_, p)| p.as_ref())
     }
 
+    /// Index of the entry handling `file`'s language — a stable provider identity, so a caller
+    /// can GROUP a mixed-language batch per provider (two langs may share one provider).
+    pub fn entry_for(&self, file: &Path) -> Option<usize> {
+        let lang = Lang::of(file);
+        self.entries.iter().position(|(langs, _)| langs.contains(&lang))
+    }
+
+    /// The provider at `entry_for`'s index.
+    pub fn entry_at(&self, i: usize) -> Option<&dyn LanguageProvider> {
+        self.entries.get(i).map(|(_, p)| p.as_ref())
+    }
+
     /// Structure for one file via its language's provider; empty when no provider handles it (a
     /// file whose language isn't registered — e.g. it was disabled in the manifest).
     pub fn structure(&self, file: &Path) -> Result<Vec<Node>> {
