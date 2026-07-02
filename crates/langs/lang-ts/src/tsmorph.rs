@@ -4,7 +4,7 @@
 //! move edits. The sidecar script is bundled in the binary and run with a managed ts-morph
 //! install (no global dependency); `node` and `npm` are resolved from PATH like our other
 //! TS tooling.
-use ci_core::{Diag, Error, Result};
+use ci_core::{Diag, Error, FileSummary, Node, NodeKind, Range, Result, SymbolKind};
 use ci_edit::GateEngine;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -219,6 +219,59 @@ impl GateEngine for TsMorphClient {
         let res = self.call(json!({ "op": "willRename", "from": from, "to": to }))?;
         Ok(json!({ "changes": res.get("changes").cloned().unwrap_or_else(|| json!({})) }))
     }
+
+    fn file_summaries(&mut self, files: &[String]) -> Result<Option<Vec<FileSummary>>> {
+        let res = self.call(json!({ "op": "fileInfo", "files": files }))?;
+        let mut out = Vec::new();
+        for f in res["files"].as_array().into_iter().flatten() {
+            let path = f["path"].as_str().unwrap_or_default().to_string();
+            let deleted = f["deleted"].as_bool().unwrap_or(false);
+            // Same id scheme as the SCIP loader: `{rel}#{qualified}` with `~N` on duplicates,
+            // counted in document order (the sidecar returns symbols sorted by position).
+            let mut id_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let mut nodes = Vec::new();
+            for s in f["symbols"].as_array().into_iter().flatten() {
+                let (Some(q), Some(name)) = (s["q"].as_str(), s["name"].as_str()) else { continue };
+                let (Some(range), name_range) = (decode_span(&s["range"]), decode_span(&s["nameRange"])) else {
+                    continue;
+                };
+                let kind = match s["kind"].as_str() {
+                    Some("function") => SymbolKind::Function,
+                    Some("class") => SymbolKind::Class,
+                    _ => SymbolKind::Variable,
+                };
+                let base = format!("{path}#{q}");
+                let n = id_counts.entry(base.clone()).or_insert(0);
+                let id = if *n == 0 { base.clone() } else { format!("{base}~{n}") };
+                *n += 1;
+                nodes.push(Node { id, name: Some(name.to_string()), kind: NodeKind::Symbol(kind), range, name_range, children: vec![] });
+            }
+            let imports = f["imports"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(std::path::PathBuf::from))
+                .collect();
+            out.push(FileSummary { path, deleted, nodes, imports });
+        }
+        Ok(Some(out))
+    }
+}
+
+/// Sidecar span `[startLine, startChar, endLine, endChar]` (0-based lines, like SCIP) -> core
+/// `Range` (1-based lines).
+fn decode_span(v: &Value) -> Option<Range> {
+    let a = v.as_array()?;
+    if a.len() != 4 {
+        return None;
+    }
+    let n = |i: usize| a[i].as_u64().map(|x| x as u32);
+    Some(Range {
+        start_line: n(0)? + 1,
+        start_char: n(1)?,
+        end_line: n(2)? + 1,
+        end_char: n(3)?,
+    })
 }
 
 #[cfg(test)]

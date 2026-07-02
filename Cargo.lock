@@ -556,6 +556,7 @@ dependencies = [
  "ci-scip",
  "ci-treesitter",
  "ignore",
+ "serde_json",
  "tempfile",
  "tree-sitter",
  "tree-sitter-rust",

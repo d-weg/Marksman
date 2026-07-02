@@ -200,6 +200,23 @@ pub struct EditOpts {
     pub tsconfig: Option<String>,
 }
 
+/// Fresh read-path info for one file, produced by a write engine's live project right after a
+/// committed edit (see `GateEngine::file_summaries`). For providers whose read index is a build
+/// artifact (SCIP), this is how `structure()`/`import_graph()` stay true in-session: the same
+/// compiler that gated the edit re-describes the changed files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSummary {
+    /// Repo-relative posix path.
+    pub path: String,
+    /// True when the file no longer exists on disk (deleted, or the source of a move).
+    pub deleted: bool,
+    /// Shallow named-symbol nodes, same shape the SCIP read path produces (ids like
+    /// `"file.ts#Class.method"`); any AST deepening stays the provider's job.
+    pub nodes: Vec<Node>,
+    /// Repo-relative files this file imports/re-exports (its outgoing graph edges).
+    pub imports: Vec<PathBuf>,
+}
+
 /// A single diagnostic, keyed for baseline-diff (file + code + message, no line).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diag {

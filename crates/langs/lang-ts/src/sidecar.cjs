@@ -105,6 +105,109 @@ function rename(file, line, character, newName) {
   return { changes };
 }
 
+// Re-describe files from their CURRENT on-disk content: named symbols (same qualification
+// scheme the SCIP read path uses — namespace parts dropped, members as `Class.member`) plus
+// resolved import/re-export targets inside the repo. Called by the provider right after a
+// committed edit so its read index doesn't serve pre-edit state until the next reindex.
+function fileInfo(files) {
+  const out = [];
+  for (const rel of files) {
+    const ap = abs(rel);
+    if (!fs.existsSync(ap)) {
+      const sf = project.getSourceFile(ap);
+      if (sf) sf.delete(); // gone on disk (deleted / move source)
+      dirtied.delete(ap);
+      out.push({ path: rel, deleted: true, symbols: [], imports: [] });
+      continue;
+    }
+    setContent(ap, fs.readFileSync(ap, "utf8"));
+    dirtied.delete(ap); // in-memory now equals disk
+    const sf = project.getSourceFile(ap);
+    if (!sf) {
+      out.push({ path: rel, deleted: false, symbols: [], imports: [] });
+      continue;
+    }
+    out.push({ path: rel, deleted: false, symbols: collectSymbols(sf), imports: collectImports(sf) });
+  }
+  return { files: out };
+}
+
+// Named declarations with SCIP-equivalent kinds: Method-suffix -> "function",
+// Type-suffix (class/interface/enum/type alias) -> "class", Term-suffix -> "variable".
+// Document order, so duplicate-name `~N` disambiguation matches the SCIP loader's.
+function collectSymbols(sf) {
+  const cn = sf.compilerNode;
+  const syms = [];
+  const span = (start, end) => {
+    const s = ts.getLineAndCharacterOfPosition(cn, start);
+    const e = ts.getLineAndCharacterOfPosition(cn, end);
+    return [s.line, s.character, e.line, e.character];
+  };
+  const push = (q, decl, kind, declFull) => {
+    const nameNode = decl.getNameNode && decl.getNameNode();
+    if (!nameNode) return; // anonymous (default-export expr, …): not an addressable anchor
+    const full = declFull || decl;
+    syms.push({
+      q,
+      name: nameNode.getText(),
+      kind,
+      nameRange: span(nameNode.getStart(), nameNode.getEnd()),
+      range: span(full.getStart(), full.getEnd()),
+      start: full.getStart(),
+    });
+  };
+  const visit = (container) => {
+    for (const st of container.getStatements()) {
+      const k = st.getKindName();
+      if (k === "FunctionDeclaration") push(st.getName(), st, "function");
+      else if (k === "TypeAliasDeclaration") push(st.getName(), st, "class");
+      else if (k === "VariableStatement") {
+        for (const d of st.getDeclarations()) push(d.getName(), d, "variable", st);
+      } else if (k === "ClassDeclaration" || k === "InterfaceDeclaration" || k === "EnumDeclaration") {
+        const name = st.getName();
+        if (!name) continue;
+        push(name, st, "class");
+        for (const m of st.getMembers()) {
+          if (!m.getName || !m.getNameNode || !m.getNameNode()) continue;
+          const mk = m.getKindName();
+          const kind =
+            mk === "MethodDeclaration" || mk === "MethodSignature" || mk === "GetAccessor" || mk === "SetAccessor"
+              ? "function"
+              : "variable"; // properties, signatures, enum members: SCIP Term
+          push(`${name}.${m.getName()}`, m, kind);
+        }
+      } else if (k === "ModuleDeclaration") {
+        // SCIP drops Namespace descriptors from qualified names — recurse with no prefix.
+        const body = st.getBody && st.getBody();
+        if (body && body.getStatements) visit(body);
+      }
+    }
+  };
+  visit(sf);
+  syms.sort((a, b) => a.start - b.start);
+  for (const s of syms) delete s.start;
+  return syms;
+}
+
+// Repo-relative files this file imports or re-exports from (resolved by the compiler, so
+// `./math.js` -> `src/math.ts`). Outside-repo and node_modules targets are dropped — the
+// graph is repo-internal, like the SCIP one.
+function collectImports(sf) {
+  const set = new Set();
+  const add = (d) => {
+    const t = d.getModuleSpecifierSourceFile && d.getModuleSpecifierSourceFile();
+    if (!t) return;
+    const p = t.getFilePath();
+    if (p.includes("/node_modules/")) return;
+    const rel = path.relative(root, p);
+    if (rel.startsWith("..")) return;
+    set.add(rel.split(path.sep).join("/"));
+  };
+  sf.getImportDeclarations().forEach(add);
+  sf.getExportDeclarations().forEach(add);
+  return [...set].sort();
+}
+
 function willRename(from, to) {
   const fmt = ts.getDefaultFormatCodeSettings ? ts.getDefaultFormatCodeSettings() : {};
   const fileChanges = rawLs.getEditsForFileRename(abs(from), abs(to), fmt, {}) || [];
@@ -130,6 +233,7 @@ rl.on("line", (line) => {
     if (req.op === "diagnostics") res = diagnostics(req.files || []);
     else if (req.op === "rename") res = rename(req.file, req.line, req.character, req.newName);
     else if (req.op === "willRename") res = willRename(req.from, req.to);
+    else if (req.op === "fileInfo") res = fileInfo(req.files || []);
     else if (req.op === "ping") res = { ok: true };
     else res = { error: "unknown op: " + req.op };
   } catch (e) {

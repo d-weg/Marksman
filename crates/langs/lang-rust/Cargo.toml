@@ -15,6 +15,7 @@ ci-treesitter = { path = "../../ci-treesitter" }
 tree-sitter = { workspace = true }
 tree-sitter-rust = "0.24"
 ignore = "0.4"
+serde_json = { workspace = true }
 
 [[bin]]
 name = "marksman-provider-rust"

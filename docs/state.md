@@ -42,11 +42,26 @@ Agent / CLI / MCP  (pure Rust)
 - Net: SCIP's "no AST → no sub-symbol edits" weakness is solved by tree-sitter; tree-sitter's
   "no semantics" weakness is covered by SCIP. Each fixes the other.
 
+### Read freshness (both providers — the index never lies in-session)
+- **TS**: after a committed `apply_edits`, the warm ts-morph sidecar re-describes the changed
+  files (`fileInfo` op: symbols + resolved imports) into a per-file **read override** consulted
+  before the loaded SCIP index — new symbols and new import edges are visible immediately, no
+  reindex. Startup stays fingerprint-cached; the overlay covers the same-session window.
+- **Rust**: `structure()` and the `mod` graph read disk live (always fresh). The opt-in
+  `rust-analyzer scip` use-graph is fingerprinted at `refresh_scip` time; at load, files that
+  drifted since (and files committed in-session) get their edges recomputed from tree-sitter
+  (`mod` + resolved `use` paths) as an overlay — scip fidelity for unchanged files, syntax
+  fidelity for changed ones. A cache with **no** fingerprint is refused (mod-graph fallback),
+  never served at unknown age.
+
 ### Write = VFS transaction + LSP gate
 - Edits stage into an in-memory **VFS** overlay (`ci-vfs`); disk untouched until commit.
-- The **gate**: push `didChange` with the overlay to the TS language server (`ci-lsp`),
+- The **gate**: push `didChange` with the overlay to the language server (`ci-lsp`),
   collect in-memory diagnostics, **baseline-diff** (fail only on NEWLY introduced errors),
-  then commit-or-roll-back atomically.
+  then commit-or-roll-back atomically. `ci-lsp` prefers **LSP 3.17 pull diagnostics**
+  (`textDocument/diagnostic`, gated on a quiescent `experimental/serverStatus` for
+  rust-analyzer) — request/response, so a slow server can never read as "clean"; the
+  publish+silence-settle path remains only for servers without pull (tsls).
 - **rename** via LSP (all references); **replace_node / insert / replace_text** via ranges;
   with `Granularity::Ast`, sub-symbol edits (`#sym:body`, `#sym:return`, `#sym:param.N`)
   work through the same machinery.

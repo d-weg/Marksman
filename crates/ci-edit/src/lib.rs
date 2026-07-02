@@ -4,7 +4,7 @@
 //! the VFS. Rename goes through LSP (all references); structural edits use the
 //! node's `enclosing_range`. No AST: `set_body` and the fine verbs are refused at
 //! Symbol granularity (use `replace_node`).
-use ci_core::{CommitResult, Diag, EditOp, EditOpts, Error, Node, Range, Result};
+use ci_core::{CommitResult, Diag, EditOp, EditOpts, Error, FileSummary, Node, Range, Result};
 use ci_lsp::LspClient;
 use ci_vfs::Vfs;
 use serde_json::{json, Value};
@@ -24,6 +24,14 @@ pub trait GateEngine {
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value>;
     /// Importer rewrites for moving `from` → `to` (does not move the file). Empty if unsupported.
     fn will_rename(&mut self, from: &str, to: &str) -> Result<Value>;
+    /// Fresh per-file read info (named symbols + import edges) from the engine's live project,
+    /// or `Ok(None)` when this engine can't provide it. Providers whose read index is a build
+    /// artifact (SCIP) call this after a committed edit so `structure()`/`import_graph()` stay
+    /// true in-session instead of serving pre-edit state until the next reindex.
+    fn file_summaries(&mut self, files: &[String]) -> Result<Option<Vec<FileSummary>>> {
+        let _ = files;
+        Ok(None)
+    }
 }
 
 /// LSP request errors that mean "the server is still loading the project" rather than a real

@@ -10,11 +10,13 @@ use ci_core::{
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
 use ci_treesitter::{syntax_node, ts_range};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node as TsNode, Parser};
+
+mod usegraph;
 
 /// The rust-analyzer LSP server, loaded once and reused as the edit/gate engine — the same
 /// `GateEngine`/`LspClient` path TypeScript uses, just rust-analyzer instead of tsserver.
@@ -27,6 +29,14 @@ pub struct RustProvider {
     /// Use the cached `rust-analyzer scip` graph (compiler-accurate `use` edges) over the
     /// tree-sitter `mod` graph. Set by the caller from `Config::scip_enabled("rust")`.
     use_scip: bool,
+    /// The scip cache's base graph, loaded + drift-checked ONCE per provider (`None` inside =
+    /// cache unusable: absent, unreadable, or no fingerprint to trust it by).
+    scip_base: Arc<Mutex<Option<Option<ImportGraph>>>>,
+    /// Per-file outgoing-edge overrides on top of the scip base graph (`None` = file deleted).
+    /// Seeded at load for files that drifted since the cache was built, updated after each
+    /// committed edit — so the served graph never reports pre-edit edges. Same pattern as
+    /// lang-ts's post-edit `fresh` overlay, sourced from tree-sitter (`mod` + resolved `use`).
+    fresh_edges: Arc<Mutex<HashMap<String, Option<Vec<PathBuf>>>>>,
 }
 
 /// The rust-analyzer binary: `$CI_RUST_ANALYZER`, else `~/.cargo/bin/rust-analyzer`, else PATH.
@@ -44,7 +54,13 @@ fn rust_analyzer_command() -> Command {
 
 impl RustProvider {
     pub fn new(root: &Path) -> Self {
-        Self { root: root.to_path_buf(), engine: Arc::new(Mutex::new(None)), use_scip: false }
+        Self {
+            root: root.to_path_buf(),
+            engine: Arc::new(Mutex::new(None)),
+            use_scip: false,
+            scip_base: Arc::new(Mutex::new(None)),
+            fresh_edges: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// Enable the compiler-accurate `rust-analyzer scip` graph (see [`RustProvider::use_scip`]).
@@ -59,7 +75,7 @@ impl RustProvider {
         p.to_string_lossy().replace('\\', "/")
     }
 
-    fn parse(content: &str) -> Option<tree_sitter::Tree> {
+    pub(crate) fn parse(content: &str) -> Option<tree_sitter::Tree> {
         let mut parser = Parser::new();
         let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         parser.set_language(&lang).ok()?;
@@ -71,14 +87,61 @@ impl RustProvider {
         self.root.join(".codeindex-rs").join("rust.scip")
     }
 
-    /// The `use`/reference import graph from the cached SCIP index, if it exists. `None` (→ the
-    /// `mod`-graph fallback) when no cache has been generated.
+    /// The `use`/reference import graph from the cached SCIP index, kept honest: the base
+    /// graph is loaded once and trusted only as far as its fingerprint reaches — every file
+    /// that drifted since `refresh_scip` ran gets its edges recomputed from tree-sitter
+    /// (`mod` + resolved `use` paths) as an overlay, and committed edits update that overlay
+    /// (see `apply_edits`). `None` (→ the `mod`-graph fallback) when there is no cache, or a
+    /// cache with no fingerprint at all — a graph we can't vouch for is never served.
     fn scip_graph(&self) -> Option<ImportGraph> {
+        let mut base_slot = self.scip_base.lock().ok()?;
+        if base_slot.is_none() {
+            *base_slot = Some(self.load_scip_base());
+        }
+        let base = base_slot.as_ref()?.clone()?;
+        drop(base_slot);
+        let overrides = self.fresh_edges.lock().ok()?;
+        Some(usegraph::overlay_graph(base, &overrides))
+    }
+
+    /// Load + drift-check the scip cache (once per provider). On success, seeds `fresh_edges`
+    /// for exactly the files that changed since the cache was built.
+    fn load_scip_base(&self) -> Option<ImportGraph> {
         let cache = self.scip_cache();
         if !cache.is_file() {
             return None;
         }
-        ci_scip::ScipIndex::load(&cache).ok()?.import_graph().ok()
+        let graph = ci_scip::ScipIndex::load(&cache).ok()?.import_graph().ok()?;
+        let Some(drift) = usegraph::drifted_files(&self.root) else {
+            eprintln!(
+                "[lang-rust] scip cache {} has no fingerprint — refusing to serve a graph of unknown \
+                 age (falling back to the mod graph); re-run `index` to regenerate it",
+                cache.display()
+            );
+            return None;
+        };
+        if !drift.is_empty() {
+            if let Ok(mut m) = self.fresh_edges.lock() {
+                for rel in &drift {
+                    if rel.ends_with(".rs") {
+                        m.entry(rel.clone()).or_insert_with(|| self.edges_from_disk(rel));
+                    }
+                }
+            }
+            eprintln!(
+                "[lang-rust] scip graph: {} file(s) changed since the cache was built; serving \
+                 tree-sitter edges for those files (scip edges for the rest)",
+                drift.len()
+            );
+        }
+        Some(graph)
+    }
+
+    /// Current outgoing edges of `rel` from disk (`None` = file gone).
+    fn edges_from_disk(&self, rel: &str) -> Option<Vec<PathBuf>> {
+        let content = std::fs::read_to_string(self.root.join(rel)).ok()?;
+        let tree = Self::parse(&content)?;
+        Some(usegraph::file_edges(&self.root, rel, tree.root_node(), content.as_bytes()))
     }
 }
 
@@ -105,6 +168,11 @@ pub fn refresh_scip(root: &Path) -> Result<()> {
     if !status.success() {
         return Err(Error::Driver(format!("`rust-analyzer scip` failed ({status})")));
     }
+    // The fingerprint is what lets a later session TRUST this cache (and pinpoint which files
+    // drifted). Without one the graph falls back to mod edges, so failing to write it is an
+    // error, not a shrug.
+    usegraph::store_fingerprint(root)
+        .map_err(|e| Error::Driver(format!("storing the scip cache fingerprint: {e}")))?;
     Ok(())
 }
 
@@ -195,7 +263,25 @@ impl LanguageProvider for RustProvider {
         let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
         let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
 
-        ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
+        let r = ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
+        // Keep the scip-backed graph true in-session: re-describe each committed file's edges
+        // from its new content (tree-sitter, in-process — cheap and can't fail the edit). The
+        // live mod graph and structure() read disk directly, so they need no help.
+        if self.use_scip {
+            if let Ok(CommitResult::Ok { changed_files, .. }) = &r {
+                if opts.write && !opts.dry_run {
+                    if let Ok(mut m) = self.fresh_edges.lock() {
+                        for f in changed_files {
+                            let rel = f.to_string_lossy().replace('\\', "/");
+                            if rel.ends_with(".rs") {
+                                m.insert(rel.clone(), self.edges_from_disk(&rel));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        r
     }
 }
 
@@ -591,6 +677,53 @@ mod tests {
         let scip_g = ci_scip::ScipIndex::load(&cache).unwrap().import_graph().unwrap();
         let edges = scip_g.get(&PathBuf::from("src/parser.rs")).expect("parser.rs edges from scip");
         assert!(edges.contains(&PathBuf::from("src/lexer.rs")), "scip use edge parser->lexer: {edges:?}");
+    }
+
+    // Freshness parity with lang-ts: the scip-backed graph must (a) pick up a committed
+    // edit's new `use` edge IN-SESSION without re-running rust-analyzer, (b) let a fresh
+    // provider (next session) see the same edge via the fingerprint-driven overlay, and
+    // (c) refuse a fingerprint-less cache outright instead of serving a graph of unknown
+    // age. #[ignore] (runs `rust-analyzer scip`); `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn scip_graph_stays_fresh_after_edits() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(root.join("src/lib.rs"), "pub mod lexer;\npub mod parser;\n").unwrap();
+        fs::write(root.join("src/lexer.rs"), "pub struct Token;\n").unwrap();
+        fs::write(root.join("src/parser.rs"), "pub fn parse() {}\n").unwrap();
+
+        refresh_scip(root).expect("rust-analyzer scip");
+        let parser = PathBuf::from("src/parser.rs");
+        let lexer = PathBuf::from("src/lexer.rs");
+        let has_edge = |g: &ImportGraph| g.get(&parser).map(|e| e.contains(&lexer)).unwrap_or(false);
+
+        let p = RustProvider::new(root).with_scip(true);
+        assert!(!has_edge(&p.import_graph().unwrap()), "no parser->lexer edge before the edit");
+
+        // Committed edit introduces `use crate::lexer::Token` — the edge appears in-session.
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let res = p
+            .apply_edits(
+                &[EditOp::ReplaceNode {
+                    node_id: "src/parser.rs#parse".into(),
+                    code: "use crate::lexer::Token;\npub fn parse(_t: Token) {}".into(),
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "edit must commit: {res:?}");
+        assert!(has_edge(&p.import_graph().unwrap()), "new use edge visible in-session, no reindex");
+
+        // A NEW provider (next session) sees it too: the fingerprint pinpoints the drifted
+        // file and its edges come from tree-sitter while the rest stay scip.
+        let p2 = RustProvider::new(root).with_scip(true);
+        assert!(has_edge(&p2.import_graph().unwrap()), "drift overlay serves the edge across sessions");
+
+        // No fingerprint -> the cache is refused (mod-graph fallback), never served stale.
+        fs::remove_file(root.join(".codeindex-rs/rust.scip.fingerprint.json")).unwrap();
+        let p3 = RustProvider::new(root).with_scip(true);
+        assert!(!has_edge(&p3.import_graph().unwrap()), "fingerprint-less cache must not be trusted");
     }
 
     #[test]
