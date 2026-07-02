@@ -23,6 +23,10 @@ export ANTHROPIC_API_KEY
 export CLAUDE_BIN="$(ls -d "$HOME/Library/Application Support/Claude/claude-code"/*/claude.app/Contents/MacOS/claude 2>/dev/null | sort -V | tail -1)"
 export CLAUDE_MODEL="${CLAUDE_MODEL:-claude-sonnet-4-6}"
 export CI_NPM_CACHE="/tmp/ci-npm-cache"
+# cargo on PATH for the harness AND the agent: T7-multilang's check runs `cargo check`, and the
+# baseline arm needs the same toolchain the rust arm's MCP server finds via its own fallback.
+# (First T7 run failed BOTH arms on `command not found: cargo` in the check subprocess.)
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
 export CODEINDEX_TS_DIR="${CODEINDEX_TS_DIR:-/Users/davi.vasconcelos/codeindex}"
 export CI_MODEL_DIR="${CI_MODEL_DIR:-/Users/davi.vasconcelos/codeindex/.models/potion-code-16M}"
 
