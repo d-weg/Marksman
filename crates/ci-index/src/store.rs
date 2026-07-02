@@ -59,6 +59,19 @@ pub fn save_index(root: &Path, config: &Config, data: &IndexData) -> Result<()> 
     }
     match std::fs::rename(&tmp, &dir) {
         Ok(()) => {
+            // The swap owns only the files IT writes. The index dir also hosts files it does
+            // not: language-provider caches (`index.scip` + its fingerprint — ~26s to rebuild)
+            // live alongside the index, and dropping the old dir wholesale silently destroyed
+            // them on EVERY save — cold provider startup after each `index`/post-edit reindex.
+            // Carry every entry `write_index_files` didn't produce over into the new dir
+            // (same-fs rename). Best-effort: a cache that fails to carry is re-derived (slow
+            // start), never stale — the atomicity that matters (pb/embeddings aligned) is done.
+            for entry in std::fs::read_dir(&stale).into_iter().flatten().flatten() {
+                let keep = entry.file_name();
+                if !INDEX_OWNED_FILES.contains(&keep.to_string_lossy().as_ref()) {
+                    let _ = std::fs::rename(entry.path(), dir.join(&keep));
+                }
+            }
             let _ = std::fs::remove_dir_all(&stale);
             Ok(())
         }
@@ -71,6 +84,9 @@ pub fn save_index(root: &Path, config: &Config, data: &IndexData) -> Result<()> 
         }
     }
 }
+
+/// The files `write_index_files` produces — the ONLY entries the atomic swap may discard.
+const INDEX_OWNED_FILES: &[&str] = &["index.pb", "embeddings.bin", "config.snapshot.json"];
 
 /// Write the index into `dir` (used against a temp dir before the atomic swap): `index.pb`
 /// (everything but the matrix — protobuf, see `pb.rs`), `embeddings.bin` (raw f32 LE), and a
@@ -278,6 +294,31 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "temp/lock artifacts left behind: {leftovers:?}");
         assert!(load_index(root, &config).is_ok(), "index still loads after atomic overwrite");
+    }
+
+    // The index dir also hosts files the swap does NOT own — language-provider caches
+    // (`index.scip` + fingerprint, minutes to rebuild). A save must carry them over, not
+    // silently destroy them with the old dir (the bug: every `index`/post-edit reindex cost
+    // the next startup a full scip run).
+    #[test]
+    fn save_preserves_foreign_files_in_the_index_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let config = Config::default();
+        save_index(root, &config, &tiny_index(root)).unwrap();
+
+        let idx = index_dir(root, &config);
+        std::fs::write(idx.join("index.scip"), b"provider cache").unwrap();
+        std::fs::write(idx.join("index.scip.fingerprint.json"), b"{}").unwrap();
+
+        save_index(root, &config, &tiny_index(root)).unwrap();
+        assert_eq!(
+            std::fs::read(idx.join("index.scip")).unwrap(),
+            b"provider cache",
+            "a provider cache must survive the atomic index swap"
+        );
+        assert!(idx.join("index.scip.fingerprint.json").exists(), "fingerprint survives too");
+        assert!(load_index(root, &config).is_ok(), "index itself still loads");
     }
 
     #[test]

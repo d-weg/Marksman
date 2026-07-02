@@ -245,6 +245,45 @@ augmented with the index's own document list) decides load-vs-reindex. Content h
 mtimes — a `git reset` still hits the cache. Any doubt reindexes: a stale load is a
 correctness bug, a spurious reindex only a slow start.
 
+### Headroom on a real repo (microsoft/TypeScript, no-agent)
+
+The fixtures are tiny by design; this measures the same machinery on the TypeScript compiler
+itself — 709 source files, **453k lines, 21,794 symbols** (test corpus excluded, as any real
+user would). One machine, single runs, 2026-07-02:
+
+| what | measured |
+|---|--:|
+| cold full index (scip + embed + persist) | **29.5s** |
+| warm reindex (`marksman index` again) | 13.9s |
+| warm provider open (fingerprint check over the whole repo) | **~0.3s** |
+| `retrieve` per query, end-to-end incl. process + model + index load | **0.26–0.40s** |
+| gated edit, leaf file (warm engine) | **0.098s** |
+| gated edit, hub file — `corePublic.ts`, 303 real importers | ~20s |
+
+- **Retrieval's O(n) is a non-issue at this scale** (22k chunks); results were on-target
+  (the union-type-narrowing query led with `compiler/types.ts`' `UnionType`).
+- **Gate latency scales with the TRUE blast radius, not repo size**: ~0.1s + ~65ms per
+  radius file. A hub edit checking 303 real referencers costs ~20s — the honest price of
+  enumerating every consequence, still under a full `tsc` iterate, and leaf edits (the common
+  case) stay ~0.1s.
+- **The radius data settles the ablation's scale question brutally.** This repo imports
+  through `_namespaces` barrels, so the syntactic graph sees **1** importer of
+  `compiler/core.ts` where scip sees **465** true referencers — and the transitive syntactic
+  closure needed for soundness is **596 files (the entire repo) for any hub edit**
+  (inflation over all files: p50 1.0×, p90 59×, p99 298×). At ~65ms/file that's a ~40s gate
+  per hub edit in `treesitter-gated` mode vs scip's bounded true-referencer set. On barrel-
+  architected repos at scale, scip is what keeps the gate both sound AND affordable.
+- **This test also flushed out a real bug** (fixed + regression-tested): the atomic index
+  save swapped the whole `.marksman` dir, destroying the co-located scip cache + fingerprint
+  on every save — every post-`index` startup silently paid a full scip rerun. The swap now
+  carries over every file it didn't write.
+
+Caveats: single machine/runs; `npm ci` failed in this sandbox (TypeScript's src is
+self-contained so scip was unaffected — on dependency-heavy repos, install first);
+`.d.ts` lib files have no syntactic import edges (scip-only, consistent with the monorepo
+finding). Agent-level A/B on external repos needs repo-specific tasks with objective checks —
+the harness takes `--repo`, tasks live in `scripts/agent-bench/tasks.json`.
+
 ### Retrieval overlap vs the Node prototype (Jaccard, per task)
 
 | task | rust | node | shared | Jaccard |
