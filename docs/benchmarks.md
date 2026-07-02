@@ -309,11 +309,26 @@ composition: the full 10-task suite through [Headroom](https://github.com/headro
   a grep-and-read agent benefits from compression; a Marksman agent mostly never emits the
   dumps in the first place.
 
-Caveats: single runs; `in_tok` is not comparable across wrapped/unwrapped arms (proxy cache
-alignment shifts the cache-write/read mix); the wrapped rust arm posted unusually LOW turn
-counts (2-turn renames) — correct but unexplained, not claimed. Recipe:
-`headroom proxy --port 8787`, a shim exporting `ANTHROPIC_BASE_URL`, `CLAUDE_BIN=<shim> go.sh …`
-(go.sh honors a pre-set `CLAUDE_BIN` and exports `CLAUDE_REAL` for the shim).
+**The wrapped arm's "improvement," explained (transcript-diffed):** the wrapped rust runs
+posted the lowest turn counts ever (2-turn renames, $0.027 T1) — and it was NOT compression.
+Behind the proxy, Claude Code registered the marksman MCP tools **upfront**
+(init: 34 tools, marksman `connected`, zero ToolSearch calls in all 10 transcripts — first
+action is `apply_edits` directly); unwrapped, the tools are **deferred** (29 tools, marksman
+`pending`) and every session pays a ToolSearch discovery turn first. The proxy's first-request
+latency appears to let the MCP handshake win the client's registration race — marksman-mcp
+itself answers `initialize` in 0.13s, so the deferral is client-side policy/timing, not the
+server. Marksman's replies passed through the proxy byte-identical (the T1 tool_result is the
+same 389 chars in both arms). Two implications: (1) wrapped-vs-unwrapped comparisons change
+TWO variables (compression + tool-registration mode) — attribute with transcripts, not totals;
+(2) **every published marksman number in this file INCLUDES a discovery turn** — a client that
+registers MCP tools eagerly gets 2-turn renames (T1 at −83% vs baseline instead of −70%). The
+discovery turn costs ~1 turn + ~2¢/session; eager registration is worth requesting from any
+client that supports it.
+
+Other caveats: single runs; `in_tok` is not comparable across wrapped/unwrapped arms (proxy
+cache alignment shifts the cache-write/read mix). Recipe: `headroom proxy --port 8787`, a shim
+exporting `ANTHROPIC_BASE_URL`, `CLAUDE_BIN=<shim> go.sh …` (go.sh honors a pre-set
+`CLAUDE_BIN` and exports `CLAUDE_REAL` for the shim).
 
 ### Retrieval overlap vs the Node prototype (Jaccard, per task)
 
