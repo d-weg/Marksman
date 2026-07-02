@@ -292,8 +292,10 @@ now executable — the NEXT provider can't ship without passing it.
 - [x] **The audit**: all 10 instances green; grep-audit confirms every provider routes writes
       through `commit_edits` and no provider re-implements the graph/text helpers. CONTRIBUTING
       wires the suite into the PR flow.
-- [ ] (nice-to-have) a `lang-template` skeleton crate so Step-1 languages (Batch 8) start
-      conformant instead of converging later.
+- [x] `lang-template` skeleton crate: `GatedTreeSitter` (tree-sitter reads + a pluggable
+      checker on the shared spine, transitive radius wired) with a mock checker and its OWN
+      conformance instance — a copied crate starts conformant, provably. Step-1 languages
+      (Batch 8) start here.
 
 ## Capability checklist for ANY new language provider (definition-of-done)
 The bar TS and Rust meet — every new provider should target all of it. The seams
