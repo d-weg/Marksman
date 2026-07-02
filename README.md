@@ -39,9 +39,22 @@ On a 7-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), an
 ## Install
 
 ### Prerequisites
-- **Rust** (stable) — to build. <https://rustup.rs>
-- **Node 18+** with `npm` / `npx` — the TypeScript provider runs `scip-typescript` and `ts-morph`, fetched automatically on first use.
+
+Dependencies are **per language, checked only for languages your repo actually contains** — a
+Rust-only repo never needs (or touches) Node, and a TS-only repo never needs rust-analyzer.
+Run `codeindex-rs doctor <repo>` any time to see exactly what your repo needs, what's
+installed, and how to install what's missing.
+
+- **Rust** (stable) — to build Marksman itself. <https://rustup.rs>
 - The **embedding model** (~65 MB), `minishlab/potion-code-16M` — downloaded once (below).
+- *Only if your repo has TypeScript:* **Node 18+** with `npm`/`npx` — `scip-typescript` and
+  `ts-morph` are then fetched automatically on first use.
+- *Only if your repo has Rust and you want type-checked edits:* **rust-analyzer**
+  (`rustup component add rust-analyzer`) — reads/indexing work without it.
+
+If a needed toolchain is missing, Marksman says so **actionably** — the language is disabled
+with an install instruction (at startup, in `doctor`, and on any tool call touching that
+language's files) — it never half-works or silently degrades.
 
 ### 1. Build
 ```bash
@@ -101,6 +114,9 @@ claude mcp add marksman \
 ```
 codeindex-rs index    <repo>                              # build / refresh the index (.codeindex-rs/)
 codeindex-rs retrieve <repo> "<task>" [--top N] [--json]  # query the index
+codeindex-rs doctor   [<repo>]                            # per-language dependency report: what this
+                                                          # repo needs, what's installed, what's missing
+                                                          # (with install commands); exit 1 if unhealthy
 ```
 
 ## Configuration

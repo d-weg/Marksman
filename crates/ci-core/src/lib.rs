@@ -10,6 +10,7 @@ pub mod driver;
 pub mod error;
 pub mod outline;
 pub mod text;
+pub mod toolchain;
 pub mod types;
 pub mod weight;
 
@@ -18,4 +19,5 @@ pub use driver::LanguageProvider;
 pub use error::{Error, Result};
 pub use outline::{elide_bodies, elide_bodies_with};
 pub use text::byte_offset;
+pub use toolchain::{probe_tool, ToolStatus, ToolchainReport};
 pub use types::*;

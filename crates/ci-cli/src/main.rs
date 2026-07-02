@@ -6,7 +6,7 @@
 //!
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
-use ci_build::{build_index, build_registry};
+use ci_build::{build_index, build_registry, ProviderBuild};
 use ci_core::{Config, LanguageProvider, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
@@ -47,16 +47,16 @@ fn die(msg: impl std::fmt::Display) -> ! {
 /// `CI_PROVIDER=sidecar`. Returns `None` (and warns) when a language's tooling can't start, so a
 /// mixed-language index isn't sunk by one language failing. Called by [`build_registry`] once per
 /// active language — so Node's `scip-typescript` only runs when the repo actually has `.ts*`.
-fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn LanguageProvider>> {
+fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
     // `CI_PROVIDER=sidecar`: index over the protobuf wire via a `marksman-provider-<lang>` process.
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
         if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
             eprintln!("[codeindex-rs] language: {lang} (sidecar process — protobuf wire)");
             match ProcessProvider::spawn(cmd) {
-                Ok(p) => return Some(Arc::new(p)),
+                Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
                     eprintln!("[codeindex-rs] sidecar {lang} failed to start ({e}); skipping");
-                    return None;
+                    return ProviderBuild::Failed(e.to_string());
                 }
             }
         }
@@ -64,26 +64,36 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn Lan
     }
     match lang {
         "rust" => {
+            // Reads are in-process (no external deps); rust-analyzer gates only writes.
+            if let Some(missing) = lang_rust::toolchain().describe_missing() {
+                eprintln!("[codeindex-rs] warning: {missing}\n  (rust indexing/reads work; type-checked edits will fail until installed)");
+            }
             eprintln!("[codeindex-rs] language: rust (tree-sitter, in-process — no Node)");
-            Some(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
+            ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
         "python" => {
             eprintln!("[codeindex-rs] language: python (tree-sitter fallback, in-process — ungated edits)");
-            Some(Arc::new(FallbackProvider::new(root, FbLang::Python)))
+            ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Python)))
         }
         "ts" => {
+            // Check the toolchain BEFORE running any of it: a missing Node is one actionable
+            // message (what + why + install), not a cryptic npx spawn error mid-index.
+            if let Some(missing) = lang_ts::toolchain().describe_missing() {
+                eprintln!("[codeindex-rs] typescript DISABLED:\n{missing}");
+                return ProviderBuild::Unavailable(missing);
+            }
             // `open` reuses the cached .codeindex/index.scip when the source fingerprint still
             // matches; scip-typescript re-runs only when the source actually changed.
             eprintln!("[codeindex-rs] language: typescript — opening scip index for {} …", root.display());
             match TsProvider::open(root) {
-                Ok(p) => Some(Arc::new(p)),
+                Ok(p) => ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
                     eprintln!("[codeindex-rs] typescript indexing failed ({e}); skipping TS files");
-                    None
+                    ProviderBuild::Failed(e.to_string())
                 }
             }
         }
-        _ => None,
+        _ => ProviderBuild::Failed(format!("unknown language '{lang}'")),
     }
 }
 
@@ -134,6 +144,71 @@ fn cmd_index(root: &Path) {
         index.meta.dims,
         config.index_dir
     );
+}
+
+/// `doctor` — the human entry to the dependency layer: which languages this repo actually
+/// contains, what each one needs from the machine, what's installed (with versions), what's
+/// missing (with install instructions), plus embedding-model and index status. Read-only —
+/// probes `--version`s, runs nothing heavy, fetches nothing. Exits non-zero when a PRESENT
+/// language is missing a required tool, so scripts can gate on it.
+fn cmd_doctor(root: &Path) {
+    let config = rust_config(root);
+    let present = ci_walk::present_langs(root, &config).unwrap_or_else(|e| die(e));
+    let has = |l: ci_walk::Lang| present.contains(&l);
+    println!("marksman doctor — {}\n", root.display());
+
+    let mut unhealthy = false;
+    let mut section = |report: ci_core::ToolchainReport, note: Option<&str>| {
+        println!("[{}]", report.lang);
+        for t in &report.tools {
+            match &t.found {
+                Some(v) => println!("  ok       {} ({v})", t.tool),
+                None => {
+                    unhealthy = true;
+                    println!("  MISSING  {} — needed for {}\n           install: {}", t.tool, t.needed_for, t.install);
+                }
+            }
+        }
+        if let Some(n) = note {
+            println!("  note     {n}");
+        }
+        println!();
+    };
+
+    if has(ci_walk::Lang::Ts) || has(ci_walk::Lang::Tsx) {
+        section(lang_ts::toolchain(), Some("scip-typescript / ts-morph are fetched automatically once node+npx exist"));
+    }
+    if has(ci_walk::Lang::Rust) {
+        section(lang_rust::toolchain(), Some("reads (structure/import graph) are in-process and need nothing external"));
+    }
+    if has(ci_walk::Lang::Python) {
+        println!("[python]\n  ok       no external tooling (in-process tree-sitter; edits are ungated)\n");
+    }
+    if !(has(ci_walk::Lang::Ts) || has(ci_walk::Lang::Tsx) || has(ci_walk::Lang::Rust) || has(ci_walk::Lang::Python)) {
+        println!("no supported source languages detected under {}\n", root.display());
+    }
+
+    println!("[embedding model]");
+    let md = model_dir();
+    if md.join("model.safetensors").is_file() {
+        println!("  ok       {}", md.display());
+    } else {
+        unhealthy = true;
+        println!("  MISSING  {} — needed for retrieval (BM25+vector index)\n           install: see README \"Get the embedding model\" (or set CI_MODEL_DIR)", md.display());
+    }
+
+    println!("\n[index]");
+    if index_exists(root, &config) {
+        println!("  ok       {}/{}", root.display(), config.index_dir);
+    } else {
+        println!("  none     run `codeindex-rs index {}`", root.display());
+    }
+
+    if unhealthy {
+        println!("\nstatus: MISSING DEPENDENCIES (see install lines above)");
+        exit(1);
+    }
+    println!("\nstatus: healthy");
 }
 
 fn cmd_retrieve(root: &Path, task: &str, top: Option<usize>, json: bool) {
@@ -296,6 +371,10 @@ fn main() {
             }
             cmd_retrieve(Path::new(&root), &task, top, json);
         }
+        Some("doctor") => {
+            let root = args.get(1).map(String::as_str).unwrap_or(".");
+            cmd_doctor(Path::new(root));
+        }
         Some("eval") => {
             let root = args.get(1).cloned().unwrap_or_else(|| die("usage: eval <root> <eval.json> [--top N]"));
             let eval = args.get(2).cloned().unwrap_or_else(|| die("usage: eval <root> <eval.json> [--top N]"));
@@ -311,7 +390,7 @@ fn main() {
             cmd_eval(Path::new(&root), Path::new(&eval), k);
         }
         _ => {
-            eprintln!("usage:\n  codeindex-rs index <root>\n  codeindex-rs retrieve <root> \"<task>\" [--top N] [--json]\n  codeindex-rs eval <root> <eval.json> [--top N]");
+            eprintln!("usage:\n  codeindex-rs index <root>\n  codeindex-rs retrieve <root> \"<task>\" [--top N] [--json]\n  codeindex-rs doctor [<root>]\n  codeindex-rs eval <root> <eval.json> [--top N]");
             exit(2);
         }
     }

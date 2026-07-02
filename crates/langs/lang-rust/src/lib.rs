@@ -52,6 +52,22 @@ fn rust_analyzer_command() -> Command {
     Command::new(bin)
 }
 
+/// What the Rust provider needs from the machine. Honest scoping: the READ path (structure,
+/// import graph) is in-process tree-sitter and needs NOTHING external — only type-checked
+/// edits (the gate, rename/move) need rust-analyzer. The registry builders surface this at
+/// startup; `apply_edits` repeats it if the engine actually fails to spawn.
+pub fn toolchain() -> ci_core::ToolchainReport {
+    ci_core::ToolchainReport {
+        lang: "rust",
+        tools: vec![ci_core::ToolStatus {
+            tool: "rust-analyzer",
+            needed_for: "type-checked edits (rename / gate); reads work without it",
+            install: "`rustup component add rust-analyzer` — or point CI_RUST_ANALYZER at the binary",
+            found: ci_core::probe_tool(rust_analyzer_command().arg("--version")),
+        }],
+    }
+}
+
 impl RustProvider {
     pub fn new(root: &Path) -> Self {
         Self {
@@ -252,7 +268,15 @@ impl LanguageProvider for RustProvider {
         // baseline-diff + blast-radius path as TypeScript, through the GateEngine seam.
         let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
         if guard.is_none() {
-            *guard = Some(LspClient::start(&self.root, rust_analyzer_command())?);
+            *guard = Some(LspClient::start(&self.root, rust_analyzer_command()).map_err(|e| {
+                // When the toolchain itself is the problem, say THAT (with the install hint)
+                // instead of a raw spawn error — reads worked fine, so this is the user's first
+                // signal that the WRITE path has a missing dependency.
+                match toolchain().describe_missing() {
+                    Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
+                    None => e,
+                }
+            })?);
         }
         let engine: &mut dyn GateEngine = guard.as_mut().unwrap();
 

@@ -6,7 +6,7 @@
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
-use ci_build::{build_registry, ProviderRegistry};
+use ci_build::{build_registry, ProviderBuild, ProviderRegistry};
 use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_all_in, resolve_in, Action};
 use ci_embed::StaticEmbedder;
@@ -22,18 +22,20 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 /// Construct the provider for one language, honoring the manifest's vendored binary and
-/// `CI_PROVIDER=sidecar`. `None` (with a warning) when a language's tooling can't start, so one
-/// language failing doesn't sink a mixed-language repo. Called once per active language by
-/// [`build_registry`], so Node's `scip-typescript` only runs when the repo has `.ts*` files.
-fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn LanguageProvider>> {
+/// `CI_PROVIDER=sidecar`. Called once per active language by [`build_registry`], so a language's
+/// toolchain is never probed, fetched, or run unless the repo actually has its files (a
+/// Rust-only repo never touches Node). Each language's TOOLCHAIN is checked before any of it
+/// runs: a missing dependency becomes `Unavailable` with the install instructions (permanent,
+/// carried on the registry), not a cryptic spawn error or a retry loop.
+fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
         if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
             eprintln!("[codeindex-rs-mcp] language: {lang} (sidecar process — protobuf wire)");
             match ProcessProvider::spawn(cmd) {
-                Ok(p) => return Some(Arc::new(p)),
+                Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
                     eprintln!("[codeindex-rs-mcp] sidecar {lang} failed to start ({e}); skipping");
-                    return None;
+                    return ProviderBuild::Failed(e.to_string());
                 }
             }
         }
@@ -41,26 +43,39 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn Lan
     }
     match lang {
         "rust" => {
+            // Reads are in-process tree-sitter (no external deps) — the provider always comes
+            // up. rust-analyzer gates only WRITES: warn now if missing, and apply_edits repeats
+            // the same install hint if actually invoked.
+            if let Some(missing) = lang_rust::toolchain().describe_missing() {
+                eprintln!("[codeindex-rs-mcp] warning: {missing}\n  (rust reads work; type-checked edits will fail until installed)");
+            }
             eprintln!("[codeindex-rs-mcp] language: rust (tree-sitter, in-process — no Node)");
-            Some(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
+            ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
         }
         "python" => {
             eprintln!("[codeindex-rs-mcp] language: python (tree-sitter fallback, in-process — edits are ungated)");
-            Some(Arc::new(FallbackProvider::new(root, FbLang::Python)))
+            ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Python)))
         }
         "ts" => {
+            // TypeScript needs Node for BOTH paths (scip-typescript index + the gate). Missing
+            // toolchain = the language is off, loudly and actionably — never a half-working
+            // provider or an ungated fallback.
+            if let Some(missing) = lang_ts::toolchain().describe_missing() {
+                eprintln!("[codeindex-rs-mcp] typescript DISABLED:\n{missing}");
+                return ProviderBuild::Unavailable(missing);
+            }
             // `open` loads the cached .codeindex/index.scip when the source fingerprint still
             // matches (ms), and re-runs scip-typescript only when it doesn't (~20s).
             eprintln!("[codeindex-rs-mcp] language: typescript — opening scip index for {} …", root.display());
             match TsProvider::open(root) {
-                Ok(p) => Some(Arc::new(p)),
+                Ok(p) => ProviderBuild::Ready(Arc::new(p)),
                 Err(e) => {
                     eprintln!("[codeindex-rs-mcp] typescript indexing failed ({e}); skipping TS files");
-                    None
+                    ProviderBuild::Failed(e.to_string())
                 }
             }
         }
-        _ => None,
+        _ => ProviderBuild::Failed(format!("unknown language '{lang}'")),
     }
 }
 
@@ -351,7 +366,12 @@ impl Server {
                 collect_ids_by_leaf(&nodes, "", &mut candidates); // no leaf match — list everything
             }
             return Err(if candidates.is_empty() {
-                format!("anchor '{reference}' not found — {file} has no indexed symbols (check the path)")
+                // A file with zero symbols usually means a wrong path — but when its LANGUAGE
+                // is disabled (toolchain missing), say THAT, with the install instruction.
+                match registry.disabled_reason(Path::new(file)) {
+                    Some(reason) => format!("'{file}' can't be read — its language is disabled on this machine:\n{reason}"),
+                    None => format!("anchor '{reference}' not found — {file} has no indexed symbols (check the path)"),
+                }
             } else {
                 format!(
                     "anchor '{reference}' not found in {file}. Closest ids there (nested symbols include \
@@ -681,7 +701,12 @@ impl Server {
         for op in ops {
             let slot = match op_file(&op) {
                 Some(f) => registry.entry_for(Path::new(&f)).ok_or_else(|| {
-                    format!("no language provider for '{f}' — its language isn't active in this repo (is its toolchain available?)")
+                    // The dependency layer: when the language is present but its toolchain is
+                    // missing, hand the agent/user the exact install instruction — not a shrug.
+                    match registry.disabled_reason(Path::new(&f)) {
+                        Some(reason) => format!("no provider for '{f}' — its language is disabled on this machine:\n{reason}"),
+                        None => format!("no language provider for '{f}' — its language isn't active in this repo (is its toolchain available?)"),
+                    }
                 })?,
                 None => 0, // path-less op: first provider, as before
             };

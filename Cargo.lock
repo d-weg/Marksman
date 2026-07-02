@@ -97,6 +97,7 @@ dependencies = [
  "ci-index",
  "ci-proto",
  "ci-retrieve",
+ "ci-walk",
  "lang-fallback",
  "lang-rust",
  "lang-ts",

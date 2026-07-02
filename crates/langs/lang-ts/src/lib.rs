@@ -31,6 +31,31 @@ pub(crate) const SCIP_TS_VERSION: &str = "0.4.0";
 const TS_LSP_VERSION: &str = "5.3.0";
 const TYPESCRIPT_VERSION: &str = "6.0.3";
 
+/// Everything the TypeScript provider needs from the machine, checked WITHOUT running any of
+/// it — the registry builders call this before constructing the provider, so a missing Node
+/// yields one actionable message instead of a cryptic npx spawn error mid-index. (A repo with
+/// no TypeScript never gets here at all.)
+pub fn toolchain() -> ci_core::ToolchainReport {
+    let hint = "Node 18+ (https://nodejs.org — e.g. `brew install node`); scip-typescript and ts-morph are then fetched automatically on first use";
+    ci_core::ToolchainReport {
+        lang: "typescript",
+        tools: vec![
+            ci_core::ToolStatus {
+                tool: "node",
+                needed_for: "the type-check gate (ts-morph sidecar) and the language server fallback",
+                install: hint,
+                found: ci_core::probe_tool(Command::new("node").arg("--version")),
+            },
+            ci_core::ToolStatus {
+                tool: "npx",
+                needed_for: "indexing (scip-typescript) and fetching the pinned TS tooling",
+                install: hint,
+                found: ci_core::probe_tool(Command::new("npx").arg("--version")),
+            },
+        ],
+    }
+}
+
 /// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`. Shared with the
 /// ts-morph sidecar (`tsmorph.rs`) so both TS tooling paths use the same cache location.
 pub(crate) fn npm_cache() -> PathBuf {
@@ -114,7 +139,15 @@ fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
             Err(_) => {} // auto: fall back to LSP
         }
     }
-    Ok(Box::new(ci_lsp::LspClient::start(root, TsProvider::ts_lsp_command())?))
+    match ci_lsp::LspClient::start(root, TsProvider::ts_lsp_command()) {
+        Ok(c) => Ok(Box::new(c)),
+        // Both engines need Node; when the toolchain itself is the problem, say THAT (with the
+        // install hint) instead of a raw spawn error.
+        Err(e) => match toolchain().describe_missing() {
+            Some(missing) => Err(Error::Driver(format!("TypeScript edit engine failed to start ({e}).\n{missing}"))),
+            None => Err(e),
+        },
+    }
 }
 
 impl TsProvider {

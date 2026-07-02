@@ -15,7 +15,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 mod registry;
-pub use registry::{build_registry, ProviderRegistry, RegistryBuild};
+pub use registry::{build_registry, ProviderBuild, ProviderRegistry, RegistryBuild};
 
 struct Item {
     sym: SymbolEntry,
