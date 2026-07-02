@@ -110,21 +110,36 @@ fn forced_lang() -> Option<&'static str> {
     }
 }
 
+/// The outcome of [`build_registry`]: the per-file dispatch registry plus the languages that were
+/// *expected* (present in the repo AND enabled) yet whose provider failed to construct — a `None`
+/// from `make`, e.g. scip-typescript couldn't start. The registry is INCOMPLETE for those: files
+/// in a failed language have no provider, so live reads/edits silently no-op on them. Callers that
+/// serve edits must NOT cache an incomplete registry (a transient toolchain failure would be baked
+/// in for the process's whole life) — inspect `failed` and retry/surface instead. The index-time
+/// caller can proceed with a partial index (better than none) and just warns.
+pub struct RegistryBuild {
+    pub registry: ProviderRegistry,
+    pub failed: Vec<&'static str>,
+}
+
 /// Build the provider registry for `root` with per-file dispatch. Detects which languages actually
 /// have source files, honors the manifest (`config.providers.<lang>.enabled`), forces one language
 /// when `CI_LANG` is set, rewrites `config.include`/`exclude` to cover exactly the active
 /// languages, and asks `make` to construct each active language's provider. A `None` from `make`
-/// (e.g. TS indexing failed) drops that language rather than failing the whole build. Absent or
-/// disabled languages register nothing — so their tooling is never fetched or run.
+/// (e.g. TS indexing failed) drops that language from the registry rather than failing the whole
+/// build, but records it in [`RegistryBuild::failed`] so an edit-serving caller can tell a genuine
+/// absence apart from a toolchain that didn't come up. Absent or disabled languages register
+/// nothing — so their tooling is never fetched or run, and they are NOT reported as failed.
 pub fn build_registry(
     root: &Path,
     config: &mut Config,
     mut make: impl FnMut(&str) -> Option<Arc<dyn LanguageProvider>>,
-) -> Result<ProviderRegistry> {
+) -> Result<RegistryBuild> {
     let forced = forced_lang();
     let present = present_langs(root, config)?;
 
     let mut registry = ProviderRegistry::new();
+    let mut failed: Vec<&'static str> = Vec::new();
     let mut includes: Vec<String> = Vec::new();
     let mut excludes: Vec<String> = Vec::new();
 
@@ -140,10 +155,15 @@ pub fn build_registry(
         if !active || !config.provider_enabled(spec.name) {
             continue;
         }
-        if let Some(provider) = make(spec.name) {
-            registry.register(spec.langs.to_vec(), provider);
-            includes.extend(spec.globs.iter().map(|g| g.to_string()));
-            excludes.extend(spec.excludes.iter().map(|g| g.to_string()));
+        match make(spec.name) {
+            Some(provider) => {
+                registry.register(spec.langs.to_vec(), provider);
+                includes.extend(spec.globs.iter().map(|g| g.to_string()));
+                excludes.extend(spec.excludes.iter().map(|g| g.to_string()));
+            }
+            // Active + enabled but the toolchain didn't come up: an incomplete registry, not a
+            // legitimate absence. Record it so edit-serving callers refuse to cache this build.
+            None => failed.push(spec.name),
         }
     }
 
@@ -157,5 +177,85 @@ pub fn build_registry(
             config.exclude.push(e);
         }
     }
-    Ok(registry)
+    Ok(RegistryBuild { registry, failed })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ci_core::{Granularity, ImportGraph, Result};
+
+    /// A do-nothing provider — build_registry only registers/queries by language, never calls in.
+    struct StubProvider;
+    impl LanguageProvider for StubProvider {
+        fn granularity(&self) -> Granularity {
+            Granularity::Symbol
+        }
+        fn structure(&self, _file: &Path) -> Result<Vec<ci_core::Node>> {
+            Ok(vec![])
+        }
+        fn import_graph(&self) -> Result<ImportGraph> {
+            Ok(ImportGraph::default())
+        }
+        fn apply_edits(&self, _ops: &[ci_core::EditOp], _opts: &ci_core::EditOpts) -> Result<ci_core::CommitResult> {
+            unimplemented!()
+        }
+    }
+
+    /// A repo with both a `.ts` and a `.rs` file, so TS and Rust are both "present".
+    fn mixed_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.ts"), "export function f() {}\n").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "pub fn g() {}\n").unwrap();
+        dir
+    }
+
+    /// A present + enabled language whose provider fails to construct (make → None) is reported in
+    /// `failed` AND dropped from the registry — the signal an edit-serving caller needs to refuse to
+    /// cache a degraded build, instead of silently serving files with no provider.
+    #[test]
+    fn failed_provider_is_reported_not_silently_dropped() {
+        let dir = mixed_repo();
+        let mut config = Config::default();
+        // Rust comes up; TS "toolchain" fails.
+        let built = build_registry(dir.path(), &mut config, |lang| match lang {
+            "rust" => Some(Arc::new(StubProvider) as Arc<dyn LanguageProvider>),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(built.failed, vec!["ts"], "a present+enabled lang that failed to build must be reported");
+        assert!(built.registry.provider_for(Path::new("src/a.ts")).is_none(), "no TS provider registered");
+        assert!(built.registry.provider_for(Path::new("src/b.rs")).is_some(), "Rust provider registered");
+    }
+
+    /// When every present language's provider constructs, `failed` is empty — the caller caches.
+    #[test]
+    fn all_providers_up_reports_no_failure() {
+        let dir = mixed_repo();
+        let mut config = Config::default();
+        let built = build_registry(dir.path(), &mut config, |_lang| {
+            Some(Arc::new(StubProvider) as Arc<dyn LanguageProvider>)
+        })
+        .unwrap();
+        assert!(built.failed.is_empty(), "no failures expected, got {:?}", built.failed);
+        assert!(built.registry.provider_for(Path::new("src/a.ts")).is_some());
+        assert!(built.registry.provider_for(Path::new("src/b.rs")).is_some());
+    }
+
+    /// A language that's absent (or disabled) is NOT a failure — only present+enabled langs whose
+    /// toolchain didn't come up are reported, so a Rust-only repo never "fails" on missing TS.
+    #[test]
+    fn absent_language_is_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/only.rs"), "pub fn g() {}\n").unwrap();
+        let mut config = Config::default();
+        let built = build_registry(dir.path(), &mut config, |lang| match lang {
+            "rust" => Some(Arc::new(StubProvider) as Arc<dyn LanguageProvider>),
+            _ => None, // TS/Python would fail — but they're absent, so make is never called for them
+        })
+        .unwrap();
+        assert!(built.failed.is_empty(), "absent languages must not be reported as failed");
+    }
 }

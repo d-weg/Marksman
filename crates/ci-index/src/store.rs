@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 /// mismatched index (with a "re-run index" hint) rather than silently mis-reading an old layout.
 /// v2: dropped the `doc` symbol kind — Marksman is code-only, so an old index that holds doc
 /// chunks is rejected and rebuilt cleanly.
-pub const INDEX_VERSION: u32 = 2;
+/// v3: protobuf single-file store (`index.pb`, see `pb.rs`) replacing the JSON sidecars; an old
+/// JSON dir has no `index.pb`, so it reads as "no index" and rebuilds cleanly.
+pub const INDEX_VERSION: u32 = 3;
 
 pub struct IndexData {
     pub meta: IndexMeta,
@@ -28,7 +30,7 @@ pub fn index_dir(root: &Path, config: &Config) -> PathBuf {
 }
 
 pub fn index_exists(root: &Path, config: &Config) -> bool {
-    index_dir(root, config).join("meta.json").exists()
+    index_dir(root, config).join("index.pb").exists()
 }
 
 pub fn save_index(root: &Path, config: &Config, data: &IndexData) -> Result<()> {
@@ -70,13 +72,11 @@ pub fn save_index(root: &Path, config: &Config, data: &IndexData) -> Result<()> 
     }
 }
 
-/// Write every index sidecar into `dir` (used against a temp dir before the atomic swap).
+/// Write the index into `dir` (used against a temp dir before the atomic swap): `index.pb`
+/// (everything but the matrix — protobuf, see `pb.rs`), `embeddings.bin` (raw f32 LE), and a
+/// human-readable `config.snapshot.json` kept as JSON for debuggability.
 fn write_index_files(dir: &Path, config: &Config, data: &IndexData) -> Result<()> {
-    write_json(&dir.join("meta.json"), &data.meta)?;
-    write_json(&dir.join("symbols.json"), &data.symbols)?;
-    write_json(&dir.join("chunks.json"), &data.chunks)?;
-    write_json(&dir.join("graph.json"), &data.forward)?;
-    write_json(&dir.join("bm25.json"), &data.bm25.to_json())?;
+    std::fs::write(dir.join("index.pb"), crate::pb::encode_index(data))?;
     let mut buf = Vec::with_capacity(data.vectors.len() * 4);
     for v in &data.vectors {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -135,17 +135,15 @@ impl Drop for IndexLock {
 
 pub fn load_index(root: &Path, config: &Config) -> Result<IndexData> {
     let dir = index_dir(root, config);
-    let meta: IndexMeta = read_json(&dir.join("meta.json"))?;
+    let (meta, symbols, chunks, forward, bm25_json) =
+        crate::pb::decode_index(&std::fs::read(dir.join("index.pb"))?)?;
     if meta.version != INDEX_VERSION {
         return Err(Error::Other(format!(
             "index schema v{} is not supported (this build expects v{INDEX_VERSION}) — re-run `index`",
             meta.version
         )));
     }
-    let symbols: Vec<SymbolEntry> = read_json(&dir.join("symbols.json"))?;
-    let chunks: Vec<ChunkMeta> = read_json(&dir.join("chunks.json"))?;
-    let forward: Adjacency = read_json(&dir.join("graph.json"))?;
-    let bm25 = Bm25::from_json(read_json(&dir.join("bm25.json"))?);
+    let bm25 = Bm25::from_json(bm25_json);
 
     let raw = std::fs::read(dir.join("embeddings.bin"))?;
     let vectors: Vec<f32> = raw
@@ -161,9 +159,6 @@ fn write_json<T: serde::Serialize>(p: &Path, v: &T) -> Result<()> {
     std::fs::write(p, serde_json::to_vec(v)?)?;
     Ok(())
 }
-fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
-    Ok(serde_json::from_slice(&std::fs::read(p)?)?)
-}
 
 #[cfg(test)]
 mod tests {
@@ -171,6 +166,27 @@ mod tests {
     use crate::bm25::tokenize;
     use crate::types::*;
     use std::collections::BTreeMap;
+
+    // Timing utility, not a correctness test:
+    //   CI_TIMING_DIR=/path/to/repo cargo test -p ci-index --release -- --ignored load_timing --nocapture
+    // (expects `<dir>/.codeindex-rs`). Used to compare store formats (JSON → protobuf).
+    #[test]
+    #[ignore]
+    fn load_timing() {
+        let Ok(root) = std::env::var("CI_TIMING_DIR") else {
+            eprintln!("set CI_TIMING_DIR to a repo with a .codeindex-rs index");
+            return;
+        };
+        let config = Config { index_dir: ".codeindex-rs".into(), ..Default::default() };
+        let mut best = std::time::Duration::MAX;
+        for _ in 0..20 {
+            let t = std::time::Instant::now();
+            let d = load_index(Path::new(&root), &config).expect("load");
+            best = best.min(t.elapsed());
+            std::hint::black_box((d.symbols.len(), d.chunks.len()));
+        }
+        eprintln!("load_index best of 20: {best:?}");
+    }
 
     #[test]
     fn save_load_roundtrip() {

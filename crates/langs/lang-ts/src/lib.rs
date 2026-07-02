@@ -12,10 +12,22 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 mod ast;
+mod fingerprint;
 mod outline;
 mod tsmorph;
 
+use fingerprint::{fingerprint_path, fingerprint_drift, hash_file, load_fingerprint, source_fingerprint, store_fingerprint, Fingerprint};
+
 pub use outline::outline;
+
+/// Pinned TS toolchain. Unpinned npx/npm floats to "latest", which drifts under us: a new
+/// scip-typescript can change index content between two startups (silently invalidating the
+/// cache semantics), and a new tsserver/typescript changes what the gate accepts. Bump these
+/// deliberately; `SCIP_TS_VERSION` participates in the source fingerprint, so bumping it
+/// reindexes on the next startup.
+pub(crate) const SCIP_TS_VERSION: &str = "0.4.0";
+const TS_LSP_VERSION: &str = "5.3.0";
+const TYPESCRIPT_VERSION: &str = "6.0.3";
 
 /// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`. Shared with the
 /// ts-morph sidecar (`tsmorph.rs`) so both TS tooling paths use the same cache location.
@@ -98,8 +110,44 @@ fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
 }
 
 impl TsProvider {
+    /// Open a provider for `root`, loading the cached `.codeindex/index.scip` (milliseconds)
+    /// when the source is byte-identical to what produced it, else reindexing (~20s). The
+    /// freshness check is the full source fingerprint (see `fingerprint.rs`), so content
+    /// edits, import changes, and added/removed/moved files all invalidate; anything doubtful
+    /// (no fingerprint, unreadable index) reindexes — a stale load is a correctness bug, a
+    /// spurious reindex only a slow start.
+    pub fn open(root: &Path) -> Result<Self> {
+        let out = root.join(".codeindex").join("index.scip");
+        let current = source_fingerprint(root);
+        if out.exists() {
+            match load_fingerprint(&fingerprint_path(root)) {
+                Some(stored) => match fingerprint_drift(root, &stored, &current) {
+                    None => match Self::from_index(root, &out) {
+                        Ok(p) => {
+                            eprintln!("[lang-ts] loaded cached {} (source unchanged)", out.display());
+                            return Ok(p);
+                        }
+                        Err(e) => eprintln!("[lang-ts] cached index.scip unreadable ({e}); reindexing"),
+                    },
+                    Some(why) => eprintln!("[lang-ts] source changed since index.scip was built ({why}); reindexing"),
+                },
+                None => eprintln!("[lang-ts] no fingerprint for existing index.scip; reindexing"),
+            }
+        }
+        Self::index_with(root, current)
+    }
+
     /// Index `root` with scip-typescript (`npx @sourcegraph/scip-typescript`), then load it.
+    /// Always reindexes; `open` is the cached path.
     pub fn index(root: &Path) -> Result<Self> {
+        Self::index_with(root, source_fingerprint(root))
+    }
+
+    /// The fingerprint is computed by the caller BEFORE scip runs: if a file changes while the
+    /// indexer is running, the stored fingerprint reflects the pre-change bytes, so the next
+    /// `open` sees a mismatch and reindexes (conservative), rather than blessing an index that
+    /// missed the mid-run edit.
+    fn index_with(root: &Path, fp: Fingerprint) -> Result<Self> {
         let out = root.join(".codeindex").join("index.scip");
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
@@ -108,14 +156,9 @@ impl TsProvider {
         // concurrent `npx` staging can't corrupt the scip-typescript install out from under us.
         let _cache_lock = NpxCacheLock::acquire();
         let status = Command::new("npx")
-            .args([
-                "--yes",
-                "@sourcegraph/scip-typescript",
-                "index",
-                "--infer-tsconfig",
-                "--no-progress-bar",
-                "--output",
-            ])
+            .arg("--yes")
+            .arg(format!("@sourcegraph/scip-typescript@{SCIP_TS_VERSION}"))
+            .args(["index", "--infer-tsconfig", "--no-progress-bar", "--output"])
             .arg(&out)
             .current_dir(root)
             .env("npm_config_cache", npm_cache())
@@ -127,7 +170,23 @@ impl TsProvider {
         if !status.success() {
             return Err(Error::Driver(format!("scip-typescript index failed ({status})")));
         }
-        Self::from_index(root, &out)
+        let provider = Self::from_index(root, &out)?;
+        // Augment with files scip indexed that the walk can't see (gitignored/hidden sources a
+        // tsconfig still includes) so their edits invalidate the cache too. Hashed AFTER the
+        // run, so the conservative pre-run guarantee narrows to just these hidden files.
+        let mut fp = fp;
+        for doc in provider.scip.documents() {
+            if !fp.contains_key(&doc) {
+                if let Some(h) = hash_file(&root.join(&doc)) {
+                    fp.insert(doc, h);
+                }
+            }
+        }
+        if let Err(e) = store_fingerprint(&fingerprint_path(root), &fp) {
+            // Not fatal: without a fingerprint the next `open` just reindexes.
+            eprintln!("[lang-ts] could not persist the index fingerprint ({e}); next startup will reindex");
+        }
+        Ok(provider)
     }
 
     /// Load a provider from an existing `index.scip` (skip running the indexer).
@@ -143,7 +202,12 @@ impl TsProvider {
     /// here in the provider — the core + ci-lsp stay pure Rust.
     fn ts_lsp_command() -> Command {
         let mut c = Command::new("npx");
-        c.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
+        c.arg("--yes")
+            .arg("-p")
+            .arg(format!("typescript-language-server@{TS_LSP_VERSION}"))
+            .arg("-p")
+            .arg(format!("typescript@{TYPESCRIPT_VERSION}"))
+            .args(["typescript-language-server", "--stdio"])
             .env("npm_config_cache", npm_cache());
         c
     }
@@ -296,5 +360,22 @@ mod tests {
         let g = provider.import_graph().unwrap();
         let app = g.get(&PathBuf::from("src/app.ts")).expect("app.ts edges");
         assert!(app.contains(&PathBuf::from("src/math.ts")));
+
+        // Unchanged source -> `open` loads the cached index.scip instead of re-running scip
+        // (the file's mtime must not move — reindexing rewrites it).
+        let scip = root.join(".codeindex/index.scip");
+        let cached_mtime = fs::metadata(&scip).unwrap().modified().unwrap();
+        let reopened = TsProvider::open(root).expect("open from cache");
+        assert_eq!(fs::metadata(&scip).unwrap().modified().unwrap(), cached_mtime, "open() re-ran the indexer on unchanged source");
+        assert!(reopened.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.name.as_deref() == Some("add")));
+
+        // A source edit invalidates the fingerprint -> `open` reindexes and sees the new symbol.
+        fs::write(
+            root.join("src/math.ts"),
+            "export function add(a: number, b: number): number {\n  return a + b;\n}\nexport function sub(a: number, b: number): number {\n  return a - b;\n}\n",
+        )
+        .unwrap();
+        let refreshed = TsProvider::open(root).expect("open after edit reindexes");
+        assert!(refreshed.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.name.as_deref() == Some("sub")));
     }
 }

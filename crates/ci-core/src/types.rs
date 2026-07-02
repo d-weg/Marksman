@@ -164,6 +164,12 @@ pub enum EditOp {
     /// Delete the statement line(s) containing `text` (unique within the body) from a `:body`.
     #[serde(rename = "DELETE_IN_BODY")]
     DeleteInBody { node_id: String, text: String },
+    /// Insert `code` as a new member at the top of a `{ … }` block — an interface/type field, a
+    /// class member, or an object-literal property. Targets the CONTAINER symbol directly (no
+    /// `:body` sub-node needed); `code` must carry its own terminator (`;` for a type/interface
+    /// member, `,` for an object property), since it lands ahead of the existing members.
+    #[serde(rename = "INSERT_MEMBER")]
+    InsertMember { node_id: String, code: String },
     /// Append a parameter to a function/method's parameter list (the `:params` sub-node), inserting
     /// before the closing `)` and prefixing `, ` when the list is non-empty.
     #[serde(rename = "ADD_PARAMETER")]

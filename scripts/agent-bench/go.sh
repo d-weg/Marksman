@@ -36,4 +36,15 @@ if [ ! -d "$TARGET/.git" ]; then
 fi
 
 cd "$HERE/../.."
+# The bench runs the RELEASE binaries (both the MCP server in codeindex-rust.mcp.json and the
+# CLI indexer in run.py) — rebuild them so a run never measures a stale build. Incremental, so
+# this is seconds when nothing changed. cargo may not be on a non-interactive PATH; fall back
+# to the rustup default location rather than fail the bench.
+CARGO="$(command -v cargo || true)"
+[ -z "$CARGO" ] && [ -x "$HOME/.cargo/bin/cargo" ] && CARGO="$HOME/.cargo/bin/cargo"
+if [ -n "$CARGO" ]; then
+  "$CARGO" build --release -p ci-mcp -p ci-cli
+else
+  echo "warning: cargo not found — running with the EXISTING release binaries (may be stale)" >&2
+fi
 exec python3 scripts/agent-bench/run.py --repo "$TARGET" "$@"

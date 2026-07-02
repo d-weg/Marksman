@@ -72,8 +72,10 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn Lan
             Some(Arc::new(FallbackProvider::new(root, FbLang::Python)))
         }
         "ts" => {
-            eprintln!("[codeindex-rs] language: typescript — running scip-typescript on {} …", root.display());
-            match TsProvider::index(root) {
+            // `open` reuses the cached .codeindex/index.scip when the source fingerprint still
+            // matches; scip-typescript re-runs only when the source actually changed.
+            eprintln!("[codeindex-rs] language: typescript — opening scip index for {} …", root.display());
+            match TsProvider::open(root) {
                 Ok(p) => Some(Arc::new(p)),
                 Err(e) => {
                     eprintln!("[codeindex-rs] typescript indexing failed ({e}); skipping TS files");
@@ -95,8 +97,17 @@ fn cmd_index(root: &Path) {
     // Rust+TS+Python repo indexes fully). `cfg` is a snapshot for the constructors — build_registry
     // only rewrites include/exclude, which they don't read.
     let cfg = config.clone();
-    let registry = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg))
+    let built = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg))
         .unwrap_or_else(|e| die(e));
+    // A partial index (one language's toolchain down) still beats none for the CLI indexer, so we
+    // proceed — but warn, since those files won't be indexed until the toolchain is fixed.
+    if !built.failed.is_empty() {
+        eprintln!(
+            "[codeindex-rs] warning: skipping language(s) whose provider failed to start: {} — their files are NOT indexed",
+            built.failed.join(", ")
+        );
+    }
+    let registry = built.registry;
 
     // Opt-in (`rustScip` config / `CI_RUST_SCIP` env): generate the compiler-accurate Rust `use`
     // graph BEFORE indexing so it's the one persisted (import_graph reads the cache). Slow

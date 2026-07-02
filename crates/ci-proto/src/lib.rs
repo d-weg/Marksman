@@ -260,6 +260,11 @@ fn op_to_pb(op: &EditOp) -> PbEditOp {
             p.node_id = node_id.clone();
             p.text = text.clone();
         }
+        EditOp::InsertMember { node_id, code } => {
+            p.op = "insert_member".into();
+            p.node_id = node_id.clone();
+            p.text = code.clone();
+        }
         EditOp::AddParameter { node_id, param } => {
             p.op = "add_parameter".into();
             p.node_id = node_id.clone();
@@ -305,6 +310,7 @@ fn pb_to_op(p: &PbEditOp) -> Result<EditOp> {
             after: (!p.old_text.is_empty()).then(|| p.old_text.clone()),
         },
         "delete_in_body" => EditOp::DeleteInBody { node_id: p.node_id.clone(), text: p.text.clone() },
+        "insert_member" => EditOp::InsertMember { node_id: p.node_id.clone(), code: p.text.clone() },
         "add_parameter" => EditOp::AddParameter { node_id: p.node_id.clone(), param: p.text.clone() },
         "set_return_type" => EditOp::SetReturnType { node_id: p.node_id.clone(), ty: p.text.clone() },
         "rename" => EditOp::Rename { node_id: p.node_id.clone(), new_name: p.text.clone() },

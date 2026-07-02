@@ -1,9 +1,10 @@
 //! ci-index — storage primitives for the retrieval index: BM25, a flat dense
-//! vector store, the import graph, and JSON+binary persistence. The build/update
+//! vector store, the import graph, and protobuf+binary persistence. The build/update
 //! pipeline (which calls a `CodeDriver` for symbols/imports) lands once a driver
 //! exists.
 pub mod bm25;
 pub mod graph;
+pub mod pb;
 pub mod store;
 pub mod types;
 pub mod vector;

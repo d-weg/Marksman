@@ -8,9 +8,9 @@
 use ci_arch::{build_architecture, format_architecture};
 use ci_build::{build_registry, ProviderRegistry};
 use ci_core::{Config, EditOpts, LanguageProvider, Manifest, Node, NodeKind};
-use ci_edit::{action_to_op, resolve_in, Action};
+use ci_edit::{action_to_op, resolve_all_in, resolve_in, Action};
 use ci_embed::StaticEmbedder;
-use ci_index::{index_exists, load_index, save_index};
+use ci_index::{index_dir, index_exists, load_index, save_index, IndexData};
 use ci_retrieve::{retrieve, RetrieveOptions};
 use ci_proto::ProcessProvider;
 use lang_fallback::{FallbackProvider, FbLang};
@@ -49,8 +49,10 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> Option<Arc<dyn Lan
             Some(Arc::new(FallbackProvider::new(root, FbLang::Python)))
         }
         "ts" => {
-            eprintln!("[codeindex-rs-mcp] language: typescript — running scip-typescript on {} …", root.display());
-            match TsProvider::index(root) {
+            // `open` loads the cached .codeindex/index.scip when the source fingerprint still
+            // matches (ms), and re-runs scip-typescript only when it doesn't (~20s).
+            eprintln!("[codeindex-rs-mcp] language: typescript — opening scip index for {} …", root.display());
+            match TsProvider::open(root) {
                 Ok(p) => Some(Arc::new(p)),
                 Err(e) => {
                     eprintln!("[codeindex-rs-mcp] typescript indexing failed ({e}); skipping TS files");
@@ -68,7 +70,22 @@ fn build_registry_for(root: &Path) -> Result<ProviderRegistry, String> {
     let mut config = Config::load(root).unwrap_or_default();
     config.index_dir = ".codeindex-rs".into();
     let cfg = config.clone();
-    build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg)).map_err(|e| e.to_string())
+    let built = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg)).map_err(|e| e.to_string())?;
+    // A language that's present + enabled but whose provider failed to construct (e.g.
+    // scip-typescript lost an npx-cache race and exited non-zero) yields an INCOMPLETE registry:
+    // its files would silently have no provider, so every read/edit on them degrades to "symbol
+    // not found" / "no language provider" and the agent falls back to grep. Such failures are
+    // typically transient, so refuse this build rather than let the caller CACHE it for the whole
+    // process life — the next tool call rebuilds and retries the toolchain (and a genuinely broken
+    // toolchain surfaces loudly on every call instead of being masked by a silent fallback).
+    if !built.failed.is_empty() {
+        return Err(format!(
+            "language provider(s) failed to start: {} — toolchain unavailable or a transient error \
+             (e.g. scip-typescript via npx); not caching a degraded registry. Retry the call.",
+            built.failed.join(", ")
+        ));
+    }
+    Ok(built.registry)
 }
 
 fn resolve_root() -> PathBuf {
@@ -100,6 +117,9 @@ struct Server {
     // (see `start_prewarm`) and cheaply cloned out for each tool call.
     registry: Arc<Mutex<Option<ProviderRegistry>>>,
     embedder: Option<StaticEmbedder>,
+    // The loaded retrieval index, keyed on meta.json's mtime (see `index_data`). Mutex (not a
+    // plain field) so `&self` methods like files_defining can read through the cache.
+    index_cache: Mutex<Option<(std::time::SystemTime, Arc<IndexData>)>>,
 }
 
 impl Server {
@@ -107,7 +127,30 @@ impl Server {
         let mut config = Config::load(&root).unwrap_or_default();
         config.embedding_model = "minishlab/potion-code-16M".into();
         config.index_dir = ".codeindex-rs".into();
-        Server { root, config, registry: Arc::new(Mutex::new(None)), embedder: None }
+        Server { root, config, registry: Arc::new(Mutex::new(None)), embedder: None, index_cache: Mutex::new(None) }
+    }
+
+    /// The retrieval index, cached in memory and keyed on index.pb's mtime. Every tool call
+    /// used to re-read + re-parse the whole store and rebuild BM25/graph — pure per-call
+    /// waste, linear in repo size. `save_index` rewrites index.pb, so its mtime is the
+    /// generation marker: our own reindex_after_edit and an external `codeindex-rs index`
+    /// both invalidate. The mtime is read BEFORE loading, so a writer racing the load causes
+    /// a re-load on the next call rather than a stale cache entry.
+    fn index_data(&self) -> Result<Arc<IndexData>, String> {
+        let mtime = std::fs::metadata(index_dir(&self.root, &self.config).join("index.pb"))
+            .and_then(|m| m.modified())
+            .ok();
+        let mut cache = self.index_cache.lock().map_err(|_| "index cache lock poisoned".to_string())?;
+        if let (Some((cached_at, data)), Some(m)) = (cache.as_ref(), mtime) {
+            if *cached_at == m {
+                return Ok(data.clone());
+            }
+        }
+        let data = Arc::new(load_index(&self.root, &self.config).map_err(|e| e.to_string())?);
+        if let Some(m) = mtime {
+            *cache = Some((m, data.clone()));
+        }
+        Ok(data)
     }
 
     /// Build the provider registry for the repo AND warm each write engine on a background thread
@@ -156,7 +199,7 @@ impl Server {
         if !index_exists(&self.root, &self.config) {
             return Err("no index — run `codeindex-rs index <root>` first".into());
         }
-        let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
+        let index = self.index_data()?;
         let model = self.config.embedding_model.clone();
         let embedder = self.embedder()?;
         ensure_index_matches(&index.meta.model, index.meta.dims, &model, embedder.dim())?;
@@ -232,7 +275,7 @@ impl Server {
         if !index_exists(&self.root, &self.config) {
             return Err("no index — run `codeindex-rs index` first".into());
         }
-        let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
+        let index = self.index_data()?;
         const CAP: usize = 200;
         let (hits, total) = ci_retrieve::find_symbols(&index, &query, substring, &self.config, CAP);
         if hits.is_empty() {
@@ -269,21 +312,102 @@ impl Server {
     ///   3. a bare name + NO usable path — searched across the INDEX: unique → resolved;
     ///      ambiguous → Err listing the candidate ids so the agent re-issues with one (one cheap
     ///      round-trip, never a full retrieve). The server disambiguates because it owns the index.
-    fn resolve_symbol(&self, registry: &ProviderRegistry, path: &str, reference: &str) -> Result<String, String> {
+    ///
+    /// Ambiguity is judged at SYMBOL granularity (every matching node id), NOT file granularity: a
+    /// name reused within ONE file — two interface fields `nodeId`, an overload pair — is still
+    /// ambiguous and returns candidates, so a bare-name edit never silently lands on "the first one".
+    fn resolve_symbol(
+        &self,
+        registry: &ProviderRegistry,
+        path: &str,
+        reference: &str,
+        op_needle: Option<&str>,
+    ) -> Result<String, String> {
         if reference.contains('#') {
-            return Ok(reference.to_string()); // already a node_id
+            // Already a node_id — but validate it NOW against the file's structure instead of
+            // letting a constructed id die later as a bare "anchor not found". The common miss is
+            // a nested symbol: the agent builds `file#foo` but the real id is `file#Cls.foo`.
+            // On a miss, list the file's same-leaf-name ids (else all its ids) so one retry fixes it.
+            let file = file_of(reference);
+            let nodes = registry.structure(Path::new(file)).unwrap_or_default();
+            if find_node(&nodes, reference).is_some() {
+                return Ok(reference.to_string());
+            }
+            // Leaf name of the requested id: after the last `.` of the scope, before any `:subnode`.
+            let leaf = reference
+                .rsplit('#')
+                .next()
+                .unwrap_or(reference)
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let mut candidates = Vec::new();
+            collect_ids_by_leaf(&nodes, &leaf, &mut candidates);
+            if candidates.is_empty() {
+                collect_ids_by_leaf(&nodes, "", &mut candidates); // no leaf match — list everything
+            }
+            return Err(if candidates.is_empty() {
+                format!("anchor '{reference}' not found — {file} has no indexed symbols (check the path)")
+            } else {
+                format!(
+                    "anchor '{reference}' not found in {file}. Closest ids there (nested symbols include \
+                     their scope):\n{}",
+                    candidates.join("\n")
+                )
+            });
         }
+        // A path pins the file, but the name can still collide WITHIN it — collect every match there
+        // and disambiguate, rather than taking the first. Only fall through to the index-wide search
+        // when the name isn't defined in this file at all.
         if !path.is_empty() {
             let nodes = registry.structure(Path::new(path)).unwrap_or_default();
-            if let Some(id) = resolve_in(&nodes, reference) {
-                return Ok(id);
+            let ids = resolve_all_in(&nodes, reference);
+            if !ids.is_empty() {
+                return self.one_or_candidates(registry, reference, ids, op_needle);
             }
         }
         let files = self.files_defining(reference)?;
-        let id_in = |f: &str| resolve_in(&registry.structure(Path::new(f)).unwrap_or_default(), reference);
-        let ids: Vec<String> = files.iter().filter_map(|f| id_in(f)).collect();
+        let ids: Vec<String> = files
+            .iter()
+            .flat_map(|f| resolve_all_in(&registry.structure(Path::new(f)).unwrap_or_default(), reference))
+            .collect();
+        if ids.is_empty() {
+            return Err(format!(
+                "symbol '{reference}' not found in the index — pass a `path`, or a node id from list_anchors/retrieve_context"
+            ));
+        }
+        self.one_or_candidates(registry, reference, ids, op_needle)
+    }
+
+    /// Exactly one candidate → resolve it; several → try the OP'S OWN constraint before asking:
+    /// when the action carries a text the target must contain (replace_text's `oldText`,
+    /// delete_in_body's line, insert_in_body's `after` anchor), a candidate whose source lacks it
+    /// can't be the target — and if exactly ONE candidate qualifies, it IS the target. Asking the
+    /// agent to pick would make it replay this same containment check, one round-trip later
+    /// (bench T3: `replace_text k1 1.5→1.2` was ambiguous between a class field `k1 = 1.5` and an
+    /// interface field `k1: number;` — only one contains "1.5"). Still ambiguous after the
+    /// filter → an Err listing every candidate so the agent re-issues with one as `name`.
+    /// (node ids are unique by construction — file prefix + scope — so no de-dup is needed.)
+    fn one_or_candidates(
+        &self,
+        registry: &ProviderRegistry,
+        reference: &str,
+        ids: Vec<String>,
+        op_needle: Option<&str>,
+    ) -> Result<String, String> {
+        if ids.len() > 1 {
+            if let Some(needle) = op_needle.filter(|n| !n.is_empty()) {
+                let hits: Vec<&String> = ids.iter().filter(|id| self.node_contains(registry, id, needle)).collect();
+                if hits.len() == 1 {
+                    return Ok(hits[0].clone());
+                }
+            }
+        }
         match ids.len() {
-            0 => Err(format!("symbol '{reference}' not found in the index — pass a `path`, or a node id from list_anchors/retrieve_context")),
             1 => Ok(ids.into_iter().next().unwrap()),
             _ => Err(format!(
                 "'{reference}' is ambiguous ({} definitions). Re-issue with one of these as `name`:\n{}",
@@ -293,18 +417,39 @@ impl Server {
         }
     }
 
+    /// Does the node's current source contain `needle`? (containment only — the op itself still
+    /// enforces uniqueness within the node later, with its own clear error).
+    fn node_contains(&self, registry: &ProviderRegistry, id: &str, needle: &str) -> bool {
+        let file = file_of(id);
+        let Ok(content) = std::fs::read_to_string(self.root.join(file)) else { return false };
+        let nodes = registry.structure(Path::new(file)).unwrap_or_default();
+        let Some(node) = find_node(&nodes, id) else { return false };
+        slice_lines(&content, node.range.start_line, node.range.end_line).contains(needle)
+    }
+
     /// Resolve a free-text `query` to a single node_id (the fuzziest addressing mode — fuse
     /// locate+edit into one call). Conservative + gated: an exact symbol-NAME token in the query
     /// resolves directly when unique; otherwise it falls back to retrieval and **only** auto-
-    /// resolves when the top result is unambiguous — any ambiguity returns candidate ids for the
-    /// agent to pick, so we never silently edit a vague guess.
-    fn resolve_query(&mut self, registry: &ProviderRegistry, query: &str) -> Result<String, String> {
+    /// resolves when the top result is unambiguous. Before giving up on ambiguity or a miss, the
+    /// OP'S OWN constraint gets a shot: when the action carries a `path` and a text the target
+    /// must contain (oldText), the one symbol in that file containing it IS the target — the
+    /// query was only ever a description of what the agent already pinned down precisely
+    /// (bench T5: `query:"…object literal in indexer doc sections"` + path + a unique oldText
+    /// drew 4 junk candidates while the oldText identified the site exactly). Only a genuinely
+    /// under-determined query returns candidate ids.
+    fn resolve_query(
+        &mut self,
+        registry: &ProviderRegistry,
+        query: &str,
+        path: &str,
+        op_needle: Option<&str>,
+    ) -> Result<String, String> {
         let id_in = |f: &str, n: &str| resolve_in(&registry.structure(Path::new(f)).unwrap_or_default(), n);
         if !index_exists(&self.root, &self.config) {
             return Err("no index — run `codeindex-rs index` first, or address by name/id".into());
         }
         // 1) an exact symbol name that appears as a token in the query.
-        let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
+        let index = self.index_data()?;
         let toks: std::collections::HashSet<String> =
             query.to_lowercase().split(|c: char| !c.is_alphanumeric() && c != '_').filter(|t| t.len() > 2).map(str::to_string).collect();
         let mut named: Vec<(String, String)> = index
@@ -319,7 +464,9 @@ impl Server {
             let ids: Vec<String> = named.iter().filter_map(|(f, n)| id_in(f, n)).collect();
             return match ids.len() {
                 1 => Ok(ids.into_iter().next().unwrap()),
-                _ => Err(candidate_msg(query, &ids)),
+                _ => self
+                    .resolve_by_containment(registry, path, op_needle)
+                    .ok_or_else(|| candidate_msg(query, &ids)),
             };
         }
         // 2) retrieval fallback — only auto-resolve when unambiguous.
@@ -337,9 +484,46 @@ impl Server {
         ids.sort();
         ids.dedup();
         match ids.len() {
-            0 => Err(format!("query {query:?} resolved to no symbol — use retrieve_context to find it, then edit by name/id")),
             1 => Ok(ids.into_iter().next().unwrap()),
-            _ => Err(candidate_msg(query, &ids)),
+            _ => self.resolve_by_containment(registry, path, op_needle).ok_or_else(|| {
+                if ids.is_empty() {
+                    format!("query {query:?} resolved to no symbol — use retrieve_context to find it, then edit by name/id")
+                } else {
+                    candidate_msg(query, &ids)
+                }
+            }),
+        }
+    }
+
+    /// The one symbol in `path` whose source contains `needle` — resolution by the op's own
+    /// constraint when fuzzy addressing under-determines. Overlapping matches (a class contains
+    /// everything its methods contain) reduce to the INNERMOST set; only an exactly-unique
+    /// innermost hit resolves, anything else stays None so the caller's candidate error stands.
+    fn resolve_by_containment(&self, registry: &ProviderRegistry, path: &str, needle: Option<&str>) -> Option<String> {
+        let needle = needle.filter(|n| !n.is_empty())?;
+        if path.is_empty() {
+            return None;
+        }
+        let content = std::fs::read_to_string(self.root.join(path)).ok()?;
+        let nodes = registry.structure(Path::new(path)).unwrap_or_default();
+        let hits: Vec<&Node> = nodes
+            .iter()
+            .filter(|n| n.name.is_some())
+            .filter(|n| slice_lines(&content, n.range.start_line, n.range.end_line).contains(needle))
+            .collect();
+        let innermost: Vec<&&Node> = hits
+            .iter()
+            .filter(|a| {
+                !hits.iter().any(|b| {
+                    b.id != a.id
+                        && a.range.start_line <= b.range.start_line
+                        && b.range.end_line <= a.range.end_line
+                })
+            })
+            .collect();
+        match innermost.as_slice() {
+            [only] => Some(only.id.clone()),
+            _ => None,
         }
     }
 
@@ -348,7 +532,7 @@ impl Server {
         if !index_exists(&self.root, &self.config) {
             return Ok(vec![]);
         }
-        let index = load_index(&self.root, &self.config).map_err(|e| e.to_string())?;
+        let index = self.index_data()?;
         let mut files: Vec<String> = index.symbols.iter().filter(|s| s.name == name).map(|s| s.file.clone()).collect();
         files.sort();
         files.dedup();
@@ -363,13 +547,26 @@ impl Server {
         let id = if let Some(id) = args["id"].as_str() {
             id.to_string()
         } else if let Some(name) = args["name"].as_str() {
-            self.resolve_symbol(&registry, args["file"].as_str().unwrap_or(""), name)?
+            self.resolve_symbol(&registry, args["file"].as_str().unwrap_or(""), name, None)?
         } else {
             return Err("provide `id` (a node id from list_anchors) or `name`".into());
         };
         let file = file_of(&id).to_string();
         let nodes = registry.structure(Path::new(&file)).map_err(|e| e.to_string())?;
-        let node = find_node(&nodes, &id).ok_or_else(|| format!("anchor '{id}' not found in {file}"))?;
+        let node = find_node(&nodes, &id).ok_or_else(|| {
+            // Same near-miss help as resolve_symbol: a constructed id usually missed the scope.
+            let leaf = id.rsplit('#').next().unwrap_or(&id).split(':').next().unwrap_or("").rsplit('.').next().unwrap_or("");
+            let mut candidates = Vec::new();
+            collect_ids_by_leaf(&nodes, leaf, &mut candidates);
+            if candidates.is_empty() {
+                collect_ids_by_leaf(&nodes, "", &mut candidates);
+            }
+            if candidates.is_empty() {
+                format!("anchor '{id}' not found in {file}")
+            } else {
+                format!("anchor '{id}' not found in {file}. Closest ids there:\n{}", candidates.join("\n"))
+            }
+        })?;
         let content = std::fs::read_to_string(self.root.join(&file)).map_err(|e| e.to_string())?;
         let text = slice_lines(&content, node.range.start_line, node.range.end_line);
         let kind = match &node.kind {
@@ -399,16 +596,47 @@ impl Server {
         };
 
         let mut ops = Vec::new();
-        for a in &actions {
+        for (ai, a) in actions.iter().enumerate() {
+            // Reject unknown fields UP FRONT: a misspelled field (`old_text`, `after`) would
+            // otherwise be silently dropped — and for insert_in_body a dropped `after` doesn't
+            // error, it silently changes WHERE the code lands (end of body). A clear one-round-trip
+            // correction beats a wrong edit that type-checks.
+            if let Some(obj) = a.as_object() {
+                const KNOWN: [&str; 8] = ["action", "name", "query", "path", "value", "oldText", "newText", "target"];
+                for k in obj.keys() {
+                    if !KNOWN.contains(&k.as_str()) {
+                        let hint = if k == "after" {
+                            " — did you mean `oldText` (it holds the insert-after anchor)?".to_string()
+                        } else {
+                            KNOWN
+                                .iter()
+                                .find(|known| known.eq_ignore_ascii_case(&k.replace(['_', '-'], "")))
+                                .map(|known| format!(" — did you mean `{known}`?"))
+                                .unwrap_or_default()
+                        };
+                        return Err(format!(
+                            "action #{ai}: unknown field `{k}`{hint} Allowed fields: {}",
+                            KNOWN.join(", ")
+                        ));
+                    }
+                }
+            }
             let act = a["action"].as_str().unwrap_or("");
             let path = a["path"].as_str().unwrap_or("").to_string();
             note_target(&path);
             let mut name = a["name"].as_str().map(str::to_string);
+            // The op's containment constraint, for auto-disambiguation of fuzzy addressing:
+            // replace_text/delete_in_body's oldText and insert_in_body's `after` anchor must all
+            // occur in the target's source (see one_or_candidates / resolve_by_containment).
+            let op_needle = match act {
+                "replace_text" | "delete_in_body" | "insert_in_body" => a["oldText"].as_str(),
+                _ => None,
+            };
             // `query` — the fuzziest target: resolve a free-text description to a node_id via the
             // index/retrieval (fuse locate+edit). Only when no explicit name/id was given.
             if name.is_none() {
                 if let Some(q) = a["query"].as_str() {
-                    name = Some(self.resolve_query(&registry, q)?);
+                    name = Some(self.resolve_query(&registry, q, &path, op_needle)?);
                 }
             }
             // For a symbol-targeting action, resolve the reference to a node_id UP FRONT through
@@ -418,12 +646,12 @@ impl Server {
             // (move/create/delete) carry no symbol, so they're left untouched.
             let symbol_action = matches!(
                 act,
-                "rename" | "replace" | "replace_node" | "replace_text" | "set_body" | "insert_before"
-                    | "insert_in_body" | "delete_in_body" | "add_parameter" | "set_return_type"
+                "rename" | "replace_node" | "replace_text" | "set_body" | "insert_before"
+                    | "insert_in_body" | "delete_in_body" | "insert_member" | "add_parameter" | "set_return_type"
             );
             if symbol_action {
                 if let Some(reference) = name.as_deref() {
-                    name = Some(self.resolve_symbol(&registry, &path, reference)?);
+                    name = Some(self.resolve_symbol(&registry, &path, reference, op_needle)?);
                 }
             }
             // A resolved node_id (`file#…`) also pins the target file.
@@ -534,7 +762,14 @@ impl Server {
             &changed_rel,
         )
         .map_err(|e| e.to_string())?;
-        save_index(&root, &config, &updated).map_err(|e| e.to_string())
+        save_index(&root, &config, &updated).map_err(|e| e.to_string())?;
+        // We already hold the freshest index — seed the cache with it so the next tool call
+        // (often a name resolution right after the edit) doesn't re-read what we just wrote.
+        let mtime = std::fs::metadata(index_dir(&root, &config).join("index.pb")).and_then(|m| m.modified()).ok();
+        if let (Ok(mut cache), Some(m)) = (self.index_cache.lock(), mtime) {
+            *cache = Some((m, Arc::new(updated)));
+        }
+        Ok(())
     }
 }
 
@@ -584,6 +819,20 @@ fn candidate_msg(reference: &str, ids: &[String]) -> String {
     )
 }
 
+/// Collect symbol node ids whose LEAF name matches (e.g. leaf `foo` matches `f.ts#Cls.foo`);
+/// an empty `leaf` collects every named symbol id. Capped — this feeds a retry hint, not a dump.
+fn collect_ids_by_leaf(nodes: &[Node], leaf: &str, out: &mut Vec<String>) {
+    for n in nodes {
+        if out.len() >= 20 {
+            return;
+        }
+        if n.name.is_some() && (leaf.is_empty() || n.name.as_deref() == Some(leaf)) {
+            out.push(n.id.clone());
+        }
+        collect_ids_by_leaf(&n.children, leaf, out);
+    }
+}
+
 /// Depth-first find of a node by its anchor id (symbol or sub-node).
 fn find_node<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
     for n in nodes {
@@ -622,7 +871,7 @@ fn tools_list() -> Value {
     json!([
         {
             "name": "retrieve_context",
-            "description": "Find the files and line-ranges relevant to a task. Hybrid index (BM25 + Model2Vec + symbol match) fused with RRF, expanded along the import graph. No API calls. `detailLevel` controls how much code is inlined so you may not need a separate read: `pointers` (default — just file + line-range pointers), `outline` (inline the relevant files with function/method BODIES elided — you get exact signatures, arguments, and return types but not the bodies; a 200-line file becomes ~15 lines), or `full` (inline whole files). DEFAULT to `pointers` when you just need to LOCATE code you'll then edit (apply_edits / replace_text) or expand with read_node — it's by far the cheapest. Use `outline`/`full` only when you genuinely need to read several files' code at once, not merely find them. Under `full`, files pulled in via the import graph (not direct matches) are still returned as outline — you get their signatures to call them; use read_node if you need one of their bodies.",
+            "description": "Find files + line-ranges relevant to a task (hybrid BM25 + Model2Vec + symbol match, RRF-fused, expanded along the import graph; no API calls). `detailLevel`: `pointers` (default — file+line pointers only, by far the cheapest; use it to LOCATE code you'll then edit or read_node), `outline` (files inlined with function/method BODIES elided — exact signatures/args/return types, not bodies; a 200-line file → ~15 lines), `full` (whole files; import-graph neighbors stay outline). Use outline/full only when you must read several files' code at once, not merely find them. To EDIT a named symbol you don't need this at all — call apply_edits by name directly.",
             "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"},"detailLevel":{"type":"string","enum":["pointers","outline","full"]}},"required":["task"]}
         },
         {
@@ -632,8 +881,11 @@ fn tools_list() -> Value {
         },
         {
             "name": "find_symbols",
-            "description": "Exact/substring search over indexed symbol NAMES, returning self-locating node-id handles (with kind + line range) ranked by relevance — NOT file:line. Use it to jump straight from a name to an editable handle: every result feeds directly into read_node (id=…, incl. …:body/:doc sub-nodes) or apply_edits (name=… / the id). It's the bridge between retrieve_context (fuzzy, concept→files) and grep (literal, but gives you lines you'd have to map back to a symbol). Exhaustive by default (great for audits — \"every symbol named/containing X\"), not top-k. Pass `substring:true` to match anywhere in the name; omit it for whole-name matches. Prefer this over grep when you want to act on the symbol next.",
-            "inputSchema": {"type":"object","properties":{"query":{"type":"string","description":"symbol name (or fragment with substring:true)"},"substring":{"type":"boolean","description":"match anywhere in the name (default false = whole name)"}},"required":["query"]}
+            "description": "Exact/substring search over indexed symbol NAMES → self-locating node-id handles (with kind + line range), NOT file:line. The cheap bridge from a known name to an editable handle: results feed straight into read_node (id=…, incl. …:body/:doc) or apply_edits (name=… / the id). Prefer over retrieve_context when you know the name, and over grep when you'll act on the symbol next. Exhaustive (good for audits — every symbol named/containing X), not top-k. `substring:true` matches anywhere in the name; omit for whole-name.",
+            "inputSchema": {"type":"object","properties":{
+                "query":{"type":"string","description":"The symbol name to search for."},
+                "substring":{"type":"boolean","description":"Match anywhere in the name (default false = whole-name match)."}
+            },"required":["query"]}
         },
         {
             "name": "list_anchors",
@@ -642,13 +894,44 @@ fn tools_list() -> Value {
         },
         {
             "name": "read_node",
-            "description": "Get the full source + metadata of ONE anchor (a symbol, or its :body / :param.N / :return / :doc sub-node) — the precise drill-down after retrieve_context `outline` elided a body. Address by `id` (a node id from list_anchors, e.g. 'src/bm25.ts#BM25.search' or '…#search:body' — self-locating, NO `file` needed), or by `name` (its file is found in the index; pass `file` only to disambiguate). To read just a body, pass the `…:body` id.",
-            "inputSchema": {"type":"object","properties":{"file":{"type":"string"},"id":{"type":"string"},"name":{"type":"string"}}}
+            "description": "Full source + metadata of ONE anchor (a symbol, or its :body / :param.N / :return / :doc sub-node) — the drill-down after an `outline` elided a body. Address by `id` (a node id, e.g. 'src/http/retry.ts#RetryPolicy.execute' or '…#execute:body' — self-locating, no `file`) or by `name` (file found via the index; pass `file` only to disambiguate).",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"A node id, e.g. 'src/bm25.ts#BM25.search' or a sub-node '…#search:body' — self-locating, needs no `file`. Use ids you were GIVEN; a constructed one may miss a nested symbol's scope (the error lists the file's real ids)."},
+                "name":{"type":"string","description":"A bare symbol name; its file is found via the index. Pass `file` only to disambiguate."},
+                "file":{"type":"string","description":"Optional: repo-relative file to disambiguate a `name` defined in more than one file."}
+            },"anyOf":[{"required":["id"]},{"required":["name"]}]}
         },
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land (nothing commits if it introduces a new type error, including in files that import what changed). TS + Rust are gated; Python is structural-only (`gated:false` — verify it yourself). PREFER over grep + hand-editing: `rename` and `move_file` rewrite every reference / importer across the whole codebase in ONE call — don't edit call sites yourself or grep to verify. ADDRESSING — if the task already NAMES the symbol (e.g. \"rename X to Y\", \"change the body of Z\"), go STRAIGHT to apply_edits with name=X. Do NOT call retrieve_context or list_anchors first to find it: the index resolves a bare `name` to its defining file (omit `path`), and the type-check gate verifies the blast radius — so edit by name and trust it, don't pre-read callers. A node id from list_anchors (e.g. `src/x.ts#Foo.bar`) also works and is self-locating. If you DON'T know the name, give `query` (a free-text description) instead of `name`: the server resolves it to the symbol via the index (fusing find+edit into ONE call) and applies the edit when unambiguous, else returns candidate ids. An ambiguous name/query returns candidate ids to re-issue with. So you almost never need a separate retrieve_context before editing. Each action: {path?, action, name, value, target?, oldText?, newText?}. Pick the SMALLEST edit: • `replace_text` (name=symbol, oldText=exact substring unique within it, newText) — cheapest; use it when you already know the text, with NO Read/list_anchors first. • `replace_node` + `target` for ONE sub-node: target = `body` | `return` (return-type text) | `param.N` (0-based) | `doc` (leading comment / docstring); value = the new code. • `set_body` (name=fn/method, value=new `{ … }` block) — only when rewriting most of a body. • `insert_in_body` (name=fn, value=statement; optional oldText=an existing body line to insert AFTER, else appended at the body end) / `delete_in_body` (name=fn, oldText=the statement line to remove) — statement-level body edits that leave the rest of the block intact. • `add_parameter` (name=fn, value=the new `x: T` param — appended to the list) / `set_return_type` (name=fn, value=the type — added where none exists; the server writes TS `: T` vs Rust/Python `-> T`; to CHANGE an existing return type use replace_node target:return). • `rename` (path=defining file, name=current, value=new); `move_file` (path=current, value=new path); also `insert_before` / `create_file` / `delete_file`. Actions: rename, replace_node, replace_text, set_body, insert_in_body, delete_in_body, add_parameter, set_return_type, insert_before, create_file, move_file, delete_file.",
-            "inputSchema": {"type":"object","properties":{"actions":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"action":{"type":"string"},"name":{"type":"string","description":"symbol name or a node id (file#Scope.name); the index resolves the file"},"query":{"type":"string","description":"free-text target when you don't know the name; resolved via the index, applied if unambiguous"},"value":{"type":"string"},"oldText":{"type":"string","description":"replace_text: exact substring to replace (unique within the symbol)"},"newText":{"type":"string","description":"replace_text: its replacement"},"target":{"type":"string","description":"sub-node selector: body | return | param.N | doc"}},"required":["path","action"]}},"dryRun":{"type":"boolean"}},"required":["actions"]}
+            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first. • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
+            "inputSchema": {"type":"object","properties":{
+                "actions":{"type":"array","description":"One or more edits, applied atomically and type-checked together — batch related edits here instead of separate calls.","items":{"type":"object","additionalProperties":false,"properties":{
+                    "action":{"type":"string","enum":["rename","replace_text","replace_node","set_body","insert_in_body","delete_in_body","insert_member","add_parameter","set_return_type","insert_before","move_file","create_file","delete_file"],"description":"Fields per action — rename: name, value(new name) · replace_text: name, oldText, newText · replace_node: name, value(new code), target? · set_body: name, value · insert_in_body: name, value, oldText? · delete_in_body: name, oldText · insert_member: name, value · add_parameter: name, value · set_return_type: name, value · insert_before: name, value · move_file: path, value(new path) · create_file: path, value(source) · delete_file: path. For symbol actions `query` may replace `name`, and `path` may scope a bare `name`."},
+                    "name":{"type":"string","description":"Target symbol: a node id `file#Scope.name` you were GIVEN (find_symbols/list_anchors/a reject), or a bare NAME — add `path` when you know the defining file, omit it to let the index find the file. If ambiguous, the reply lists candidate ids to re-issue with. Used by every symbol action."},
+                    "query":{"type":"string","description":"Use INSTEAD of `name` when you don't know it: a free-text description of the target; the server resolves it via the index and applies if unambiguous. Pass `path` (and, for text ops, oldText) alongside — when the description alone is ambiguous, the one symbol in that file containing your oldText resolves it."},
+                    "path":{"type":"string","description":"The file to resolve a bare `name` in — pass it whenever you know the defining file (avoids ambiguity; the id stays validated). Also the file path for move_file/create_file/delete_file, and optionally rename."},
+                    "value":{"type":"string","description":"The new code/text for MOST actions: rename→the new name; replace_node→new node code; set_body→new `{ … }` block; insert_in_body→a statement; insert_member→the new member (include its own `;` or `,`); add_parameter→`x: T`; set_return_type→the type; move_file→the new path; create_file→the file source. NOTE: replace_text does NOT use `value` — it uses oldText/newText."},
+                    "oldText":{"type":"string","description":"replace_text: the exact substring to replace (unique within the symbol). delete_in_body: the body line to remove. insert_in_body: optional — an existing body line to insert AFTER (substring-matched, must be unique in the body); omit to append at the END of the body."},
+                    "newText":{"type":"string","description":"replace_text ONLY: the replacement for `oldText`."},
+                    "target":{"type":"string","pattern":"^(body|return|returnType|doc|comment|docstring|param\\.[0-9]+)$","description":"Sub-node selector for replace_node/replace_text/insert_before: `body` | `return` | `doc` | `param.N` (0-based). Anything else is rejected — never silently the whole symbol."}
+                },"required":["action"],
+                "allOf":[
+                    {"if":{"properties":{"action":{"const":"rename"}}},"then":{"required":["name","value"]}},
+                    {"if":{"properties":{"action":{"const":"replace_text"}}},"then":{"required":["oldText","newText"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"replace_node"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"set_body"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"insert_in_body"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"delete_in_body"}}},"then":{"required":["oldText"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"insert_member"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"add_parameter"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"set_return_type"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"insert_before"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"move_file"}}},"then":{"required":["path","value"]}},
+                    {"if":{"properties":{"action":{"const":"create_file"}}},"then":{"required":["path","value"]}},
+                    {"if":{"properties":{"action":{"const":"delete_file"}}},"then":{"required":["path"]}}
+                ]}},
+                "dryRun":{"type":"boolean","description":"Validate through the type-check gate without writing to disk."}
+            },"required":["actions"]}
         }
     ])
 }
@@ -728,7 +1011,44 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_index_matches;
+    use super::{ensure_index_matches, tools_list};
+
+    // The schema's `action` enum and the edit engine's dispatch are maintained separately; this
+    // pins them together — every action the schema advertises must be one action_to_op accepts
+    // (an enum entry the engine rejects would send the agent into "unsupported action" loops).
+    #[test]
+    fn schema_action_enum_matches_the_edit_engine() {
+        let tools = tools_list();
+        let actions = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "apply_edits")
+            .unwrap()["inputSchema"]["properties"]["actions"]["items"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("apply_edits action enum")
+            .clone();
+        assert!(actions.len() >= 13, "action enum unexpectedly small: {actions:?}");
+        let resolve = |_: &str, _: Option<&str>, _: Option<&str>| Some("f.ts#x".to_string());
+        for a in actions {
+            let act = a.as_str().unwrap();
+            let action = ci_edit::Action {
+                path: "f.ts".into(),
+                action: act.into(),
+                target: None,
+                name: Some("x".into()),
+                value: Some("v".into()),
+                old_text: Some("o".into()),
+                new_text: Some("n".into()),
+            };
+            if let Err(e) = ci_edit::action_to_op(&action, resolve) {
+                assert!(
+                    !e.to_string().contains("unsupported action"),
+                    "schema advertises {act:?} but the edit engine rejects it: {e}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn index_compat_guard() {

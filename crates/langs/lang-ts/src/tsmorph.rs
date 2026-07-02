@@ -16,11 +16,16 @@ use std::time::{Duration, Instant};
 
 const SIDECAR_SRC: &str = include_str!("sidecar.cjs");
 
+/// Pinned ts-morph for the sidecar (unpinned `npm install` floats and can change gate
+/// behavior between machines/runs). The home dir is version-suffixed so a bump actually
+/// installs the new pin instead of reusing a stale cached install.
+const TS_MORPH_VERSION: &str = "28.0.0";
+
 /// Where the managed ts-morph install + sidecar live (cached across runs).
 fn ts_morph_home() -> PathBuf {
     std::env::var("CI_TSMORPH_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir().join("ci-tsmorph"))
+        .unwrap_or_else(|_| std::env::temp_dir().join(format!("ci-tsmorph-{TS_MORPH_VERSION}")))
 }
 
 use crate::npm_cache;
@@ -38,7 +43,7 @@ fn ensure_sidecar(home: &Path) -> Result<PathBuf> {
             let status = Command::new("npm")
                 .args(["install", "--silent", "--no-audit", "--no-fund", "--prefix"])
                 .arg(home)
-                .arg("ts-morph")
+                .arg(format!("ts-morph@{TS_MORPH_VERSION}"))
                 .env("npm_config_cache", npm_cache())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())

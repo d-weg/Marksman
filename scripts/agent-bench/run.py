@@ -5,7 +5,8 @@
 Trustworthy by construction (see README.md): the only thing that varies between arms is
 which MCP server is loaded; model, prompt, and repo start-state are identical; every run
 starts from `git reset --hard`; success is an objective `check` command; tokens come straight
-from Claude Code's own JSON; every task is reported.
+from Claude Code's own JSON; every task is reported. Each arm is ONE agent — subagent spawning
+is disallowed, so the top-level token/cost numbers account for the whole run.
 
   python3 run.py --repo /path/to/ts/repo [--task T1-rename] [--runs 3] [--arms baseline,rust,ts]
 
@@ -25,6 +26,7 @@ BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
     "mcp__codeindex__retrieve_context",
     "mcp__codeindex__describe_architecture",
+    "mcp__codeindex__find_symbols",
     "mcp__codeindex__list_anchors",
     "mcp__codeindex__read_node",
     "mcp__codeindex__apply_edits",
@@ -80,12 +82,22 @@ def reset(repo, base):
 # measures the agent's whim (it often defaults to grep + manual edits) instead of the
 # tool. The baseline gets no such nudge; it uses its standard tools.
 PREAMBLE = (
-    "You have codeindex MCP tools: retrieve_context (find relevant code for a task), "
-    "list_anchors (a file's symbols/anchors), read_node (the full source + metadata of ONE "
-    "symbol/anchor — use instead of a separate Read), apply_edits (structural edits — rename / "
-    "replace_node / move_file, plus surgical edits: replace_text to swap an exact substring you "
-    "already know, or set_body / replace_node target:body|return|param.N — all type-checked "
-    "before they land). Prefer them over grepping and hand-editing.\n\nTask: "
+    "You have codeindex MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
+    "names (a bare name like `select:apply_edits` FAILS — it must be `mcp__codeindex__apply_edits`):\n"
+    "  ToolSearch  query=\"select:mcp__codeindex__apply_edits,mcp__codeindex__find_symbols,"
+    "mcp__codeindex__retrieve_context,mcp__codeindex__read_node,mcp__codeindex__list_anchors\"\n"
+    "What they do: apply_edits (structural + surgical edits — rename / move_file / replace_text / "
+    "set_body / replace_node target:body|return|param.N / insert_member — all type-checked before they "
+    "land), find_symbols (name -> node-id handles; to disambiguate a name apply_edits called ambiguous), "
+    "retrieve_context (find code by concept), read_node (one symbol's full source), list_anchors (a "
+    "file's anchors).\n"
+    "Then EDIT WITH THE TOOL, not grep+Edit: if the task NAMES the symbol, call apply_edits by name "
+    "DIRECTLY — don't locate it first; if the task also gives the FILE, address as `file#name` (e.g. "
+    "`src/http/retry.ts#parseResponse`) so it resolves in ONE call; else a bare name works and an ambiguous one "
+    "just returns candidate ids to re-issue with. This holds even for "
+    "a ONE-LINE change (change a default, fix a value) — use apply_edits replace_text by name; do NOT "
+    "reach for Grep/Bash/Read+Edit for a small edit. It's type-checked and needs no separate search.\n\n"
+    "Task: "
 )
 
 
@@ -102,7 +114,12 @@ def run_agent(repo, prompt, mcp_config, model, transcript=None):
     tools = BASE_TOOLS + ("," + CI_TOOLS if mcp_config else "")
     if mcp_config:
         cmd += ["--mcp-config", mcp_config]
-    cmd += ["--allowedTools", tools]
+    # Keep each arm ONE agent: the subagent-spawn tool (`Agent`/`Task`) is available by default even
+    # when not in --allowedTools, and the model sometimes reaches for it. That both contaminates
+    # "one agent doing everything" AND breaks the token metric — the top-level usage counts only the
+    # main agent while `$` counts the subagent too, so a delegated run shows the FEWEST tokens yet
+    # the HIGHEST cost. Disallow it so the reported numbers describe the whole run.
+    cmd += ["--allowedTools", tools, "--disallowedTools", "Agent,Task"]
 
     t = time.time()
     r = sh(cmd, cwd=repo)
@@ -159,13 +176,22 @@ def check(repo, cmd):
 def preflight():
     r = sh([CLAUDE, "-p", "reply with exactly: ok", "--output-format", "json"])
     try:
-        json.loads(r.stdout)
-        return True
+        out = json.loads(r.stdout)
     except Exception:
         print("ERROR: `claude` did not return valid JSON. Need a working CLI + $ANTHROPIC_API_KEY.")
         print("  stdout:", (r.stdout or "")[:200])
         print("  stderr:", (r.stderr or "")[:300])
         return False
+    # An auth/API failure is still valid JSON (`is_error:true`) — catch it here, else every arm
+    # silently reports 0 tokens / ok=False and the run looks "done". A common cause: Claude Code
+    # authenticating via a stored subscription/OAuth login that the org blocks headless, instead of
+    # using $ANTHROPIC_API_KEY — `claude /logout` (or a shell without the OAuth session) forces the
+    # API key. See go.sh's header on the org-policy caveat.
+    if out.get("is_error") or out.get("api_error_status"):
+        print("ERROR: `claude` reached the CLI but the API call FAILED — fix auth before benchmarking.")
+        print("  message:", (out.get("result") or "")[:300])
+        return False
+    return True
 
 
 def build_indexes(repo, arms):
@@ -194,6 +220,16 @@ def main():
         sys.exit(1)
     base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
     print(f"# Agent benchmark — arms: {', '.join(arms)} · model: {args.model}\nrepo: {repo} @ {base[:8]}\n")
+    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `build_indexes` runs
+    # before the task loop's first reset, and `codeindex-rs index` updates INCREMENTALLY (mtime-keyed),
+    # so a stale index left by a prior run — or a dirty working tree — would be snapshotted and then
+    # restored on every reset, leaving the index inconsistent with the reset SOURCE. That silently
+    # sabotages symbol-targeting tasks: e.g. a rename whose symbol the stale index already renamed
+    # away resolves to "not found", forcing a grep fallback and an invalid measurement (the T6
+    # postmortem). Reset tracked source to base and delete the index dirs so the build is from scratch.
+    sh(["git", "reset", "--hard", base], cwd=repo)
+    for d in INDEX_DIRS:
+        shutil.rmtree(os.path.join(repo, d), ignore_errors=True)
     build_indexes(repo, arms)
     snapshot_indexes(repo)  # pristine, base-consistent indexes restored on every reset
 

@@ -9,6 +9,7 @@ description = "Index storage: BM25 + flat vector store + import graph + persiste
 ci-core = { path = "../ci-core" }
 serde.workspace = true
 serde_json.workspace = true
+prost = "0.13"
 
 [dev-dependencies]
 tempfile.workspace = true

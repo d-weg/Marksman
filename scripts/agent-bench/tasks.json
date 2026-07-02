@@ -22,5 +22,17 @@
     "prompt": "In the tokenize function (src/bm25.ts), raise the minimum token length so it keeps only tokens LONGER THAN 2 characters instead of longer than 1. There are two length checks inside the function body — `lower.length > 1` and `lp.length > 1` — change both to `> 2`. Change nothing else and keep it compiling.",
     "check": "grep -Eq 'lower\\.length > 2' src/bm25.ts && grep -Eq 'lp\\.length > 2' src/bm25.ts && ! grep -Eq 'lower\\.length > 1' src/bm25.ts && ! grep -Eq 'lp\\.length > 1' src/bm25.ts && grep -Eq 'parts\\.length > 1' src/bm25.ts && npm run -s typecheck",
     "why": "Edit confined to ONE function body (two spots) — exercises surgical sub-node edits (set_body / replace_node target:body) vs re-emitting the whole function."
+  },
+  {
+    "id": "T5-schema-field",
+    "prompt": "Add a required field `nameLower: string` to the SymbolEntry interface in src/types.ts — the lowercase form of the symbol's `name` — and set it at every place a SymbolEntry object is constructed (use name.toLowerCase()). Keep everything compiling.",
+    "check": "grep -Eq 'nameLower: string' src/types.ts && grep -q nameLower src/indexer.ts && grep -q nameLower src/symbols.ts && npm run -s typecheck",
+    "why": "Wide schema change: a REQUIRED field makes tsc fail until every construction site is updated — the first task that actually exercises the type-check GATE (nothing commits until the blast radius compiles) and the find-all-construction-sites step. `nameLower: string` (not `nameLower?:`) enforces required, so a passing tsc proves both sites were updated — ungameable."
+  },
+  {
+    "id": "T6-type-rename",
+    "prompt": "Rename the SymbolEntry interface to CodeSymbol everywhere in the codebase — its definition in src/types.ts and every reference and import across all files. Keep everything compiling.",
+    "check": "! grep -rq 'SymbolEntry' src && grep -q 'interface CodeSymbol' src/types.ts && npm run -s typecheck",
+    "why": "Type rename propagating across 5 files — scaled-up T1 (a function rename in ~3 files). Baseline must chase every reference/import and typecheck-iterate; a gated structural rename does the whole blast radius in one call. tsc + zero-SymbolEntry-remaining is ungameable."
   }
 ]

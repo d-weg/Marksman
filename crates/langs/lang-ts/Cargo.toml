@@ -13,6 +13,7 @@ ci-edit = { path = "../../ci-edit" }
 ci-proto = { path = "../../ci-proto" }
 ci-treesitter = { path = "../../ci-treesitter" }
 serde_json.workspace = true
+ignore.workspace = true
 tree-sitter = { workspace = true }
 tree-sitter-typescript = "0.23.2"
 

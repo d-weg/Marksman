@@ -139,6 +139,7 @@ name = "ci-index"
 version = "0.1.0"
 dependencies = [
  "ci-core",
+ "prost",
  "serde",
  "serde_json",
  "tempfile",
@@ -570,6 +571,7 @@ dependencies = [
  "ci-proto",
  "ci-scip",
  "ci-treesitter",
+ "ignore",
  "serde_json",
  "tempfile",
  "tree-sitter",

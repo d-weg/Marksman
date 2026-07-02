@@ -8,7 +8,7 @@ use ci_core::{CommitResult, Diag, EditOp, EditOpts, Error, Node, Range, Result};
 use ci_lsp::LspClient;
 use ci_vfs::Vfs;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 /// The type-check engine behind the gate. Abstracts over *how* a language computes
@@ -134,23 +134,32 @@ pub fn action_to_op(
     // The resolved symbol id, optionally NARROWED to a sub-node anchor when `target` names one
     // (`body` / `return` / `param.N`). For a surgical edit the agent targets a sub-symbol range
     // — its body or return type or one parameter — instead of re-emitting the whole definition.
-    // Any other `target` (e.g. a symbol-kind hint like "function") leaves the id as the whole
-    // symbol, so existing callers are unaffected. The narrowed id (`f.ts#foo:body`) is validated
-    // against the structure tree in `apply_structural`.
+    // An UNRECOGNIZED target is an error, never a silent fallthrough: falling back to the whole
+    // symbol would apply sub-node code (a body, a type) over the entire declaration — a
+    // silently-wrong edit is worse than one clear retry. The narrowed id (`f.ts#foo:body`) is
+    // validated against the structure tree in `apply_structural`.
     let targeted = || -> Result<String> {
         let base = node()?;
         Ok(match a.target.as_deref() {
+            None | Some("") => base,
             Some("body") => format!("{base}:body"),
             Some("return") | Some("returnType") => format!("{base}:return"),
             Some("doc") | Some("comment") | Some("docstring") => format!("{base}:doc"),
-            Some(t) if t.starts_with("param.") => format!("{base}:{t}"),
-            _ => base,
+            Some(t) if t.starts_with("param.") && t["param.".len()..].parse::<u32>().is_ok() => {
+                format!("{base}:{t}")
+            }
+            Some(t) => {
+                return Err(Error::Other(format!(
+                    "unknown target {t:?} — use `body`, `return`, `doc`, or `param.N` (0-based), or omit \
+                     `target` to address the whole symbol"
+                )))
+            }
         })
     };
     let value = || a.value.clone().ok_or_else(|| Error::Other(format!("{} needs a value", a.action)));
     Ok(match a.action.as_str() {
         "rename" => EditOp::Rename { node_id: node()?, new_name: value()? },
-        "replace" | "replace_node" => EditOp::ReplaceNode { node_id: targeted()?, code: value()? },
+        "replace_node" => EditOp::ReplaceNode { node_id: targeted()?, code: value()? },
         // `replace_text` swaps an exact substring INSIDE a node (optionally a sub-node via
         // `target`) — the cheapest precise edit: the agent sends only old→new, not the whole
         // body. `old_text` must be unique within the node. Gated like any structural edit.
@@ -168,6 +177,7 @@ pub fn action_to_op(
         "insert_in_body" => {
             EditOp::InsertInBody { node_id: node()?, code: value()?, after: a.old_text.clone() }
         }
+        "insert_member" => EditOp::InsertMember { node_id: node()?, code: value()? },
         "delete_in_body" => EditOp::DeleteInBody {
             node_id: node()?,
             text: a.old_text.clone().or_else(|| a.value.clone()).ok_or_else(|| {
@@ -181,7 +191,13 @@ pub fn action_to_op(
         "create_file" => EditOp::CreateFile { path: a.path.clone().into(), code: value()? },
         "move_file" => EditOp::MoveFile { from: a.path.clone().into(), to: value()?.into() },
         "delete_file" => EditOp::DeleteFile { path: a.path.clone().into() },
-        other => return Err(Error::Driver(format!("unsupported action: {other}"))),
+        other => {
+            return Err(Error::Driver(format!(
+                "unsupported action {other:?} — valid actions: rename, replace_text, replace_node, set_body, \
+                 insert_in_body, delete_in_body, insert_member, add_parameter, set_return_type, insert_before, \
+                 move_file, create_file, delete_file"
+            )))
+        }
     })
 }
 
@@ -199,6 +215,26 @@ pub fn resolve_in(nodes: &[Node], name: &str) -> Option<String> {
         None
     }
     rec(nodes, name).map(|n| n.id.clone())
+}
+
+/// EVERY node id whose name matches, depth-first — the collision-aware sibling of [`resolve_in`].
+/// The single-match `resolve_in` silently returns the FIRST of several same-named symbols in one
+/// file (two interface fields named `nodeId`, an overload pair, a method + a top-level fn), so an
+/// edit-by-bare-name would land on whichever came first with no warning. Callers that must never
+/// guess use this and treat `len > 1` as ambiguous — surfacing the candidate ids to pick from.
+/// Sub-nodes (`:body`/`:param.N`/`:return`) carry `name: None`, so only real symbols match.
+pub fn resolve_all_in(nodes: &[Node], name: &str) -> Vec<String> {
+    fn rec(nodes: &[Node], name: &str, out: &mut Vec<String>) {
+        for n in nodes {
+            if n.name.as_deref() == Some(name) {
+                out.push(n.id.clone());
+            }
+            rec(&n.children, name, out);
+        }
+    }
+    let mut out = Vec::new();
+    rec(nodes, name, &mut out);
+    out
 }
 
 fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
@@ -235,6 +271,7 @@ fn op_paths(op: &EditOp) -> Vec<PathBuf> {
         | EditOp::SetBody { node_id, .. }
         | EditOp::InsertInBody { node_id, .. }
         | EditOp::DeleteInBody { node_id, .. }
+        | EditOp::InsertMember { node_id, .. }
         | EditOp::AddParameter { node_id, .. }
         | EditOp::SetReturnType { node_id, .. }
         | EditOp::Rename { node_id, .. } => vec![PathBuf::from(file_of(node_id))],
@@ -293,6 +330,7 @@ fn op_node_id(op: &EditOp) -> Option<&str> {
         | EditOp::SetBody { node_id, .. }
         | EditOp::InsertInBody { node_id, .. }
         | EditOp::DeleteInBody { node_id, .. }
+        | EditOp::InsertMember { node_id, .. }
         | EditOp::AddParameter { node_id, .. }
         | EditOp::SetReturnType { node_id, .. }
         | EditOp::Rename { node_id, .. } => Some(node_id),
@@ -304,6 +342,51 @@ fn op_node_id(op: &EditOp) -> Option<&str> {
 /// same file whose node starts nearest above the diagnostic's line. Makes a
 /// rejection actionable — the agent re-emits just that op (scoped repair) instead
 /// of the whole batch.
+/// The INNERMOST named symbol whose line range contains `line`. Lets a blast-radius diagnostic name
+/// the symbol an agent should edit (its construction site / caller), sparing it a `list_anchors`
+/// round-trip to map `file:line` back to a node. Innermost wins so a method beats its class.
+fn enclosing_symbol(nodes: &[Node], line: u32) -> Option<String> {
+    fn walk<'a>(nodes: &'a [Node], line: u32, best: &mut Option<(&'a Node, u32)>) {
+        for n in nodes {
+            if n.name.is_some() && n.range.start_line <= line && line <= n.range.end_line {
+                let span = n.range.end_line - n.range.start_line;
+                if best.map_or(true, |(_, s)| span <= s) {
+                    *best = Some((n, span));
+                }
+            }
+            walk(&n.children, line, best);
+        }
+    }
+    let mut best = None;
+    walk(nodes, line, &mut best);
+    best.map(|(n, _)| n.id.clone())
+}
+
+/// A ready-to-copy `insert_in_body` action for one blast-radius site — the reject hands the
+/// agent the whole edit except `value`, so fixing a fan-out (a newly-required member at N
+/// construction sites) needs no read_node per site and no anchor construction: the server picks
+/// the anchor from the site's own post-edit source (`window` = offending line + up to 2
+/// following). When the offending line opens a `{ …` block the anchor is the first line INSIDE
+/// it, so the insert lands among the members at their indent (`after` is substring-matched and
+/// auto-indented, so whitespace never matters). The suggestion is serialized JSON — exactly the
+/// object to drop into `actions`, with quoting the agent can't get wrong.
+fn suggest_fix(node_id: &str, window: &[&str]) -> Option<String> {
+    let first = window.first()?.trim();
+    let opens_block = first.matches('{').count() > first.matches('}').count();
+    let anchor = if opens_block {
+        window.get(1).map(|l| l.trim()).filter(|l| !l.is_empty()).unwrap_or(first)
+    } else {
+        first
+    };
+    if anchor.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\nfix (set `value` to the code this site needs, then batch): {}",
+        serde_json::json!({"action": "insert_in_body", "name": node_id, "oldText": anchor, "value": "<FILL IN>"})
+    ))
+}
+
 fn anchor(diag: &Diag, ops: &[EditOp], structure_of: &impl Fn(&str) -> Vec<Node>) -> Option<(usize, String)> {
     let mut candidates: Vec<(usize, String, u32)> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
@@ -313,7 +396,13 @@ fn anchor(diag: &Diag, ops: &[EditOp], structure_of: &impl Fn(&str) -> Vec<Node>
         }
         let nodes = structure_of(file_of(node_id));
         if let Some(node) = find(&nodes, node_id) {
-            if node.range.start_line <= diag.line {
+            // The diag must fall WITHIN the op's node, not merely below its start: without the
+            // end check, a same-file op swallows every blast-radius diagnostic under it (bench
+            // T5: an insert into `makeEntry` claimed a missing-member error 60 lines below, in a
+            // function no op touched) — and the op-anchored branch never emits the ready-to-copy
+            // `fix:`, so the agent had to re-read the site. Un-anchored is the better failure:
+            // the enclosing-symbol branch names the real site and hands over the fix.
+            if node.range.start_line <= diag.line && diag.line <= node.range.end_line {
                 candidates.push((i, node_id.to_string(), node.range.start_line));
             }
         }
@@ -400,6 +489,26 @@ pub fn apply_structural(
             let new_body = delete_stmt_in_body(&text, needle)?;
             vfs.replace_range(Path::new(file), &range, &new_body)
         }
+        // Insert a member at the TOP of the container's `{ … }` block (interface field, class
+        // member, object property). Works off the container node's own text — no `:body` sub-node
+        // needed, so it targets a plain interface/type/class/object symbol directly. Landing first
+        // (right after `{`) means our member carries its own separator and never needs the PRIOR
+        // item to gain a trailing comma, so it stays valid for both `;`-separated interface members
+        // and `,`-separated object properties. The type-check gate verifies the result.
+        EditOp::InsertMember { node_id, code } => {
+            let file = file_of(node_id);
+            let node = node_by_id(node_id, structure_of)?;
+            let text = vfs
+                .read_range(Path::new(file), &node.range)
+                .ok_or_else(|| Error::Other("node text unavailable".into()))?;
+            let open = block_open(&text).ok_or_else(|| {
+                Error::Other(format!("INSERT_MEMBER: node '{node_id}' has no `{{ … }}` block to insert into"))
+            })?;
+            let member_indent = format!("{}  ", " ".repeat(node.range.start_char as usize));
+            let (head, tail) = text.split_at(open + 1); // just past the opening brace
+            let new_text = format!("{head}\n{member_indent}{}{tail}", code.trim());
+            vfs.replace_range(Path::new(file), &node.range, &new_text)
+        }
         // Append a parameter: rewrite the `:params` `(...)` list, inserting before the `)`.
         EditOp::AddParameter { node_id, param } => {
             let file = file_of(node_id);
@@ -435,6 +544,25 @@ pub fn apply_structural(
         }
         EditOp::Rename { .. } => Err(Error::Driver("rename must go through apply_rename".into())),
     }
+}
+
+/// Byte index of the block-opening `{` in a container's text — the first `{` that isn't inside a
+/// generic `<…>` or a parameter `(…)`, so `interface Foo extends Bar<{ x }> {` finds the BODY
+/// brace, not the one in the type argument. `None` if there's no such brace (e.g. a `type X = number`
+/// alias with no block). Braces inside strings/comments are a theoretical edge the gate would catch.
+fn block_open(text: &str) -> Option<usize> {
+    let (mut angle, mut paren) = (0i32, 0i32);
+    for (i, c) in text.char_indices() {
+        match c {
+            '<' => angle += 1,
+            '>' if angle > 0 => angle -= 1,
+            '(' => paren += 1,
+            ')' if paren > 0 => paren -= 1,
+            '{' if angle == 0 && paren == 0 => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Resolve `{node_id}:{sub}` to its range, or an `Anchor` error carrying `why` (the symbol lacks
@@ -723,6 +851,13 @@ pub fn commit_edits(
     // direct reverse-import dependents — a bounded slice of the import graph, never the whole
     // project. (A rename already rewrites every reference into `changed`; this matters for
     // replace_node / structural edits whose ripple reaches importers.)
+    // One hop is deeper than it looks for TS: the graph comes from SEMANTIC scip references, so
+    // a consumer importing through a barrel (`export { x } from './a'`) edges DIRECTLY to a.ts
+    // (verified: app->barrel->math yields app -> [barrel, math]) — re-exports never hide a
+    // consumer. The accepted residual is the type-INFERENCE ripple (A changes B's inferred
+    // type, which breaks C two hops out): closing it needs transitive expansion on every edit's
+    // gate — the hot path — for a much rarer miss. Rust's tree-sitter mod graph is syntactic,
+    // so its `pub use` re-exports do not get this flattening.
     let mut affected: Vec<String> = changed_rel.clone();
     {
         let mut seen = changed_set.clone();
@@ -734,14 +869,6 @@ pub fn commit_edits(
             }
         }
     }
-    // Baseline = disk state of every affected file (disk is untouched until commit).
-    let baseline_files: Vec<(String, String)> = affected
-        .iter()
-        .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
-        .collect();
-    let baseline = engine.diagnostics(&baseline_files)?;
-    let baseline_keys: HashSet<String> = baseline.iter().map(diag_key).collect();
-
     // After = overlay (edited) content for the changed files; disk content for the dependents
     // (their source is unchanged, but tsserver re-checks them against the overlaid changed
     // files, so a freshly-broken caller surfaces here).
@@ -757,24 +884,116 @@ pub fn commit_edits(
         })
         .collect();
     let after = engine.diagnostics(&after_files)?;
-    let new: Vec<&Diag> = after.iter().filter(|d| !baseline_keys.contains(&diag_key(d))).collect();
+    // Gate as a diff, computed LAZILY: if the post-edit state is clean, there can be no newly
+    // introduced error, so we commit WITHOUT the baseline pass — the happy path (a good edit), which
+    // halves the gate's type-check work. Only when `after` has errors do we pay the baseline pass, to
+    // tell a freshly-introduced error from one that was already there (disk is untouched until commit).
+    let new: Vec<&Diag> = if after.is_empty() {
+        Vec::new()
+    } else {
+        let baseline_files: Vec<(String, String)> = affected
+            .iter()
+            .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
+            .collect();
+        // COUNT baseline occurrences per key, don't just collect the key set: the key has no line
+        // (edits shift lines, so it can't), which means one pre-existing error would otherwise
+        // excuse EVERY new instance with the same code+message in that file — a false accept.
+        // Each after-instance beyond the baseline count is new. (When instances are excused, the
+        // FIRST ones in diagnostic order are — so a flagged line can occasionally be the old
+        // site rather than the new one; the reject still surfaces the error either way.)
+        let mut baseline_counts: HashMap<String, usize> = HashMap::new();
+        for d in engine.diagnostics(&baseline_files)? {
+            *baseline_counts.entry(diag_key(&d)).or_default() += 1;
+        }
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        after
+            .iter()
+            .filter(|d| {
+                let k = diag_key(d);
+                let n = seen.entry(k.clone()).or_default();
+                *n += 1;
+                *n > baseline_counts.get(&k).copied().unwrap_or(0)
+            })
+            .collect()
+    };
 
     if !new.is_empty() {
+        // Post-edit source of every affected file, so each diagnostic can carry the OFFENDING LINE
+        // inline — the agent sees the exact code to fix (its object literal, caller, …) without a
+        // follow-up read_node per site. Lightweight: just the one line, trimmed (no ANSI, no context
+        // block that would balloon a many-site rejection).
+        let after_src: HashMap<&str, &str> = after_files.iter().map(|(f, c)| (f.as_str(), c.as_str())).collect();
+        // A small SOURCE WINDOW around the offending line (the line + up to 2 following) — enough for
+        // the agent to pick a unique `replace_text` anchor and see the indentation of the site it must
+        // fix, so it can write the fix straight from the reject WITHOUT a read_node per site. Lines are
+        // VERBATIM (leading indentation intact, only trailing whitespace trimmed) so the agent can copy
+        // one straight into `oldText` and have it match — a display prefix would inflate the indent and
+        // every `replace_text` would miss. Fenced so the code is visually distinct from the diagnostics.
+        // The site's source window: the offending line, extended to where its opened block
+        // closes (capped). Three lines showed the anchor but not the site's SCOPE — the agent
+        // still read_node'd each site to learn what variables the new member could be built
+        // from (bench T5: is there a `name` in scope?). Showing the whole literal makes the
+        // fix's `value` derivable in place; the cap keeps a many-site rejection bounded.
+        let window = |file: &str, line: u32| -> Vec<&str> {
+            let Some(c) = after_src.get(file) else { return Vec::new() };
+            let mut out: Vec<&str> = Vec::new();
+            let mut depth: i64 = 0;
+            for (i, l) in c.lines().skip(line.saturating_sub(1) as usize).take(8).enumerate() {
+                let l = l.trim_end();
+                depth += l.bytes().filter(|b| matches!(b, b'{' | b'(' | b'[')).count() as i64;
+                depth -= l.bytes().filter(|b| matches!(b, b'}' | b')' | b']')).count() as i64;
+                out.push(l);
+                if i >= 2 && depth <= 0 {
+                    break; // at least the old 3-line window; stop once the site's block closes
+                }
+            }
+            out
+        };
+        let snippet =
+            |w: &[&str]| if w.is_empty() { String::new() } else { format!("\n```\n{}\n```", w.join("\n")) };
         // Anchor each new diagnostic to the op that introduced it (scoped repair).
         let mut anchored_op: i64 = -1;
         let feedback = new
             .iter()
-            .map(|d| match anchor(d, ops, structure_of) {
-                Some((i, node_id)) => {
-                    if anchored_op < 0 {
-                        anchored_op = i as i64;
+            .map(|d| {
+                let w = window(&d.file, d.line);
+                let (head, fix) = match anchor(d, ops, structure_of) {
+                    Some((i, node_id)) => {
+                        if anchored_op < 0 {
+                            anchored_op = i as i64;
+                        }
+                        (format!("op #{i} ({node_id}) -> {}:{} TS{} {}", d.file, d.line, d.code, d.message), None)
                     }
-                    format!("op #{i} ({node_id}) -> {}:{} TS{} {}", d.file, d.line, d.code, d.message)
-                }
-                None => format!("{}:{} TS{} {}", d.file, d.line, d.code, d.message),
+                    // A blast-radius error at a site NO op touched (e.g. a construction site that must
+                    // now set a newly-required field). Name its enclosing symbol so the agent edits it
+                    // directly in the next batch instead of a list_anchors hunt to map line -> node —
+                    // and hand it the ready-to-copy insert_in_body for that site (only `value` left).
+                    None => match enclosing_symbol(&structure_of(&d.file), d.line) {
+                        Some(id) => {
+                            let fix = suggest_fix(&id, &w);
+                            (format!("{}:{} (in {id}) TS{} {}", d.file, d.line, d.code, d.message), fix)
+                        }
+                        None => (format!("{}:{} TS{} {}", d.file, d.line, d.code, d.message), None),
+                    },
+                };
+                format!("{head}{}{}", snippet(&w), fix.unwrap_or_default())
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // Point-of-use instruction, only when ready-to-copy fixes were handed out: the upfront
+        // tool description tells the agent not to re-read the sites, but the moment of decision
+        // is HERE, right after this text — and agents demonstrably heed the success message's
+        // equivalent ("do not grep to verify"). Say it where it lands.
+        let feedback = if feedback.contains("\nfix (set") {
+            format!(
+                "{feedback}\n\nThis list is COMPLETE (the type-checker found every affected site) and each window \
+                 above is that site's current source — the variables in scope are visible in it. Re-issue ONE batch \
+                 now: your original edit(s) + each `fix:` action with `value` filled from its window. Do NOT \
+                 read_node/Read/list_anchors the sites first; that would only re-fetch what is already shown here."
+            )
+        } else {
+            feedback
+        };
         return Ok(CommitResult::Rejected { failed_op_index: anchored_op, feedback });
     }
 
@@ -799,6 +1018,110 @@ mod tests {
             name_range: Some(Range { start_line: sl, start_char: 16, end_line: sl, end_char: 19 }),
             children: vec![],
         }
+    }
+
+    /// `resolve_all_in` returns EVERY same-named symbol (incl. two in the same scope depth), while
+    /// `resolve_in` only sees the first — the difference that lets the MCP flag same-file collisions
+    /// instead of silently editing whichever came first.
+    #[test]
+    fn resolve_all_in_surfaces_same_file_collisions() {
+        // A named symbol with a `name`d child, ids given explicitly (mirrors real structure ids).
+        let scope = |iface: &str, line: u32| {
+            let mut field = fn_node("t.ts", "nodeId", line + 1, line + 1);
+            field.id = format!("t.ts#{iface}.nodeId");
+            let mut s = fn_node("t.ts", iface, line, line + 2);
+            s.id = format!("t.ts#{iface}");
+            s.children = vec![field];
+            s
+        };
+        // Two distinct symbols named `nodeId`, e.g. a field on each of two interfaces.
+        let nodes = vec![scope("IfaceA", 1), scope("IfaceB", 5)];
+
+        let all = resolve_all_in(&nodes, "nodeId");
+        assert_eq!(all, vec!["t.ts#IfaceA.nodeId", "t.ts#IfaceB.nodeId"], "both collisions returned, in source order");
+        // The old single-match helper hides the second one.
+        assert_eq!(resolve_in(&nodes, "nodeId").as_deref(), Some("t.ts#IfaceA.nodeId"));
+        // A unique name resolves to exactly one.
+        assert_eq!(resolve_all_in(&nodes, "IfaceB"), vec!["t.ts#IfaceB"]);
+        assert!(resolve_all_in(&nodes, "missing").is_empty());
+    }
+
+    #[test]
+    fn enclosing_symbol_picks_the_innermost() {
+        // A class spanning 1-20 with a method spanning 5-10; line 7 is inside the method.
+        let method = fn_node("t.ts", "run", 5, 10);
+        let mut class = fn_node("t.ts", "Svc", 1, 20);
+        class.id = "t.ts#Svc".into();
+        class.children = vec![{
+            let mut m = method;
+            m.id = "t.ts#Svc.run".into();
+            m
+        }];
+        let nodes = vec![class];
+        assert_eq!(enclosing_symbol(&nodes, 7).as_deref(), Some("t.ts#Svc.run")); // innermost
+        assert_eq!(enclosing_symbol(&nodes, 3).as_deref(), Some("t.ts#Svc")); // only the class here
+        assert_eq!(enclosing_symbol(&nodes, 99), None); // out of range
+    }
+
+    #[test]
+    fn insert_member_lands_first_in_the_block() {
+        use ci_vfs::Vfs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // An interface with a generic-bound `{` in `extends` — block_open must skip it and find the
+        // real body brace.
+        std::fs::write(
+            root.join("t.ts"),
+            "export interface Foo extends Bar<{ x: number }> {\n  id: string;\n}\n",
+        )
+        .unwrap();
+        let node = Node {
+            id: "t.ts#Foo".into(),
+            name: Some("Foo".into()),
+            kind: NodeKind::Symbol(SymbolKind::Interface),
+            range: Range { start_line: 1, start_char: 0, end_line: 3, end_char: 1 },
+            name_range: None,
+            children: vec![],
+        };
+        let structure_of = |_f: &str| vec![node.clone()];
+        let mut vfs = Vfs::new(root);
+        apply_structural(
+            &mut vfs,
+            &EditOp::InsertMember { node_id: "t.ts#Foo".into(), code: "tag: string;".into() },
+            &structure_of,
+        )
+        .unwrap();
+        let out = vfs.read(Path::new("t.ts")).unwrap();
+        // New member is inserted right after the BODY `{` (not the generic one), ahead of `id`.
+        assert!(
+            out.contains("> {\n  tag: string;\n  id: string;\n}"),
+            "member should land first in the body block, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn insert_member_rejects_a_blockless_node() {
+        use ci_vfs::Vfs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("t.ts"), "export type Id = string;\n").unwrap();
+        let node = Node {
+            id: "t.ts#Id".into(),
+            name: Some("Id".into()),
+            kind: NodeKind::Symbol(SymbolKind::TypeAlias),
+            range: Range { start_line: 1, start_char: 0, end_line: 1, end_char: 24 },
+            name_range: None,
+            children: vec![],
+        };
+        let structure_of = |_f: &str| vec![node.clone()];
+        let mut vfs = Vfs::new(root);
+        let err = apply_structural(
+            &mut vfs,
+            &EditOp::InsertMember { node_id: "t.ts#Id".into(), code: "x: string;".into() },
+            &structure_of,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no `{"), "expected a no-block error, got: {err}");
     }
 
     #[test]
@@ -836,8 +1159,9 @@ mod tests {
         assert_eq!(id(act("replace_node", Some("return")).unwrap()), "a.ts#add:return");
         assert_eq!(id(act("replace_node", Some("param.1")).unwrap()), "a.ts#add:param.1");
         assert_eq!(id(act("replace_node", Some("doc")).unwrap()), "a.ts#add:doc");
-        // an unknown / symbol-kind target leaves the whole-symbol id intact.
-        assert_eq!(id(act("replace_node", Some("function")).unwrap()), "a.ts#add");
+        // an unknown target is REJECTED (it used to fall through to the whole symbol — which
+        // silently applied sub-node code over the entire declaration); no target = whole symbol.
+        assert!(act("replace_node", Some("function")).is_err());
         assert_eq!(id(act("replace_node", None).unwrap()), "a.ts#add");
 
         // replace_text carries oldText/newText and honors `target` for sub-node scoping.
@@ -862,6 +1186,22 @@ mod tests {
             }
             o => panic!("expected ReplaceText, got {o:?}"),
         }
+    }
+
+    // Regression (bench T5 trajectory variance): a blast-radius diagnostic BELOW a same-file
+    // op's node must NOT be attributed to that op — the op-anchored branch never emits the
+    // ready-to-copy `fix:`, so a swallowed site forces the agent back into read/list_anchors.
+    // Un-anchored is the designed path: enclosing symbol + fix.
+    #[test]
+    fn anchor_ignores_diags_outside_the_ops_node_range() {
+        let ops = vec![EditOp::InsertInBody { node_id: "a.ts#makeEntry".into(), code: "x".into(), after: None }];
+        let structure_of = |_f: &str| vec![fn_node("a.ts", "makeEntry", 50, 70), fn_node("a.ts", "extractAll", 100, 140)];
+        // Same file, below the op's node: un-anchored (falls to the enclosing-symbol + fix path).
+        let below = Diag { file: "a.ts".into(), code: 2741, message: "missing".into(), line: 135 };
+        assert_eq!(anchor(&below, &ops, &structure_of), None);
+        // Inside the op's node: anchored to it, as before.
+        let inside = Diag { file: "a.ts".into(), code: 2741, message: "missing".into(), line: 60 };
+        assert_eq!(anchor(&inside, &ops, &structure_of), Some((0, "a.ts#makeEntry".into())));
     }
 
     #[test]
@@ -952,6 +1292,185 @@ mod tests {
         fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
             Ok(json!({}))
         }
+    }
+
+    #[test]
+    fn unknown_target_is_rejected_never_widened() {
+        let resolve = |_: &str, _: Option<&str>, _: Option<&str>| Some("a.ts#foo".to_string());
+        let act = |target: Option<&str>| Action {
+            path: String::new(),
+            action: "replace_node".into(),
+            target: target.map(str::to_string),
+            name: Some("foo".into()),
+            value: Some("x".into()),
+            old_text: None,
+            new_text: None,
+        };
+        // A bogus target must error — falling back to the whole symbol would apply sub-node code
+        // over the entire declaration.
+        for bad in ["function", "params", "param 1", "param.x", "first"] {
+            let err = action_to_op(&act(Some(bad)), resolve).unwrap_err().to_string();
+            assert!(err.contains("unknown target"), "target {bad:?} must be rejected, got: {err}");
+        }
+        // Valid targets narrow to the sub-node; none/empty stays the whole symbol.
+        for (t, want) in [("body", "a.ts#foo:body"), ("returnType", "a.ts#foo:return"), ("param.1", "a.ts#foo:param.1")] {
+            match action_to_op(&act(Some(t)), resolve).unwrap() {
+                EditOp::ReplaceNode { node_id, .. } => assert_eq!(node_id, want),
+                other => panic!("unexpected op: {other:?}"),
+            }
+        }
+        for whole in [None, Some("")] {
+            match action_to_op(&act(whole), resolve).unwrap() {
+                EditOp::ReplaceNode { node_id, .. } => assert_eq!(node_id, "a.ts#foo"),
+                other => panic!("unexpected op: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn suggest_fix_picks_an_inside_anchor_for_block_openers() {
+        // Offending line opens a `{ …` block -> anchor on the first line INSIDE it, trimmed.
+        let w = vec!["  return {", "    id: symbolId(name),", "    name,"];
+        let fix = suggest_fix("b.ts#makeEntry", &w).unwrap();
+        assert!(fix.contains(r#""oldText":"id: symbolId(name),""#), "inside-block anchor: {fix}");
+        assert!(fix.contains(r#""name":"b.ts#makeEntry""#));
+        // Plain offending line -> anchor on the line itself.
+        let w = vec!["  const x = build(entry);"];
+        let fix = suggest_fix("b.ts#run", &w).unwrap();
+        assert!(fix.contains(r#""oldText":"const x = build(entry);""#), "own-line anchor: {fix}");
+        // No source window -> no suggestion.
+        assert_eq!(suggest_fix("b.ts#run", &[]), None);
+    }
+
+    // A gate engine that flags b.ts once the edit's marker text is in play — after-pass sees the
+    // overlay (marker present -> diag), baseline-pass sees disk (absent -> clean), so the diag is
+    // "new" and the rejection feedback is built.
+    struct FanoutEngine;
+    impl GateEngine for FanoutEngine {
+        fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
+            if files.iter().any(|(_, c)| c.contains("nameLower")) {
+                return Ok(vec![Diag {
+                    file: "b.ts".into(),
+                    code: 2741,
+                    message: "Property 'nameLower' is missing in type".into(),
+                    line: 2,
+                }]);
+            }
+            Ok(vec![])
+        }
+        fn rename(&mut self, _f: &str, _l: u32, _c: u32, _n: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    // Baseline: ONE instance of an error. After the edit: TWO instances with the identical
+    // key (same file+code+message — the key has no line, since edits shift lines). Set-based
+    // diffing excused BOTH as pre-existing — a false accept; count-based diffing flags the
+    // second instance as new and rejects.
+    struct DupDiagEngine;
+    impl GateEngine for DupDiagEngine {
+        fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
+            let d = |line| Diag {
+                file: "a.ts".into(),
+                code: 2322,
+                message: "Type 'string' is not assignable to type 'number'".into(),
+                line,
+            };
+            // Baseline pass sees disk content; the after pass sees the overlay with the marker.
+            if files.iter().any(|(_, c)| c.contains("NEW_BAD_SITE")) {
+                Ok(vec![d(2), d(5)])
+            } else {
+                Ok(vec![d(2)])
+            }
+        }
+        fn rename(&mut self, _f: &str, _l: u32, _c: u32, _n: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+    }
+
+    #[test]
+    fn duplicate_of_a_preexisting_error_is_still_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.ts"), "export function foo(): void {\n  const x: number = 'old';\n  return;\n}\n").unwrap();
+
+        let structure_of = |f: &str| if f == "a.ts" { vec![fn_node("a.ts", "foo", 1, 4)] } else { vec![] };
+        let no_imports = |_: &str| Vec::<String>::new();
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        let res = commit_edits(
+            root,
+            &[EditOp::ReplaceText {
+                node_id: "a.ts#foo".into(),
+                old_text: "return;".into(),
+                new_text: "const y: number = 'NEW_BAD_SITE';\n  return;".into(),
+            }],
+            &structure_of,
+            &mut DupDiagEngine,
+            &opts,
+            &no_imports,
+        )
+        .unwrap();
+
+        let CommitResult::Rejected { feedback, .. } = res else {
+            panic!("a second instance of a pre-existing error must reject, got {res:?}");
+        };
+        assert!(feedback.contains("TS2322"), "the new instance is surfaced: {feedback}");
+        // Exactly ONE instance is new — the baseline one stays excused.
+        assert_eq!(feedback.matches("TS2322").count(), 1, "only the extra instance is new: {feedback}");
+    }
+
+    #[test]
+    fn rejection_carries_a_ready_to_copy_fix_per_blast_radius_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.ts"), "export interface SymbolEntry {\n  id: string;\n  name: string;\n}\n").unwrap();
+        fs::write(
+            root.join("b.ts"),
+            "export function makeEntry(name: string): SymbolEntry {\n  return {\n    id: symbolId(name),\n    name,\n  };\n}\n",
+        )
+        .unwrap();
+
+        let structure_of = |f: &str| match f {
+            "a.ts" => vec![fn_node("a.ts", "SymbolEntry", 1, 4)],
+            "b.ts" => vec![fn_node("b.ts", "makeEntry", 1, 6)],
+            _ => vec![],
+        };
+        let reverse = |f: &str| if f == "a.ts" { vec!["b.ts".to_string()] } else { vec![] };
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        let res = commit_edits(
+            root,
+            &[EditOp::ReplaceText {
+                node_id: "a.ts#SymbolEntry".into(),
+                old_text: "name: string;".into(),
+                new_text: "name: string;\n  nameLower: string;".into(),
+            }],
+            &structure_of,
+            &mut FanoutEngine,
+            &opts,
+            &reverse,
+        )
+        .unwrap();
+
+        let CommitResult::Rejected { feedback, .. } = res else { panic!("expected rejection, got {res:?}") };
+        // The untouched construction site is named by its enclosing symbol …
+        assert!(feedback.contains("(in b.ts#makeEntry)"), "enclosing symbol tag: {feedback}");
+        // … its source window is shown verbatim …
+        assert!(feedback.contains("    id: symbolId(name),"), "verbatim snippet: {feedback}");
+        // … and the ready-to-copy action carries the symbol + an INSIDE-the-literal anchor, so the
+        // agent only fills in `value` (no read_node, no indentation reasoning).
+        assert!(feedback.contains(r#""action":"insert_in_body""#), "fix action: {feedback}");
+        assert!(feedback.contains(r#""name":"b.ts#makeEntry""#), "fix target: {feedback}");
+        assert!(feedback.contains(r#""oldText":"id: symbolId(name),""#), "fix anchor: {feedback}");
+        // Nothing was written — the reject left disk untouched.
+        assert!(!fs::read_to_string(root.join("a.ts")).unwrap().contains("nameLower"));
     }
 
     #[test]
