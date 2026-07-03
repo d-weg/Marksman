@@ -156,15 +156,38 @@ pub struct TsProvider {
 /// Start the lightest available write engine for `root`: ts-morph in-process (synchronous,
 /// no LSP settle race) when its sidecar can start, else the generic LSP server. Override with
 /// `CI_EDIT_ENGINE=lsp|tsmorph`.
+/// Engine preference: **tsgo → ts-morph → tsls**. tsgo (the TS7 native LSP) gates ~138x
+/// faster warm than the alternatives with identical verdicts (docs/benchmarks.md), but is
+/// auto-picked only when it needs NO network (`CI_TSGO`, or `tsgo` on PATH) — a surprise npx
+/// download doesn't belong in the middle of someone's first edit. `CI_EDIT_ENGINE` forces one
+/// tier: `tsgo` | `tsmorph` | `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names).
 fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
     let pref = std::env::var("CI_EDIT_ENGINE").unwrap_or_default();
-    if pref != "lsp" {
-        match tsmorph::TsMorphClient::start(root) {
-            Ok(c) => return Ok(Box::new(c)),
-            Err(e) if pref == "tsmorph" => return Err(e), // forced: surface the failure
-            Err(_) => {} // auto: fall back to LSP
+    match pref.as_str() {
+        "tsgo" => return Ok(Box::new(ci_lsp::LspClient::start(root, TsProvider::tsgo_lsp_command())?)),
+        "lsp" => return start_tsls(root),
+        _ => {}
+    }
+    if pref.is_empty() {
+        if let Some(bin) = local_tsgo() {
+            let mut c = Command::new(bin);
+            c.args(["--lsp", "-stdio"]);
+            match ci_lsp::LspClient::start(root, c) {
+                Ok(client) => return Ok(Box::new(client)),
+                Err(e) => eprintln!("[lang-ts] local tsgo failed to start ({e}); falling back to ts-morph"),
+            }
         }
     }
+    match tsmorph::TsMorphClient::start(root) {
+        Ok(c) => return Ok(Box::new(c)),
+        Err(e) if pref == "tsmorph" => return Err(e), // forced: surface the failure
+        Err(_) => {} // auto: fall back to LSP
+    }
+    start_tsls(root)
+}
+
+/// The tsls fallback tier, with the toolchain-aware error message.
+fn start_tsls(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
     match ci_lsp::LspClient::start(root, TsProvider::ts_lsp_command()) {
         Ok(c) => Ok(Box::new(c)),
         // Both engines need Node; when the toolchain itself is the problem, say THAT (with the
@@ -174,6 +197,16 @@ fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
             None => Err(e),
         },
     }
+}
+
+/// A tsgo binary that costs nothing to use: `CI_TSGO`, else a `tsgo` on PATH. `None` means
+/// the auto tier skips tsgo (explicit `CI_EDIT_ENGINE=tsgo` may still fetch via npx).
+fn local_tsgo() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CI_TSGO") {
+        return Some(PathBuf::from(bin));
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join("tsgo")).find(|p| p.is_file())
 }
 
 impl TsProvider {
@@ -465,7 +498,30 @@ impl LanguageProvider for TsProvider {
                             }
                         }
                     }
-                    Ok(None) => {} // engine can't re-describe (LSP fallback): reads lag until reindex
+                    Ok(None) => {
+                        // LSP engines (tsgo/tsls) can't re-describe their live project the way
+                        // the ts-morph sidecar does. Approximate from tree-sitter on CURRENT
+                        // disk — the same read shape TsTreeGated serves — so reads track the
+                        // commit instead of serving pre-edit state; scip fidelity (flattened
+                        // barrels, semantic edges) returns at the next reindex.
+                        let fb = lang_fallback::FallbackProvider::new(&self.root, lang_fallback::FbLang::Ts);
+                        let graph = fb.import_graph().unwrap_or_default();
+                        if let Ok(mut m) = self.fresh.lock() {
+                            for rel in &rels {
+                                let deleted = !self.root.join(rel).exists();
+                                let nodes = if deleted {
+                                    vec![]
+                                } else {
+                                    fb.structure(Path::new(rel)).unwrap_or_default()
+                                };
+                                let imports = graph.get(&PathBuf::from(rel)).cloned().unwrap_or_default();
+                                m.insert(
+                                    rel.clone(),
+                                    FileSummary { path: rel.clone(), deleted, nodes, imports },
+                                );
+                            }
+                        }
+                    }
                     Err(e) => eprintln!("[lang-ts] post-edit read refresh failed ({e}); structure/import_graph lag until the next reindex"),
                 }
             }
@@ -925,5 +981,64 @@ mod tests {
         let g = provider.import_graph().unwrap();
         let edges = g.get(&PathBuf::from("src/calc.ts")).expect("new file has graph edges");
         assert!(edges.contains(&PathBuf::from("src/math.ts")), "new import edge visible: {edges:?}");
+    }
+
+    // Rename parity across gate engines: the SAME cross-file rename through ts-morph and
+    // through tsgo must leave byte-identical trees — the check that gates flipping the
+    // default engine to tsgo. Needs CI_TSGO (skips otherwise); mutates CI_EDIT_ENGINE, so
+    // run the ignored tier single-threaded if adding more env-dependent tests.
+    // #[ignore]; `CI_TSGO=… cargo test -p lang-ts -- --ignored rename_parity`
+    #[test]
+    #[ignore]
+    fn rename_parity_tsmorph_vs_tsgo() {
+        if std::env::var("CI_TSGO").is_err() {
+            eprintln!("SKIP rename_parity: set CI_TSGO to a tsgo binary");
+            return;
+        }
+        let write_fixture = |root: &Path| {
+            fs::create_dir_all(root.join("src")).unwrap();
+            fs::write(
+                root.join("tsconfig.json"),
+                r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true},"include":["src"]}"#,
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/math.ts"),
+                "export function add(a: number, b: number): number {\n  return a + b;\n}\n",
+            )
+            .unwrap();
+            fs::write(
+                root.join("src/app.ts"),
+                "import { add } from \"./math.js\";\nexport const total = add(1, 2);\nexport const twice = add(total, total);\n",
+            )
+            .unwrap();
+        };
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let rename = EditOp::Rename { node_id: "src/math.ts#add".into(), new_name: "sum".into() };
+
+        let run_with_engine = |engine: &str| -> (String, String) {
+            let saved = std::env::var("CI_EDIT_ENGINE").ok();
+            std::env::set_var("CI_EDIT_ENGINE", engine);
+            let dir = tempfile::tempdir().unwrap();
+            write_fixture(dir.path());
+            let p = TsProvider::index(dir.path()).expect("scip-typescript indexing");
+            let res = p.apply_edits(std::slice::from_ref(&rename), &opts).unwrap();
+            match saved {
+                Some(v) => std::env::set_var("CI_EDIT_ENGINE", v),
+                None => std::env::remove_var("CI_EDIT_ENGINE"),
+            }
+            assert!(matches!(res, CommitResult::Ok { .. }), "[{engine}] rename must commit: {res:?}");
+            (
+                fs::read_to_string(dir.path().join("src/math.ts")).unwrap(),
+                fs::read_to_string(dir.path().join("src/app.ts")).unwrap(),
+            )
+        };
+
+        let (math_m, app_m) = run_with_engine("tsmorph");
+        let (math_g, app_g) = run_with_engine("tsgo");
+        assert!(math_m.contains("sum") && !math_m.contains("add"), "definition renamed:\n{math_m}");
+        assert!(app_m.contains("sum(1, 2)"), "caller renamed:\n{app_m}");
+        assert_eq!(math_m, math_g, "math.ts must be byte-identical across engines");
+        assert_eq!(app_m, app_g, "app.ts must be byte-identical across engines");
     }
 }
