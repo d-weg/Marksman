@@ -745,6 +745,8 @@ impl Server {
         // Pre-edit text of every node a replace_node/set_body op overwrites, captured while
         // the disk is pristine; appended to gate REJECTS (see replaced_extent_note).
         let mut replaced_notes: Vec<String> = Vec::new();
+        // Symbol ids whose post-commit block is echoed back in the SUCCESS response.
+        let mut echo_ids: Vec<String> = Vec::new();
         for (ai, a) in actions.iter().enumerate() {
             // Reject unknown fields UP FRONT: a misspelled field (`old_text`, `after`) would
             // otherwise be silently dropped — and for insert_in_body a dropped `after` doesn't
@@ -853,6 +855,15 @@ impl Server {
                 if let Some(id) = name.as_deref().filter(|n| n.contains('#')) {
                     if let Some(note) = replaced_extent_note(&self.root, &registry, ai, act, id) {
                         replaced_notes.push(note);
+                    }
+                }
+            }
+            // Symbol-anchored CONTENT edits get their block echoed back post-commit (see
+            // post_edit_echo) — renames/moves have the scan, file ops have nothing to echo.
+            if symbol_action && act != "rename" {
+                if let Some(id) = name.as_deref().filter(|n| n.contains('#')) {
+                    if !echo_ids.contains(&id.to_string()) {
+                        echo_ids.push(id.to_string());
                     }
                 }
             }
@@ -1014,14 +1025,16 @@ impl Server {
                 if preexisting_in_radius.len() > 12 {
                     sites.push(format!("  … and {} more", preexisting_in_radius.len() - 12));
                 }
+                let echo = if !dry_run { self.post_edit_echo(&registry, &echo_ids) } else { None };
                 Ok(format!(
                     "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; no NEW errors introduced — but {} PRE-EXISTING \
                      error(s) remain in the touched files (they predate this batch and did not block it). Fix them next or \
-                     the build stays broken:\n{}\nFiles changed:\n{}",
+                     the build stays broken:\n{}{}\nFiles changed:\n{}",
                     if dry_run { " (dry run — nothing written yet)" } else { "" },
                     changed_files.len(),
                     preexisting_in_radius.len(),
                     sites.join("\n"),
+                    echo.unwrap_or_default(),
                     changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
                 ))
             }
@@ -1032,18 +1045,22 @@ impl Server {
                 // evidence with copyable fixes, instead of overclaiming and letting the stale
                 // mention surface later (bench type-rename: a doc-comment kept the old name
                 // while the response forbade the grep that would have caught it).
-                let scan = if !dry_run {
-                    self.rename_scan_section(&registry, &renames, true)
+                let (scan, echo) = if !dry_run {
+                    (
+                        self.rename_scan_section(&registry, &renames, true),
+                        self.post_edit_echo(&registry, &echo_ids),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
                 Ok(format!(
                     "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
                      including files that import what changed. rename/move already updated every reference/import across the \
-                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{}\nFiles changed:\n{}",
+                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{}{}\nFiles changed:\n{}",
                     if dry_run { " (dry run — nothing written yet)" } else { "" },
                     changed_files.len(),
                     scan.unwrap_or_default(),
+                    echo.unwrap_or_default(),
                     changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
                 ))
             }
@@ -1054,8 +1071,12 @@ impl Server {
             // grep/read per task: the T8 bench arm lost to baseline on exactly that).
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
                 let scan = if !dry_run {
-                    self.rename_scan_section(&registry, &renames, false)
-                        .unwrap_or_else(|| "\nRun the project's own checks if correctness is uncertain.\n".to_string())
+                    format!(
+                        "{}{}",
+                        self.rename_scan_section(&registry, &renames, false)
+                            .unwrap_or_else(|| "\nRun the project's own checks if correctness is uncertain.\n".to_string()),
+                        self.post_edit_echo(&registry, &echo_ids).unwrap_or_default()
+                    )
                 } else {
                     "\nRun the project's own checks if correctness is uncertain.\n".to_string()
                 };
@@ -1164,9 +1185,10 @@ impl Server {
         let guidance = match (gated, any_hits) {
             (true, true) => {
                 "Code references are COMPLETE (type-checked) — the lines above are comment/string/doc \
-                 mentions, which no compiler rename touches. Update them only if the request covers \
-                 prose mentions too; to update one, re-issue its `fix` action VERBATIM — all of them \
-                 in ONE apply_edits batch. Do NOT grep or re-read to double-check."
+                 mentions, which no compiler rename touches. Stale prose misleads the next reader: \
+                 update these too unless the user explicitly wants the old wording kept. Re-issue each \
+                 `fix` action VERBATIM — all of them in ONE apply_edits batch. Do NOT grep or re-read \
+                 to double-check."
             }
             (true, false) => {
                 "Even comments and strings carry no stale mention — the rename(s) are COMPLETE \
@@ -1174,9 +1196,10 @@ impl Server {
             }
             (false, true) => {
                 "The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
-                 to verify the rename(s). Comment/string mentions are fine to LEAVE (only update them if \
-                 asked); code references should be fixed. To fix any line, re-issue its `fix` action \
-                 VERBATIM — all of them in ONE apply_edits batch."
+                 to verify the rename(s). Code references MUST be fixed; comment/doc mentions SHOULD \
+                 follow the rename too (stale prose misleads the next reader) unless the user wants the \
+                 old wording kept. To fix any line, re-issue its `fix` action VERBATIM — all of them in \
+                 ONE apply_edits batch."
             }
             (false, false) => {
                 "The scan above already re-checked the whole repo — the rename(s) are COMPLETE. Do NOT \
@@ -1186,6 +1209,50 @@ impl Server {
         Some(format!(
             "\nrename verification (server-side scan of EVERY file of that language):\n{}\n{guidance}\n",
             lines.join("\n")
+        ))
+    }
+
+    /// Post-commit echo of each edited symbol's block AS COMMITTED (read back from disk):
+    /// the agent verifies the edit against the real result — placement, scope, and the PROSE
+    /// around it — without a read_node round-trip. When logic changes, a comment that still
+    /// describes the old behavior is part of the diff; showing the whole block is what makes
+    /// a now-stale comment visible in the same turn.
+    fn post_edit_echo(&self, registry: &ProviderRegistry, ids: &[String]) -> Option<String> {
+        if ids.is_empty() {
+            return None;
+        }
+        let mut blocks = Vec::new();
+        for id in ids.iter().take(4) {
+            let file = file_of(id).to_string();
+            let Ok(nodes) = registry.structure(Path::new(&file)) else { continue };
+            // Gone from the tree (e.g. the node itself was deleted/renamed away): nothing to echo.
+            let Some(node) = find_node(&nodes, id) else { continue };
+            let Ok(content) = std::fs::read_to_string(self.root.join(&file)) else { continue };
+            let text = slice_lines(&content, node.range.start_line, node.range.end_line);
+            let n = text.lines().count();
+            let shown = if n <= 30 {
+                text
+            } else {
+                let head: Vec<&str> = text.lines().take(30).collect();
+                format!("{}\n… ({} more lines — read_node {} if you must see them)", head.join("\n"), n - 30, id)
+            };
+            blocks.push(format!(
+                "{id} (L{}-{}):\n```\n{shown}\n```",
+                node.range.start_line, node.range.end_line
+            ));
+        }
+        if blocks.is_empty() {
+            return None;
+        }
+        let more = if ids.len() > 4 {
+            format!("… and {} more edited symbol(s).\n", ids.len() - 4)
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "\npost-edit state (as committed — verify your intent against THIS, no re-read needed):\n{}\n{more}If a comment or doc line in/above the block still describes the OLD behavior, update it in your \
+             next batch — when logic changes, stale prose is part of the diff.\n",
+            blocks.join("\n")
         ))
     }
 }
