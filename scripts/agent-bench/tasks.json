@@ -1,70 +1,148 @@
 [
-  {
-    "id": "T1-rename",
-    "prompt": "Rename the function reciprocalRankFusion to fuseRanks everywhere in this codebase (definition and all call sites). Keep everything compiling.",
-    "check": "! grep -rq 'reciprocalRankFusion' src && grep -rq 'fuseRanks' src/rrf.ts && npm run -s typecheck",
-    "why": "Cross-file rename — Marksman's strongest case (one apply_edits vs N str_replace)."
-  },
-  {
-    "id": "T2-move",
-    "prompt": "Move the file src/rrf.ts to src/fusion/rrf.ts and update every import that references it. Keep everything compiling.",
-    "check": "test -f src/fusion/rrf.ts && ! test -f src/rrf.ts && npm run -s typecheck",
-    "why": "File move + importer rewrite — exercises move_file / willRenameFiles."
-  },
-  {
-    "id": "T3-locate-edit",
-    "prompt": "In the BM25 class, change the default value of the k1 field from 1.5 to 1.2. Change nothing else.",
-    "check": "grep -Eq 'k1\\s*=\\s*1\\.2' src/bm25.ts && npm run -s typecheck",
-    "why": "Locate-then-edit a small change — measures the find cost (retrieval vs grep)."
-  },
-  {
-    "id": "T4-body-edit",
-    "prompt": "In the tokenize function (src/bm25.ts), raise the minimum token length so it keeps only tokens LONGER THAN 2 characters instead of longer than 1. There are two length checks inside the function body — `lower.length > 1` and `lp.length > 1` — change both to `> 2`. Change nothing else and keep it compiling.",
-    "check": "grep -Eq 'lower\\.length > 2' src/bm25.ts && grep -Eq 'lp\\.length > 2' src/bm25.ts && ! grep -Eq 'lower\\.length > 1' src/bm25.ts && ! grep -Eq 'lp\\.length > 1' src/bm25.ts && grep -Eq 'parts\\.length > 1' src/bm25.ts && npm run -s typecheck",
-    "why": "Edit confined to ONE function body (two spots) — exercises surgical sub-node edits (set_body / replace_node target:body) vs re-emitting the whole function."
-  },
-  {
-    "id": "T5-schema-field",
-    "prompt": "Add a required field `nameLower: string` to the SymbolEntry interface in src/types.ts — the lowercase form of the symbol's `name` — and set it at every place a SymbolEntry object is constructed (use name.toLowerCase()). Keep everything compiling.",
-    "check": "grep -Eq 'nameLower: string' src/types.ts && grep -q nameLower src/indexer.ts && grep -q nameLower src/symbols.ts && npm run -s typecheck",
-    "why": "Wide schema change: a REQUIRED field makes tsc fail until every construction site is updated — the first task that actually exercises the type-check GATE (nothing commits until the blast radius compiles) and the find-all-construction-sites step. `nameLower: string` (not `nameLower?:`) enforces required, so a passing tsc proves both sites were updated — ungameable."
-  },
-  {
-    "id": "T6-type-rename",
-    "prompt": "Rename the SymbolEntry interface to CodeSymbol everywhere in the codebase — its definition in src/types.ts and every reference and import across all files. Keep everything compiling.",
-    "check": "! grep -rq 'SymbolEntry' src && grep -q 'interface CodeSymbol' src/types.ts && npm run -s typecheck",
-    "why": "Type rename propagating across 5 files — scaled-up T1 (a function rename in ~3 files). Baseline must chase every reference/import and typecheck-iterate; a gated structural rename does the whole blast radius in one call. tsc + zero-SymbolEntry-remaining is ungameable."
-  },
-  {
-    "id": "T7-multilang",
-    "fixture": "fixture-multilang",
-    "arms": ["baseline", "rust"],
-    "prompt": "This repo mixes Rust and TypeScript. Do both renames, everywhere (definition, call sites, imports): 1) rename the Rust function percentile to quantile; 2) rename the TypeScript function formatLatency to renderLatency. Keep the Rust crate passing `cargo check` and the TypeScript passing `npm run typecheck`.",
-    "check": "! grep -rEq 'percentile\\(' src && grep -q 'pub fn quantile' src/stats.rs && cargo check -q && ! grep -rq 'formatLatency' web && grep -q 'renderLatency' web/format.ts && grep -q 'renderLatency' web/client.ts && npm run -s typecheck",
-    "why": "Multilanguage: ONE session, edits gated by TWO compilers (rust-analyzer + tsc) via per-file provider dispatch, on a self-contained mixed fixture (`fixture` field — copied to a throwaway git repo per run). The Node oracle is TS-only, so `arms` restricts to baseline vs rust."
-  },
-  {
-    "id": "T8-fallback",
-    "fixture": "fixture-multilang",
-    "arms": ["baseline", "rust"],
-    "prompt": "Two renames, everywhere in this repo (definitions and call sites): 1) in the Python job code, rename the function rollup_day to daily_rollup; 2) in the Go tool code, rename the function bucketLabel to tierLabel. Keep the Python byte-compilable.",
-    "check": "! grep -rEq 'rollup_day\\(' jobs && grep -q 'def daily_rollup' jobs/rollup.py && grep -q 'daily_rollup(day)' jobs/rollup.py && python3 -m py_compile jobs/rollup.py && ! grep -rEq 'bucketLabel\\(' tools && grep -q 'func tierLabel' tools/latency.go && grep -q 'tierLabel(u)' tools/latency.go",
-    "why": "The GENERIC fallback provider: Python + Go in one session, neither with a native integration — structural tree-sitter edits, honestly UNGATED (the tool must say so). Measures whether the fallback still beats grep+Edit on find+edit efficiency. The Node oracle can't index either language, so arms are baseline vs rust."
-  },
-  {
-    "id": "T9-barrel",
-    "fixture": "fixture-barrels",
-    "arms": ["baseline", "rust"],
-    "prompt": "Add a required field `burst: number` to the QuotaPolicy interface in src/core/policy.ts — the extra requests a caller may briefly make above the steady limit — and set it to 0 at every place a QuotaPolicy object is constructed. Keep everything compiling.",
-    "check": "grep -Eq 'burst: number' src/core/policy.ts && grep -q burst src/middleware/throttle.ts && grep -q burst src/api/admin.ts && grep -q burst src/reporting/usage.ts && grep -q burst src/cli/config.ts && npm run -s typecheck",
-    "why": "SCIP's claimed margin, isolated: every consumer imports QuotaPolicy through a BARREL (core/index.ts `export *`), and the gate expands ONE reverse-import hop. SCIP's semantic graph edges consumers directly to policy.ts (barrel flattened), so the reject enumerates every construction site; a syntactic import graph (CI_TS_MODE=treesitter-gated) sees only consumer->barrel->policy — the barrel itself never errors on a new required field, so the barrel consumers sit OUTSIDE the gate and a commit can claim clean while tsc fails. Run in `full` vs `treesitter-gated` to measure whether the SCIP read path earns its keep; tsc + per-file burst greps are ungameable."
-  },
-  {
-    "id": "T10-monorepo",
-    "fixture": "fixture-monorepo",
-    "arms": ["baseline", "rust"],
-    "prompt": "This is a workspace monorepo (packages/core is imported by the other packages as `@acme/core`). Add a required field `timeoutMs: number` to the RetryPolicy interface in packages/core/src/policy.ts — the per-attempt timeout — and set it to 1000 at every place a RetryPolicy object is constructed, in every package. Keep `npm run typecheck` passing.",
-    "check": "grep -Eq 'timeoutMs: number' packages/core/src/policy.ts && grep -q timeoutMs packages/gateway/src/proxy.ts && grep -q timeoutMs packages/reports/src/digest.ts && npm run -s typecheck",
-    "why": "The MONOREPO seam: consumers import core via a BARE workspace specifier (`@acme/core`, root-tsconfig `paths` alias), which the syntactic resolver cannot follow at all — a bare specifier looks like a third-party package, so the fallback graph has ZERO cross-package edges and no transitive closure recovers them (edge-existence, not radius depth). SCIP resolves the alias through the TS compiler, so full mode's reject enumerates the construction sites in OTHER packages (e2e-verified: monorepo_bare_specifier test in lang-ts). Run `full` vs `CI_TS_MODE=treesitter-gated` — this is where the SCIP read path is load-bearing, not margin."
-  }
+ {
+  "id": "T1-rename",
+  "prompt": "Rename the function reciprocalRankFusion to fuseRanks everywhere in this codebase (definition and all call sites). Keep everything compiling.",
+  "check": "! grep -rq 'reciprocalRankFusion' src && grep -rq 'fuseRanks' src/rrf.ts && npm run -s typecheck",
+  "why": "Cross-file rename — Marksman's strongest case (one apply_edits vs N str_replace)."
+ },
+ {
+  "id": "T2-move",
+  "prompt": "Move the file src/rrf.ts to src/fusion/rrf.ts and update every import that references it. Keep everything compiling.",
+  "check": "test -f src/fusion/rrf.ts && ! test -f src/rrf.ts && npm run -s typecheck",
+  "why": "File move + importer rewrite — exercises move_file / willRenameFiles."
+ },
+ {
+  "id": "T3-locate-edit",
+  "prompt": "In the BM25 class, change the default value of the k1 field from 1.5 to 1.2. Change nothing else.",
+  "check": "grep -Eq 'k1\\s*=\\s*1\\.2' src/bm25.ts && npm run -s typecheck",
+  "why": "Locate-then-edit a small change — measures the find cost (retrieval vs grep)."
+ },
+ {
+  "id": "T4-body-edit",
+  "prompt": "In the tokenize function (src/bm25.ts), raise the minimum token length so it keeps only tokens LONGER THAN 2 characters instead of longer than 1. There are two length checks inside the function body — `lower.length > 1` and `lp.length > 1` — change both to `> 2`. Change nothing else and keep it compiling.",
+  "check": "grep -Eq 'lower\\.length > 2' src/bm25.ts && grep -Eq 'lp\\.length > 2' src/bm25.ts && ! grep -Eq 'lower\\.length > 1' src/bm25.ts && ! grep -Eq 'lp\\.length > 1' src/bm25.ts && grep -Eq 'parts\\.length > 1' src/bm25.ts && npm run -s typecheck",
+  "why": "Edit confined to ONE function body (two spots) — exercises surgical sub-node edits (set_body / replace_node target:body) vs re-emitting the whole function."
+ },
+ {
+  "id": "T5-schema-field",
+  "prompt": "Add a required field `nameLower: string` to the SymbolEntry interface in src/types.ts — the lowercase form of the symbol's `name` — and set it at every place a SymbolEntry object is constructed (use name.toLowerCase()). Keep everything compiling.",
+  "check": "grep -Eq 'nameLower: string' src/types.ts && grep -q nameLower src/indexer.ts && grep -q nameLower src/symbols.ts && npm run -s typecheck",
+  "why": "Wide schema change: a REQUIRED field makes tsc fail until every construction site is updated — the first task that actually exercises the type-check GATE (nothing commits until the blast radius compiles) and the find-all-construction-sites step. `nameLower: string` (not `nameLower?:`) enforces required, so a passing tsc proves both sites were updated — ungameable."
+ },
+ {
+  "id": "T6-type-rename",
+  "prompt": "Rename the SymbolEntry interface to CodeSymbol everywhere in the codebase — its definition in src/types.ts and every reference and import across all files. Keep everything compiling.",
+  "check": "! grep -rq 'SymbolEntry' src && grep -q 'interface CodeSymbol' src/types.ts && npm run -s typecheck",
+  "why": "Type rename propagating across 5 files — scaled-up T1 (a function rename in ~3 files). Baseline must chase every reference/import and typecheck-iterate; a gated structural rename does the whole blast radius in one call. tsc + zero-SymbolEntry-remaining is ungameable."
+ },
+ {
+  "id": "T7-multilang",
+  "fixture": "fixture-multilang",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "This repo mixes Rust and TypeScript. Do both renames, everywhere (definition, call sites, imports): 1) rename the Rust function percentile to quantile; 2) rename the TypeScript function formatLatency to renderLatency. Keep the Rust crate passing `cargo check` and the TypeScript passing `npm run typecheck`.",
+  "check": "! grep -rEq 'percentile\\(' src && grep -q 'pub fn quantile' src/stats.rs && cargo check -q && ! grep -rq 'formatLatency' web && grep -q 'renderLatency' web/format.ts && grep -q 'renderLatency' web/client.ts && npm run -s typecheck",
+  "why": "Multilanguage: ONE session, edits gated by TWO compilers (rust-analyzer + tsc) via per-file provider dispatch, on a self-contained mixed fixture (`fixture` field — copied to a throwaway git repo per run). The Node oracle is TS-only, so `arms` restricts to baseline vs rust."
+ },
+ {
+  "id": "T8-fallback",
+  "fixture": "fixture-multilang",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "Two renames, everywhere in this repo (definitions and call sites): 1) in the Python job code, rename the function rollup_day to daily_rollup; 2) in the Go tool code, rename the function bucketLabel to tierLabel. Keep the Python byte-compilable.",
+  "check": "! grep -rEq 'rollup_day\\(' jobs && grep -q 'def daily_rollup' jobs/rollup.py && grep -q 'daily_rollup(day)' jobs/rollup.py && python3 -m py_compile jobs/rollup.py && ! grep -rEq 'bucketLabel\\(' tools && grep -q 'func tierLabel' tools/latency.go && grep -q 'tierLabel(u)' tools/latency.go",
+  "why": "The GENERIC fallback provider: Python + Go in one session, neither with a native integration — structural tree-sitter edits, honestly UNGATED (the tool must say so). Measures whether the fallback still beats grep+Edit on find+edit efficiency. The Node oracle can't index either language, so arms are baseline vs rust."
+ },
+ {
+  "id": "T9-barrel",
+  "fixture": "fixture-barrels",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "Add a required field `burst: number` to the QuotaPolicy interface in src/core/policy.ts — the extra requests a caller may briefly make above the steady limit — and set it to 0 at every place a QuotaPolicy object is constructed. Keep everything compiling.",
+  "check": "grep -Eq 'burst: number' src/core/policy.ts && grep -q burst src/middleware/throttle.ts && grep -q burst src/api/admin.ts && grep -q burst src/reporting/usage.ts && grep -q burst src/cli/config.ts && npm run -s typecheck",
+  "why": "SCIP's claimed margin, isolated: every consumer imports QuotaPolicy through a BARREL (core/index.ts `export *`), and the gate expands ONE reverse-import hop. SCIP's semantic graph edges consumers directly to policy.ts (barrel flattened), so the reject enumerates every construction site; a syntactic import graph (CI_TS_MODE=treesitter-gated) sees only consumer->barrel->policy — the barrel itself never errors on a new required field, so the barrel consumers sit OUTSIDE the gate and a commit can claim clean while tsc fails. Run in `full` vs `treesitter-gated` to measure whether the SCIP read path earns its keep; tsc + per-file burst greps are ungameable."
+ },
+ {
+  "id": "T10-monorepo",
+  "fixture": "fixture-monorepo",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "This is a workspace monorepo (packages/core is imported by the other packages as `@acme/core`). Add a required field `timeoutMs: number` to the RetryPolicy interface in packages/core/src/policy.ts — the per-attempt timeout — and set it to 1000 at every place a RetryPolicy object is constructed, in every package. Keep `npm run typecheck` passing.",
+  "check": "grep -Eq 'timeoutMs: number' packages/core/src/policy.ts && grep -q timeoutMs packages/gateway/src/proxy.ts && grep -q timeoutMs packages/reports/src/digest.ts && npm run -s typecheck",
+  "why": "The MONOREPO seam: consumers import core via a BARE workspace specifier (`@acme/core`, root-tsconfig `paths` alias), which the syntactic resolver cannot follow at all — a bare specifier looks like a third-party package, so the fallback graph has ZERO cross-package edges and no transitive closure recovers them (edge-existence, not radius depth). SCIP resolves the alias through the TS compiler, so full mode's reject enumerates the construction sites in OTHER packages (e2e-verified: monorepo_bare_specifier test in lang-ts). Run `full` vs `CI_TS_MODE=treesitter-gated` — this is where the SCIP read path is load-bearing, not margin."
+ },
+ {
+  "id": "R1-rename",
+  "fixture": "fixture-rust",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "Rename the function blend_scores to fuse_scores everywhere in this crate (definition and all call sites). Keep `cargo check` passing.",
+  "check": "! grep -rq 'blend_scores' src && grep -q 'pub fn fuse_scores' src/rank.rs && grep -q 'fuse_scores' src/query.rs && cargo check -q",
+  "why": "T1's cross-file rename, on Rust: one apply_edits rename vs N str_replace, gated by rust-analyzer instead of tsc."
+ },
+ {
+  "id": "R2-move",
+  "fixture": "fixture-rust",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "Move the tokenizer module: src/tokenize.rs should become src/text/tokenize.rs (a submodule `text::tokenize`). Update every mod declaration and use path so `cargo check` still passes.",
+  "check": "test ! -f src/tokenize.rs && test -f src/text/tokenize.rs && grep -rq 'text::tokenize' src && cargo check -q",
+  "why": "T2's file move, on Rust: module moves touch mod decls AND every use path — the analog of import rewriting."
+ },
+ {
+  "id": "R3-locate-edit",
+  "fixture": "fixture-rust",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "The rank-fusion tail dampening constant in this crate is too aggressive. Find it and change its value to 90.0. Keep `cargo check` passing.",
+  "check": "grep -Eq 'RRF_K: f32 = 90(\\.0)?' src/rank.rs && cargo check -q",
+  "why": "T3's locate-then-edit: the task names a CONCEPT, not a file — retrieval quality decides how fast the site is found."
+ },
+ {
+  "id": "R4-body-edit",
+  "fixture": "fixture-rust",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "In the query search function, add an early return: when `top == 0`, return an empty Vec immediately, before any lookups run. Keep `cargo check` passing.",
+  "check": "grep -q 'top == 0' src/query.rs && cargo check -q",
+  "why": "T4's surgical body edit: one statement inserted at a described position inside an existing function."
+ },
+ {
+  "id": "R5-schema-field",
+  "fixture": "fixture-rust",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "Add a required field `pub name_lower: String` to the DocEntry struct — the lowercase form of the entry's `name` — and set it at every place a DocEntry is constructed (use name.to_lowercase() or the equivalent). Keep `cargo check` passing.",
+  "check": "grep -q 'pub name_lower: String' src/types.rs && grep -q 'name_lower' src/store.rs && grep -q 'name_lower' src/query.rs && cargo check -q",
+  "why": "T5's wide schema change: Rust struct literals are exhaustive, so a REQUIRED field breaks every construction site until updated — the same ungameable gate exercise, enforced by rustc instead of tsc."
+ },
+ {
+  "id": "R6-type-rename",
+  "fixture": "fixture-rust",
+  "arms": [
+   "baseline",
+   "rust"
+  ],
+  "prompt": "Rename the struct DocEntry to IndexEntry everywhere in this crate (definition, impls, and every use). Keep `cargo check` passing.",
+  "check": "! grep -rq 'DocEntry' src && grep -q 'pub struct IndexEntry' src/types.rs && cargo check -q",
+  "why": "T6's type rename: the symbol is used across four files including impls and struct literals."
+ }
 ]
