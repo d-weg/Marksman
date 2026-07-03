@@ -1025,64 +1025,37 @@ impl Server {
                     changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
                 ))
             }
-            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if all_gated => Ok(format!(
-                "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
-                 including files that import what changed. rename/move already updated every reference/import across the \
-                 whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.\nFiles changed:\n{}",
-                if dry_run { " (dry run — nothing written yet)" } else { "" },
-                changed_files.len(),
-                changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
-            )),
+            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if all_gated => {
+                // "COMPLETE — do not grep" is true for CODE references (the compiler renamed
+                // them) and false for comments/strings/docs, which no semantic rename touches.
+                // Same §5 law as the ungated tier: run the scan server-side and hand over the
+                // evidence with copyable fixes, instead of overclaiming and letting the stale
+                // mention surface later (bench type-rename: a doc-comment kept the old name
+                // while the response forbade the grep that would have caught it).
+                let scan = if !dry_run {
+                    self.rename_scan_section(&registry, &renames, true)
+                } else {
+                    None
+                };
+                Ok(format!(
+                    "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
+                     including files that import what changed. rename/move already updated every reference/import across the \
+                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{}\nFiles changed:\n{}",
+                    if dry_run { " (dry run — nothing written yet)" } else { "" },
+                    changed_files.len(),
+                    scan.unwrap_or_default(),
+                    changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
+                ))
+            }
             // Ungated (tree-sitter fallback — or a mixed batch touching one such language):
             // structural edit, NOT type-checked. Honesty stays, but the server does the
             // verification IT can do — a repo-wide rename scan — and hands the evidence over,
             // instead of telling the agent to go verify (which measurably costs 2-4 turns of
             // grep/read per task: the T8 bench arm lost to baseline on exactly that).
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
-                let scan = if !dry_run && !renames.is_empty() {
-                    let mut lines = Vec::new();
-                    let mut any_hits = false;
-                    for (ext, old, new) in &renames {
-                        let hits = scan_word(&self.root, ext, old);
-                        if hits.is_empty() {
-                            lines.push(format!("  '{old}': no remaining occurrences in any .{ext} file ✓"));
-                            continue;
-                        }
-                        any_hits = true;
-                        lines.push(format!("  '{old}': {} line(s) still mention it —", hits.len()));
-                        for (rel, ln, text) in &hits {
-                            lines.push(format!("    {rel}:{ln}: {text}"));
-                            // Ready-to-copy fix, anchored to the line's ENCLOSING symbol with the
-                            // POST-RENAME name — the agent's own attempts anchor by the old name
-                            // (gone) and burn turns discovering that. Full-line oldText for
-                            // uniqueness; target:doc when the line is a doc comment.
-                            if let Some((anchor, target)) = enclosing_anchor(&registry, rel, *ln) {
-                                let mut fix = json!({
-                                    "action": "replace_text",
-                                    "name": anchor,
-                                    "oldText": text,
-                                    "newText": text.replace(old.as_str(), new.as_str()),
-                                });
-                                if let Some(t) = target {
-                                    fix["target"] = json!(t);
-                                }
-                                lines.push(format!("      fix (ready to copy): {fix}"));
-                            }
-                        }
-                    }
-                    let guidance = if any_hits {
-                        "The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
-                         to verify the rename(s). Comment/string mentions are fine to LEAVE (only update them if \
-                         asked); code references should be fixed. To fix any line, re-issue its `fix` action \
-                         VERBATIM — all of them in ONE apply_edits batch."
-                    } else {
-                        "The scan above already re-checked the whole repo — the rename(s) are COMPLETE. Do NOT \
-                         grep, re-read, or run checks to verify."
-                    };
-                    format!(
-                        "\nrename verification (server-side scan of EVERY file of that language):\n{}\n{guidance}\n",
-                        lines.join("\n")
-                    )
+                let scan = if !dry_run {
+                    self.rename_scan_section(&registry, &renames, false)
+                        .unwrap_or_else(|| "\nRun the project's own checks if correctness is uncertain.\n".to_string())
                 } else {
                     "\nRun the project's own checks if correctness is uncertain.\n".to_string()
                 };
@@ -1143,6 +1116,77 @@ impl Server {
             *cache = Some((m, Arc::new(updated)));
         }
         Ok(())
+    }
+
+    /// Post-commit rename verification (docs/benchmarks.md §5): scan EVERY file of the renamed
+    /// symbol's language for the old name and hand the evidence over, each hit with a
+    /// ready-to-copy `replace_text` fix anchored to the POST-rename symbol — the agent's own
+    /// attempts anchor by the old name (gone) and burn turns discovering that. `None` when the
+    /// batch renamed nothing. On the GATED tier every hit is by construction a comment/string/
+    /// doc mention (the compiler renamed the code); ungated, hits may be either — the guidance
+    /// differs, the mechanism is one.
+    fn rename_scan_section(
+        &self,
+        registry: &ProviderRegistry,
+        renames: &[(String, String, String)],
+        gated: bool,
+    ) -> Option<String> {
+        if renames.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        let mut any_hits = false;
+        for (ext, old, new) in renames {
+            let hits = scan_word(&self.root, ext, old);
+            if hits.is_empty() {
+                lines.push(format!("  '{old}': no remaining occurrences in any .{ext} file ✓"));
+                continue;
+            }
+            any_hits = true;
+            lines.push(format!("  '{old}': {} line(s) still mention it —", hits.len()));
+            for (rel, ln, text) in &hits {
+                lines.push(format!("    {rel}:{ln}: {text}"));
+                // Full-line oldText for uniqueness; target:doc when the line is a doc comment.
+                if let Some((anchor, target)) = enclosing_anchor(registry, rel, *ln) {
+                    let mut fix = json!({
+                        "action": "replace_text",
+                        "name": anchor,
+                        "oldText": text,
+                        "newText": text.replace(old.as_str(), new.as_str()),
+                    });
+                    if let Some(t) = target {
+                        fix["target"] = json!(t);
+                    }
+                    lines.push(format!("      fix (ready to copy): {fix}"));
+                }
+            }
+        }
+        let guidance = match (gated, any_hits) {
+            (true, true) => {
+                "Code references are COMPLETE (type-checked) — the lines above are comment/string/doc \
+                 mentions, which no compiler rename touches. Update them only if the request covers \
+                 prose mentions too; to update one, re-issue its `fix` action VERBATIM — all of them \
+                 in ONE apply_edits batch. Do NOT grep or re-read to double-check."
+            }
+            (true, false) => {
+                "Even comments and strings carry no stale mention — the rename(s) are COMPLETE \
+                 everywhere. Do NOT grep, re-read, or run checks to verify."
+            }
+            (false, true) => {
+                "The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
+                 to verify the rename(s). Comment/string mentions are fine to LEAVE (only update them if \
+                 asked); code references should be fixed. To fix any line, re-issue its `fix` action \
+                 VERBATIM — all of them in ONE apply_edits batch."
+            }
+            (false, false) => {
+                "The scan above already re-checked the whole repo — the rename(s) are COMPLETE. Do NOT \
+                 grep, re-read, or run checks to verify."
+            }
+        };
+        Some(format!(
+            "\nrename verification (server-side scan of EVERY file of that language):\n{}\n{guidance}\n",
+            lines.join("\n")
+        ))
     }
 }
 
