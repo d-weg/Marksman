@@ -742,6 +742,9 @@ impl Server {
         let registry = self.registry()?;
 
         let mut ops = Vec::new();
+        // Pre-edit text of every node a replace_node/set_body op overwrites, captured while
+        // the disk is pristine; appended to gate REJECTS (see replaced_extent_note).
+        let mut replaced_notes: Vec<String> = Vec::new();
         for (ai, a) in actions.iter().enumerate() {
             // Reject unknown fields UP FRONT: a misspelled field (`old_text`, `after`) would
             // otherwise be silently dropped — and for insert_in_body a dropped `after` doesn't
@@ -845,6 +848,13 @@ impl Server {
             }
             if let Some(e) = resolution_err {
                 return Err(e);
+            }
+            if matches!(act, "replace_node" | "set_body") {
+                if let Some(id) = name.as_deref().filter(|n| n.contains('#')) {
+                    if let Some(note) = replaced_extent_note(&self.root, &registry, ai, act, id) {
+                        replaced_notes.push(note);
+                    }
+                }
             }
             let action = Action {
                 path,
@@ -1086,7 +1096,17 @@ impl Server {
                 ))
             }
             ci_core::CommitResult::Rejected { feedback, .. } => {
-                Err(format!("rejected — nothing written:\n{feedback}"))
+                let mut msg = format!("rejected — nothing written:\n{feedback}");
+                if !replaced_notes.is_empty() {
+                    // The ORIGINAL text is the missing half of a mis-scoped replacement reject:
+                    // the diagnostics show the broken AFTER, this shows the intact BEFORE —
+                    // enough to compose the retry in the SAME response, no read_node needed.
+                    msg.push_str(&format!(
+                        "\n\nOriginal target(s), UNCHANGED on disk — compose the retry against these (no need to re-read):\n{}",
+                        replaced_notes.join("\n")
+                    ));
+                }
+                Err(msg)
             }
         }
     }
@@ -1288,6 +1308,79 @@ fn collect_ids_by_leaf(nodes: &[Node], leaf: &str, out: &mut Vec<String>) {
 }
 
 /// Depth-first find of a node by its anchor id (symbol or sub-node).
+/// The EXACT byte extent of `r` in `content` — the text a `replace_node` value overwrites.
+/// `None` when the range is line-only (both chars 0) or out of bounds; callers fall back to
+/// whole lines.
+fn exact_extent(content: &str, r: &ci_core::Range) -> Option<String> {
+    if r.start_char == 0 && r.end_char == 0 {
+        return None;
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let s = r.start_line.checked_sub(1)? as usize;
+    let e = r.end_line.checked_sub(1)? as usize;
+    if s >= lines.len() || e >= lines.len() || e < s {
+        return None;
+    }
+    let sc = (r.start_char as usize).min(lines[s].len());
+    let ec = (r.end_char as usize).min(lines[e].len());
+    if s == e {
+        if ec <= sc {
+            return None;
+        }
+        return lines[s].get(sc..ec).map(str::to_string);
+    }
+    let mut out = lines[s].get(sc..)?.to_string();
+    for l in &lines[s + 1..e] {
+        out.push('\n');
+        out.push_str(l);
+    }
+    out.push('\n');
+    out.push_str(lines[e].get(..ec)?);
+    Some(out)
+}
+
+/// Reject-time context for a node-REPLACING op (`replace_node` / `set_body`): the target's
+/// original text and — when its extent is narrower than its lines — the exact extent the
+/// `value` overwrites. Captured while the disk is still pristine and appended to gate
+/// rejections, so the agent can compose the retry against the REAL boundaries instead of
+/// paying a read_node round-trip (bench locate-edit-ts: `replace_node RRF_K` with a whole
+/// statement as `value` duplicated the outer keywords — the reject showed only the broken
+/// AFTER, and the fix needed the BEFORE).
+fn replaced_extent_note(root: &Path, registry: &ProviderRegistry, ai: usize, act: &str, id: &str) -> Option<String> {
+    let file = file_of(id).to_string();
+    let nodes = registry.structure(Path::new(&file)).ok()?;
+    // set_body overwrites the :body sub-node when the provider exposes one.
+    let node = if act == "set_body" {
+        find_node(&nodes, &format!("{id}:body")).or_else(|| find_node(&nodes, id))?
+    } else {
+        find_node(&nodes, id)?
+    };
+    let content = std::fs::read_to_string(root.join(&file)).ok()?;
+    let cap = |t: String| -> String {
+        let n = t.lines().count();
+        if n <= 12 {
+            t
+        } else {
+            let head: Vec<&str> = t.lines().take(12).collect();
+            format!("{}\n… ({} more lines — read_node {} for the rest)", head.join("\n"), n - 12, id)
+        }
+    };
+    let lines_text = cap(slice_lines(&content, node.range.start_line, node.range.end_line));
+    let mut out = format!(
+        "op #{ai} ({act} {id}) targeted L{}-{}:\n```\n{lines_text}\n```",
+        node.range.start_line, node.range.end_line
+    );
+    if let Some(ex) = exact_extent(&content, &node.range) {
+        if ex.trim() != lines_text.trim() {
+            out.push_str(&format!(
+                "\nits EXACT extent is `{}` — `value` replaces precisely that text; everything outside it on the line STAYS (don't repeat keywords like `export`/`const`/`pub`).",
+                cap(ex)
+            ));
+        }
+    }
+    Some(out)
+}
+
 fn find_node<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
     for n in nodes {
         if n.id == id {
@@ -1518,6 +1611,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    // The reject-time BEFORE-text hinges on exact_extent slicing the node's true byte span:
+    // a declarator inside `export const X = 60;` is `X = 60`, NOT the whole line — showing
+    // the line as "the extent" would re-teach the exact mis-scope that caused the reject.
+    #[test]
+    fn exact_extent_slices_true_byte_spans() {
+        use ci_core::Range;
+        let content = "export const RRF_K = 60;\nfn f() {\n  body();\n}\n";
+        // sub-line span: the declarator only.
+        let r = Range { start_line: 1, end_line: 1, start_char: 13, end_char: 23 };
+        assert_eq!(super::exact_extent(content, &r).as_deref(), Some("RRF_K = 60"));
+        // multi-line span with byte cols.
+        let r = Range { start_line: 2, end_line: 4, start_char: 7, end_char: 1 };
+        assert_eq!(super::exact_extent(content, &r).as_deref(), Some("{\n  body();\n}"));
+        // line-only drivers (both chars 0) opt out — callers show whole lines instead.
+        let r = Range { start_line: 1, end_line: 1, start_char: 0, end_char: 0 };
+        assert_eq!(super::exact_extent(content, &r), None);
+        // out-of-bounds never panics.
+        let r = Range { start_line: 9, end_line: 9, start_char: 1, end_char: 2 };
+        assert_eq!(super::exact_extent(content, &r), None);
     }
 
     #[test]
