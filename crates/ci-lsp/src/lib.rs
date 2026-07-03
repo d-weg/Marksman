@@ -264,6 +264,28 @@ impl LspClient {
     /// the server's buffers after a dry-run/rejected gate left overlay content in them. A file
     /// gone from disk is closed. (The edit layer calls this before computing rename edits —
     /// spans computed against phantom buffer state slice the wrong text on disk.)
+    /// Staged file-system changes from the edit gate: `didClose` deleted buffers (an open
+    /// buffer SHADOWS the file system in every LSP server) and push a
+    /// `workspace/didChangeWatchedFiles` so servers running their own watcher
+    /// (rust-analyzer) re-derive the project immediately instead of racing the OS notifier.
+    pub fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
+        for rel in deleted {
+            let uri = file_uri(&self.root.join(rel));
+            if self.open.remove(&uri).is_some() {
+                self.send_notification("textDocument/didClose", json!({"textDocument": {"uri": uri}}))?;
+            }
+        }
+        let changes: Vec<Value> = created
+            .iter()
+            .map(|r| json!({"uri": file_uri(&self.root.join(r)), "type": 1})) // Created
+            .chain(deleted.iter().map(|r| json!({"uri": file_uri(&self.root.join(r)), "type": 3}))) // Deleted
+            .collect();
+        if !changes.is_empty() {
+            self.send_notification("workspace/didChangeWatchedFiles", json!({"changes": changes}))?;
+        }
+        Ok(())
+    }
+
     pub fn sync_disk(&mut self) -> Result<()> {
         let uris: Vec<String> = self.open.keys().cloned().collect();
         for uri in uris {

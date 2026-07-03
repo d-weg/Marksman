@@ -32,6 +32,13 @@ pub trait GateEngine {
         let _ = files;
         Ok(None)
     }
+    /// Notify the engine of file-system changes the gate materialized on disk (repo-relative
+    /// created/deleted paths). LSP engines forward didClose + didChangeWatchedFiles so the
+    /// server's project view tracks the staged state; in-memory engines need nothing.
+    fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
+        let _ = (created, deleted);
+        Ok(())
+    }
     /// Restore every in-memory buffer the engine holds to the CURRENT on-disk content. Called
     /// before computing any edit: a prior dry-run or rejected gate pushed overlay content into
     /// the engine, and a rename computed against that phantom state returns spans that slice
@@ -62,6 +69,9 @@ impl GateEngine for LspClient {
     }
     fn sync_disk(&mut self) -> Result<()> {
         LspClient::sync_disk(self)
+    }
+    fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
+        LspClient::fs_events(self, created, deleted)
     }
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
         // Warm: opening the file loads the project, so rename sees every reference (a cold
@@ -965,6 +975,56 @@ pub fn commit_edits(
         }
     }
 
+    // Baseline inputs, shared by the lazy diff below — built BEFORE any staged deletion
+    // leaves the disk: afterwards the pre-state error set would include the deletion's own
+    // fallout and excuse it (a false clean via the baseline itself).
+    let baseline_files: Vec<(String, String)> = affected
+        .iter()
+        .filter(|rel| !transient_rels.contains(*rel))
+        .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
+        .collect();
+
+    // Symmetric to TransientCreates: files the batch DELETES (delete_file / a move's source)
+    // still exist on DISK during the gate, and language servers resolve against the file
+    // system — rust-analyzer kept resolving a moved module's OLD path, so a move that broke
+    // the build gated "clean" (the R2 bench false-clean). Take them off disk for the check;
+    // the drop-guard restores them on any reject/error path (the server's own watcher sees
+    // the restoration), and a committing transaction DEFUSES the guard — committed deletions
+    // must stay deleted.
+    struct TransientDeletes(Vec<(PathBuf, String)>);
+    impl Drop for TransientDeletes {
+        fn drop(&mut self) {
+            for (p, content) in &self.0 {
+                let _ = std::fs::write(p, content);
+            }
+        }
+    }
+    let deleted_rels: Vec<String> = changed_rel
+        .iter()
+        .filter(|rel| root.join(rel.as_str()).exists() && vfs.read(Path::new(rel.as_str())).is_none())
+        .cloned()
+        .collect();
+    // The baseline must be measured while the deleted files still exist — eagerly, only for
+    // deletion batches (everything else keeps the lazy happy path).
+    let baseline_early: Option<Vec<Diag>> =
+        if deleted_rels.is_empty() { None } else { Some(engine.diagnostics(&baseline_files)?) };
+    let mut transient_del = TransientDeletes(Vec::new());
+    for rel in &deleted_rels {
+        let abs = root.join(rel);
+        if let Ok(content) = std::fs::read_to_string(&abs) {
+            if std::fs::remove_file(&abs).is_ok() {
+                transient_del.0.push((abs, content));
+            }
+        }
+    }
+    // Tell the engine what the gate just staged on disk: close deleted buffers (an open
+    // buffer SHADOWS the file system) and push watched-file events so servers with their own
+    // watchers (rust-analyzer) re-derive the project without racing the OS notifier.
+    if !transient_rels.is_empty() || !deleted_rels.is_empty() {
+        let created_rels: Vec<String> = transient_rels.iter().cloned().collect();
+        engine.fs_events(&created_rels, &deleted_rels)?;
+    }
+
     // After = overlay (edited) content for the changed files; disk content for the dependents
     // (their source is unchanged, but tsserver re-checks them against the overlaid changed
     // files, so a freshly-broken caller surfaces here).
@@ -987,13 +1047,13 @@ pub fn commit_edits(
     let new: Vec<&Diag> = if after.is_empty() {
         Vec::new()
     } else {
-        // The transiently-materialized creations must stay INVISIBLE to the baseline — they hold
-        // after-content, so including them would let a broken new file excuse its own errors.
-        let baseline_files: Vec<(String, String)> = affected
-            .iter()
-            .filter(|rel| !transient_rels.contains(*rel))
-            .filter_map(|rel| std::fs::read_to_string(root.join(rel)).ok().map(|c| (rel.clone(), c)))
-            .collect();
+        // (The transiently-materialized creations stayed INVISIBLE to `baseline_files` — they
+        // hold after-content, so including them would let a broken new file excuse its own
+        // errors. Deletion batches captured the baseline eagerly above, pre-removal.)
+        let baseline_diags = match baseline_early {
+            Some(b) => b,
+            None => engine.diagnostics(&baseline_files)?,
+        };
         // COUNT baseline occurrences per key, don't just collect the key set: the key has no line
         // (edits shift lines, so it can't), which means one pre-existing error would otherwise
         // excuse EVERY new instance with the same code+message in that file — a false accept.
@@ -1001,7 +1061,7 @@ pub fn commit_edits(
         // FIRST ones in diagnostic order are — so a flagged line can occasionally be the old
         // site rather than the new one; the reject still surfaces the error either way.)
         let mut baseline_counts: HashMap<String, usize> = HashMap::new();
-        for d in engine.diagnostics(&baseline_files)? {
+        for d in baseline_diags {
             *baseline_counts.entry(diag_key(&d)).or_default() += 1;
         }
         let mut seen: HashMap<String, usize> = HashMap::new();
@@ -1099,8 +1159,10 @@ pub fn commit_edits(
     if opts.write && !opts.dry_run {
         vfs.commit()?;
         // The transaction landed — the materialized creations are now REAL files (vfs.commit
-        // just rewrote them); defuse the guard so its drop doesn't delete them.
+        // just rewrote them) and the staged deletions are now REAL deletions; defuse both
+        // guards so their drops neither delete the former nor resurrect the latter.
         transient.0.clear();
+        transient_del.0.clear();
     }
     Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0 })
 }

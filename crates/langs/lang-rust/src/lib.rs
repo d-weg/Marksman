@@ -839,4 +839,47 @@ mod tests {
         let edges = g.get(&PathBuf::from("src/lib.rs")).expect("lib.rs edges");
         assert!(edges.contains(&PathBuf::from("src/foo.rs")), "mod foo -> foo.rs: {edges:?}");
     }
+
+    // The R2-bench false-clean, as an invariant: a COMMITTED move must leave a compiling
+    // crate. The gate has to SEE the staged deletion — rust-analyzer resolves module paths
+    // against the file system, so a move whose source is still on disk (and still open as a
+    // buffer) can gate "clean" while `pub mod …;` now points at nothing. We don't pin what
+    // rust-analyzer's willRenameFiles rewrites; whichever way it goes, commit ⇒ `cargo check`
+    // passes, reject ⇒ disk untouched. #[ignore]; `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn committed_move_must_leave_a_compiling_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"mv\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod util;\n\npub fn go() -> i32 {\n    util::one()\n}\n").unwrap();
+        fs::write(root.join("src/util.rs"), "pub fn one() -> i32 {\n    1\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let res = p
+            .apply_edits(
+                &[EditOp::MoveFile { from: "src/util.rs".into(), to: "src/core/util.rs".into() }],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        match res {
+            CommitResult::Ok { .. } => {
+                let out = std::process::Command::new("cargo")
+                    .args(["check", "-q"])
+                    .current_dir(root)
+                    .output()
+                    .expect("cargo check runs");
+                assert!(
+                    out.status.success(),
+                    "gate committed a move that does NOT compile (false clean):\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            CommitResult::Rejected { .. } => {
+                assert!(root.join("src/util.rs").is_file(), "reject must leave disk untouched");
+                assert!(!root.join("src/core/util.rs").exists(), "reject must not leave the destination behind");
+            }
+        }
+    }
 }
