@@ -15,7 +15,7 @@ pub mod types;
 pub mod weight;
 
 pub use config::{Config, ProviderManifest};
-pub use driver::LanguageProvider;
+pub use driver::{LanguageProvider, ReadIndex};
 pub use error::{Error, Result};
 pub use outline::{elide_bodies, elide_bodies_with};
 pub use text::byte_offset;

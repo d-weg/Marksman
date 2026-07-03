@@ -1105,6 +1105,142 @@ pub fn commit_edits(
     Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0 })
 }
 
+// ── Composed: ReadIndex × GateEngine = LanguageProvider ─────────────────────────────────────
+
+/// Builds the write engine on first use (lazily / off-thread via `prewarm`).
+pub type EngineFactory = std::sync::Arc<dyn Fn(&Path) -> Result<Box<dyn GateEngine + Send>> + Send + Sync>;
+
+/// A [`LanguageProvider`] assembled from its two halves: a [`ReadIndex`] (the artifact or
+/// live parser the agent PLANS against) and a [`GateEngine`] (the checker its edits run
+/// through). The halves talk over exactly three channels, and the wiring POLICY is derived
+/// from the reader's advertised properties instead of hand-wired per language:
+///
+/// 1. **radius** (read -> engine): the reverse-import set fed to [`commit_edits`] — one hop
+///    when [`ReadIndex::semantic_edges`] (compiler-accurate graphs flatten barrels),
+///    transitive otherwise (bench T9: a syntactic one-hop radius lets a barrel hide its
+///    consumers).
+/// 2. **freshness** (engine -> read): after a committed edit, artifact readers get overrides
+///    from `GateEngine::file_summaries` so reads track the commit until the next reindex;
+///    [`ReadIndex::live`] readers skip this — they re-parse current disk by construction.
+/// 3. **anchors**: edit ops resolve against the read structure the agent actually saw.
+use ci_core::{Granularity, ImportGraph, LanguageProvider, ReadIndex};
+use std::sync::{Arc, Mutex};
+
+pub struct Composed<R: ReadIndex> {
+    root: PathBuf,
+    read: R,
+    engine_factory: EngineFactory,
+    engine: Arc<Mutex<Option<Box<dyn GateEngine + Send>>>>,
+    fresh: Arc<Mutex<HashMap<String, FileSummary>>>,
+}
+
+impl<R: ReadIndex> Composed<R> {
+    pub fn new(root: &Path, read: R, engine_factory: EngineFactory) -> Self {
+        Self {
+            root: root.to_path_buf(),
+            read,
+            engine_factory,
+            engine: Arc::new(Mutex::new(None)),
+            fresh: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<R: ReadIndex> LanguageProvider for Composed<R> {
+    fn granularity(&self) -> Granularity {
+        self.read.granularity()
+    }
+
+    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
+        if !self.read.live() {
+            let rel = file.to_string_lossy().replace('\\', "/");
+            if let Ok(m) = self.fresh.lock() {
+                if let Some(s) = m.get(&rel) {
+                    return Ok(if s.deleted { vec![] } else { s.nodes.clone() });
+                }
+            }
+        }
+        self.read.structure(file)
+    }
+
+    fn import_graph(&self) -> Result<ImportGraph> {
+        let mut g = self.read.import_graph()?;
+        if !self.read.live() {
+            if let Ok(m) = self.fresh.lock() {
+                for s in m.values() {
+                    let key = PathBuf::from(&s.path);
+                    if s.deleted || s.imports.is_empty() {
+                        g.remove(&key);
+                    } else {
+                        g.insert(key, s.imports.clone());
+                    }
+                }
+            }
+        }
+        Ok(g)
+    }
+
+    fn prewarm(&self) {
+        let slot = self.engine.clone();
+        let factory = self.engine_factory.clone();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let Ok(mut guard) = slot.lock() else { return };
+            if guard.is_some() {
+                return;
+            }
+            if let Ok(mut engine) = factory(&root) {
+                let _ = engine.diagnostics(&[]);
+                *guard = Some(engine);
+            }
+        });
+    }
+
+    fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
+        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
+        if guard.is_none() {
+            *guard = Some((self.engine_factory)(&self.root)?);
+        }
+        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
+
+        let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
+        // Channel 1 — radius policy from the reader's edge semantics.
+        let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
+        let semantic = self.read.semantic_edges();
+        let reverse_imports = |file: &str| {
+            if semantic {
+                reverse.get(file).cloned().unwrap_or_default()
+            } else {
+                ci_core::transitive_reverse_imports(&reverse, file)
+            }
+        };
+        let r = commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
+
+        // Channel 2 — freshness push-back, artifact readers only (best-effort: a refresh
+        // hiccup must never fail an already-committed edit; reads then lag until reindex).
+        if !self.read.live() {
+            if let Ok(CommitResult::Ok { changed_files, .. }) = &r {
+                if opts.write && !opts.dry_run && !changed_files.is_empty() {
+                    let rels: Vec<String> =
+                        changed_files.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
+                    match engine.file_summaries(&rels) {
+                        Ok(Some(summaries)) => {
+                            if let Ok(mut m) = self.fresh.lock() {
+                                for s in summaries {
+                                    m.insert(s.path.clone(), s);
+                                }
+                            }
+                        }
+                        Ok(None) => {} // engine can't re-describe: reads lag until reindex
+                        Err(e) => eprintln!("[composed] post-edit read refresh failed ({e}); reads lag until reindex"),
+                    }
+                }
+            }
+        }
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

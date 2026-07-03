@@ -36,48 +36,44 @@
 //! - the engine starts lazily and [`prewarm`](LanguageProvider::prewarm) warms it off-thread,
 //!   so the first `apply_edits` doesn't pay a cold project load inline.
 
-use ci_core::{CommitResult, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node, Result};
-use ci_edit::GateEngine;
+use ci_core::{CommitResult, EditOp, EditOpts, Granularity, ImportGraph, LanguageProvider, Node, Result};
+use ci_edit::{Composed, GateEngine};
 use lang_fallback::{FallbackProvider, FbLang};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
+use std::sync::Arc;
 
 /// Builds the language's checker on first use. The real crate hardcodes its own factory
 /// (an `LspClient::start` with the checker's command); the template takes it as a parameter
 /// so the wiring is testable without any external tool.
-pub type EngineFactory = Arc<dyn Fn(&Path) -> Result<Box<dyn GateEngine + Send>> + Send + Sync>;
+pub type EngineFactory = ci_edit::EngineFactory;
 
-/// The Step-1 provider: generic tree-sitter reads, a real checker as the gate.
-#[derive(Clone)]
+/// The Step-1 provider: generic tree-sitter reads, a real checker as the gate — i.e.
+/// [`Composed`] over the tree-sitter [`ReadIndex`](ci_core::ReadIndex). This crate holds NO
+/// radius or freshness wiring of its own: `Composed` derives the glue policy from the
+/// reader's advertised properties (tree-sitter reads are `live`, so no post-commit refresh
+/// is needed; its edges are syntactic, so the blast radius is served TRANSITIVELY —
+/// contract clause 3, bench T9).
 pub struct GatedTreeSitter {
-    root: PathBuf,
-    read: FallbackProvider,
-    engine_factory: EngineFactory,
-    engine: Arc<Mutex<Option<Box<dyn GateEngine + Send>>>>,
+    inner: Composed<FallbackProvider>,
 }
 
 impl GatedTreeSitter {
     pub fn new(root: &Path, lang: FbLang, engine_factory: EngineFactory) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            read: FallbackProvider::new(root, lang),
-            engine_factory,
-            engine: Arc::new(Mutex::new(None)),
-        }
+        Self { inner: Composed::new(root, FallbackProvider::new(root, lang), engine_factory) }
     }
 }
 
 impl LanguageProvider for GatedTreeSitter {
     fn granularity(&self) -> Granularity {
-        Granularity::Ast
+        self.inner.granularity()
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        self.read.structure(file)
+        self.inner.structure(file)
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
-        self.read.import_graph()
+        self.inner.import_graph()
     }
 
     // Step-1 providers ARE gated — that's the point. If your checker can be absent at runtime,
@@ -88,34 +84,11 @@ impl LanguageProvider for GatedTreeSitter {
     }
 
     fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let factory = self.engine_factory.clone();
-        let root = self.root.clone();
-        std::thread::spawn(move || {
-            let Ok(mut guard) = slot.lock() else { return };
-            if guard.is_some() {
-                return;
-            }
-            if let Ok(mut engine) = factory(&root) {
-                let _ = engine.diagnostics(&[]);
-                *guard = Some(engine);
-            }
-        });
+        self.inner.prewarm()
     }
 
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some((self.engine_factory)(&self.root)?);
-        }
-        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
-        let structure_of = |f: &str| self.read.structure(Path::new(f)).unwrap_or_default();
-        // The blast radius comes from the SYNTACTIC import graph, so it must be served
-        // transitively: syntactic edges don't flatten re-exports, and a one-hop radius lets a
-        // barrel hide its consumers from the gate (contract clause 3; measured, bench T9).
-        let reverse = ci_core::reverse_import_map(&self.read.import_graph().unwrap_or_default());
-        let reverse_imports = |file: &str| ci_core::transitive_reverse_imports(&reverse, file);
-        ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
+        self.inner.apply_edits(ops, opts)
     }
 }
 

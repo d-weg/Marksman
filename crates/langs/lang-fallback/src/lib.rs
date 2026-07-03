@@ -137,6 +137,27 @@ impl FallbackProvider {
     }
 }
 
+/// The tree-sitter reader as a composable READ half (see `ci_core::ReadIndex`): live (parses
+/// current disk — no post-commit freshness glue needed) with syntactic edges (a composed
+/// gate must expand the radius transitively; bench T9).
+impl ci_core::ReadIndex for FallbackProvider {
+    fn granularity(&self) -> Granularity {
+        LanguageProvider::granularity(self)
+    }
+    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
+        LanguageProvider::structure(self, file)
+    }
+    fn import_graph(&self) -> Result<ImportGraph> {
+        LanguageProvider::import_graph(self)
+    }
+    fn live(&self) -> bool {
+        true
+    }
+    fn semantic_edges(&self) -> bool {
+        false
+    }
+}
+
 impl LanguageProvider for FallbackProvider {
     fn granularity(&self) -> Granularity {
         Granularity::Ast // tree-sitter sub-nodes (params / return / body)

@@ -49,3 +49,32 @@ pub trait LanguageProvider: Send + Sync {
         true
     }
 }
+
+/// The READ half of a provider: the index the agent plans against. An artifact you load and
+/// query (a SCIP index) or a live parser over current disk (tree-sitter) — never a running
+/// checker; the write half is [`ci-edit`]'s `GateEngine`. The two advertised properties drive
+/// the glue a composed provider wires between the halves:
+///
+/// - [`live`](ReadIndex::live): live readers reflect every commit by construction; artifact
+///   readers need the post-commit freshness channel (engine `file_summaries` -> read
+///   overrides) or their reads serve pre-edit state until the next reindex.
+/// - [`semantic_edges`](ReadIndex::semantic_edges): compiler-accurate graphs flatten barrels
+///   and re-exports, so a ONE-hop reverse-import radius is sound. Syntactic graphs do not —
+///   the radius must be expanded transitively or a barrel hides its consumers from the gate
+///   (measured: bench T9-barrel).
+pub trait ReadIndex: Send + Sync {
+    /// The structural depth this reader exposes (Symbol for SCIP, Ast for a full parse).
+    fn granularity(&self) -> Granularity;
+    /// Structure tree for one file (same contract as [`LanguageProvider::structure`]).
+    fn structure(&self, file: &Path) -> Result<Vec<Node>>;
+    /// File-level import/reference graph (same contract as [`LanguageProvider::import_graph`]).
+    fn import_graph(&self) -> Result<ImportGraph>;
+    /// True when reads come from current disk rather than a prebuilt artifact.
+    fn live(&self) -> bool {
+        false
+    }
+    /// True when graph edges are compiler-accurate (a one-hop blast radius is sound).
+    fn semantic_edges(&self) -> bool {
+        false
+    }
+}
