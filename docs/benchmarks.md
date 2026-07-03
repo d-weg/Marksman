@@ -7,8 +7,9 @@ This file answers, in order:
 3. [Does it hold up on a big real repo?](#3-does-it-hold-up-on-a-big-real-repo)
 4. [How do the client and middleware change the numbers?](#4-how-the-client-and-middleware-change-the-numbers)
 5. [What makes a tool response effective?](#5-tool-response-design-the-lesson-that-transfers) — the design lesson that generalizes beyond this project.
-6. [Component micro-benchmarks](#6-component-micro-benchmarks).
-7. [Methodology, trust properties, and how to reproduce](#7-methodology-trust-and-reproduction).
+6. [The TypeScript 7 (tsgo) measurements](#6-the-typescript-7-tsgo-measurements--gate-engine-index-producer-embedding) — gate engine, LSP-as-producer, and parallel embedding.
+7. [Component micro-benchmarks](#7-component-micro-benchmarks).
+8. [Methodology, trust properties, and how to reproduce](#8-methodology-trust-and-reproduction).
 
 ### Terms used throughout
 
@@ -303,7 +304,93 @@ turns are expensive (they re-send everything).
 
 ---
 
-## 6. Component micro-benchmarks
+## 6. The TypeScript 7 (tsgo) measurements — gate engine, index producer, embedding
+
+TypeScript 7 ("tsgo") is Microsoft's native Go port of the TypeScript compiler; its language
+server speaks LSP directly and serves requests across threads. Three questions, measured
+2026-07-02/03 on the same 10-core machine as §3 (single runs unless noted):
+
+### 6.1 tsgo as the gate engine — now the default tier
+
+The write gate re-checks the blast radius on every edit, so warm-engine latency is the number
+users feel. End-to-end through the full provider (scip index → `apply_edits` → gate) on a
+hub-and-40-consumers fixture:
+
+| engine | cold engine + breaking hub edit | warm clean edit |
+|---|--:|--:|
+| tsls (`typescript-language-server`) | 4.41s | 1.518s |
+| ts-morph sidecar (previous default) | 0.80s | 0.034s |
+| **tsgo** | 3.45s | **0.011s** |
+
+- Verdicts are IDENTICAL across engines: the breaking edit rejects naming all 40/40
+  consumers (same TS2554 diagnostics, zero noise), the clean edit commits, rollback intact.
+  A real-tool parity test (`rename_parity_tsmorph_vs_tsgo`) additionally requires the same
+  cross-file rename to leave byte-identical trees through both engines.
+- tsls's 1.5s warm floor is structural: it lacks LSP pull diagnostics, so every gate pays a
+  1.5s publish-silence settle. tsgo uses the pull path — no settle at all (~0.3ms per
+  radius file warm vs the ~65ms/file behind §3's 20s hub-edit figure).
+- ts-morph's original reason to be the default — faster than the old LSP — no longer holds;
+  tsgo is ~3× faster warm even at fixture scale and the gap widens with radius size.
+- **Engine order is now tsgo → ts-morph → tsls.** tsgo is auto-picked only when it costs no
+  network (`CI_TSGO=/path/to/tsgo`, or `tsgo` on PATH); `CI_EDIT_ENGINE=tsgo|tsmorph|lsp`
+  forces a tier. Note the TS7 RC npm package (`typescript@rc`) ships only `tsc` — the LSP
+  binary lives in `@typescript/native-preview` until GA.
+- Cold project load (a few seconds) is hidden by the existing background prewarm. Post-commit
+  read freshness is preserved under LSP engines by a tree-sitter re-describe of the changed
+  files (scip fidelity returns at the next reindex).
+
+### 6.2 Can an LSP replace the SCIP indexer? — parity yes, scale no
+
+`ci-lsp-index` builds a genuine SCIP index by sweeping a language server (`documentSymbol`
+for definitions, `references` per symbol for occurrences), selectable as `CI_TS_MODE=lsp`.
+The same read path consumes either producer, so the comparison is exact.
+
+**Parity (fixtures + agent bench):** structure ids byte-equal on every file compared
+(after two shape filters: object-literal members and import/re-export bindings are
+references, not definitions), identical import graphs and gate verdicts, and the full agent
+suite T1–T10 passes on the sweep index — including T9-barrel and T10-monorepo, the two tasks
+built to break weaker indexes. T9 cost lands at scip parity (159k vs 189k input tokens,
+single runs).
+
+**Scale (microsoft/TypeScript src, 601 files / 379k lines / 22,160 symbols):**
+
+| phase | time |
+|---|--:|
+| open + project load | 6.6s |
+| documentSymbol + canonical-def filter | 5.2s |
+| references sweep | **988s** |
+| **sweep total** | **1000.8s** vs **scip-typescript 26.5s** — **38× slower** |
+
+Per-symbol `references` cost is ~1ms on a 41-file fixture but **44.6ms at 379k lines** — the
+per-query cost scales with PROJECT size, because an editor-oriented server (correctly)
+maintains no whole-program reverse index. Asking it 22k times re-derives what a batch
+indexer computes in one compiler pass; that asymmetry is *why indexers exist*.
+
+**Verdict:** the sweep is the artifact producer for languages that have an LSP but **no**
+SCIP indexer (where the honest alternative is nothing, and most such repos are far smaller
+than 379k lines) — not a scip-typescript replacement. It also settles the planning-vs-editing
+split: the read index answers many speculative O(1) planning queries from a loaded artifact;
+the live engine answers the few targeted queries an edit needs. Each side keeps the tool
+shaped for its access pattern.
+
+### 6.3 Embedding parallelization — the warm-reindex bottleneck removed
+
+Phase timing (`CI_TIMING=1`) showed embedding is ~75% of a warm reindex (10.6s of §3's
+13.9s at 22k chunks). It is pure per-chunk CPU (Model2Vec static lookups) and shards
+cleanly across scoped threads:
+
+| threads | 22k chunks | speedup |
+|--:|--:|--:|
+| 1 | 10.58s | — |
+| 2 | 5.26s | 2.01× |
+| 6 | 1.99s | 5.31× |
+| 8 | 1.89s | **5.61×** |
+
+Near-linear on the 6 performance cores, CPU-bound (not memory-bound), byte-identical
+output. Shipped in `build_index`/`update_index` via `std::thread::scope` (one flat map does
+not earn a rayon dependency); projected warm reindex at §3 scale: 13.9s → ~5s.
+
+## 7. Component micro-benchmarks
 
 Machine-level numbers for individual pieces (oracle repo = the ~600-symbol Node.js
 `codeindex` prototype; timings are min-of-3 after a discarded warmup).
@@ -339,14 +426,14 @@ all); the per-file provider registry finds 6/6. The gain is recall into one shar
 the retrieval math is language-blind and unchanged.
 
 **Edit capability & latency**: sub-symbol edits (function body / return type / one
-parameter) require the tree-sitter AST — SCIP alone is symbol-level. The default write
-engine (ts-morph, kept warm) completes a full rename + blast-radius type-check in **~0.9s**
-on the oracle repo; the generic LSP engine (`CI_EDIT_ENGINE=lsp`, how the Rust gate drives
-rust-analyzer) is the slower fallback.
+parameter) require the tree-sitter AST — SCIP alone is symbol-level. The ts-morph engine
+(kept warm) completes a full rename + blast-radius type-check in **~0.9s** on the oracle
+repo; §6.1 has the current engine tiers (tsgo → ts-morph → tsls) and their warm-gate
+latencies.
 
 ---
 
-## 7. Methodology, trust, and reproduction
+## 8. Methodology, trust, and reproduction
 
 What makes the agent A/B trustworthy (`scripts/agent-bench/`, see its README):
 
@@ -380,7 +467,7 @@ CI_TS_MODE=treesitter       bash scripts/agent-bench/go.sh --arms rust --runs 1
 bash scripts/agent-bench/go.sh --task T5-schema-field --save-transcript /tmp/tx
 python3 scripts/agent-bench/analyze.py /tmp/tx
 
-# Micro-benchmarks (§6):
+# Micro-benchmarks (§7):
 python3 scripts/bench.py [oracle_repo]
 python3 scripts/multilang-bench/run.py
 ```

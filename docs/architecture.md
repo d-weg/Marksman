@@ -91,10 +91,14 @@ producers to the same expectations (`conformance_ts_scip` / `conformance_ts_lsp_
   "no semantics" weakness is covered by SCIP. Each fixes the other.
 
 ### Read freshness (both providers — the index never lies in-session)
-- **TS**: after a committed `apply_edits`, the warm ts-morph sidecar re-describes the changed
-  files (`fileInfo` op: symbols + resolved imports) into a per-file **read override** consulted
-  before the loaded SCIP index — new symbols and new import edges are visible immediately, no
-  reindex. Startup stays fingerprint-cached; the overlay covers the same-session window.
+- **TS**: after a committed `apply_edits`, the engine re-describes the changed files into a
+  per-file **read override** consulted before the loaded SCIP index — new symbols and new
+  import edges are visible immediately, no reindex. The ts-morph sidecar does this natively
+  (`fileInfo` op: symbols + resolved imports); the LSP engines (tsgo/tsls) can't re-describe
+  their live project, so the provider approximates from **tree-sitter on current disk** (the
+  same read shape `TsTreeGated` serves) — reads track the commit either way, and scip
+  fidelity returns at the next reindex. Startup stays fingerprint-cached; the overlay covers
+  the same-session window.
 - **Rust**: `structure()` and the `mod` graph read disk live (always fresh). The opt-in
   `rust-analyzer scip` use-graph is fingerprinted at `refresh_scip` time; at load, files that
   drifted since (and files committed in-session) get their edges recomputed from tree-sitter

@@ -18,8 +18,13 @@ crates (referenced per clause below); they are instances of this contract, not e
 | **ungated fallback** | tree-sitter + syntactic imports | syntax only (new parse errors reject) | `false` | Python, JS, Go, Java, Ruby, C, C++ |
 
 New languages enter at the tier the [rollout ladder](benchmarks.md#3-what-this-settles--the-provider-rollout-ladder)
-prescribes: tree-sitter + gate first, SCIP as the maturity step. A language without a usable
-checker stays ungated — honestly.
+prescribes: tree-sitter + gate first, a semantic read artifact as the maturity step. That
+artifact comes from a dedicated SCIP indexer where a maintained one exists (scip-typescript,
+`rust-analyzer scip`), or from the **`ci-lsp-index` sweep** (documentSymbol + references over
+the language's own LSP → a genuine SCIP index) where none does — same consumer, same
+conformance expectations; benchmarks.md §6.2 has the cost envelope (parity on fixtures, 38×
+slower than a batch indexer at 379k-line scale, fine at the sizes most languages see). A
+language without a usable checker stays ungated — honestly.
 
 ## 1. Identity & addressing
 

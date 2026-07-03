@@ -35,7 +35,7 @@ On a 10-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), a
 ## How it works
 
 - **Read:** `scip-typescript` (compiler-accurate symbols + cross-file references) merged with in-process **tree-sitter** (sub-symbol AST), embedded by a native **Model2Vec** (`potion-code-16M`) embedder — no GPU, no embedding server — then indexed (BM25 + flat vector store + import graph, persisted as protobuf) and retrieved with **Reciprocal Rank Fusion** + graph expansion.
-- **Write:** a persistent, warmed **ts-morph** engine applies edits behind an in-memory VFS, gated by a baseline-diff of type diagnostics over the **blast radius** (the changed files + their importers). A generic LSP path is the fallback (`CI_EDIT_ENGINE=lsp`); it prefers **LSP 3.17 pull diagnostics** (request/response — a slow server can never be mistaken for a clean file), which is how the Rust gate drives rust-analyzer.
+- **Write:** a persistent, warmed gate engine applies edits behind an in-memory VFS, gated by a baseline-diff of type diagnostics over the **blast radius** (the changed files + their importers). TypeScript's engine tiers are **tsgo → ts-morph → tsls**: the TS7 native LSP gates ~138× faster warm with identical verdicts and is auto-picked when locally present (`CI_TSGO`, or `tsgo` on PATH — never a surprise download); the ts-morph sidecar and `typescript-language-server` are the fallbacks. The LSP path prefers **LSP 3.17 pull diagnostics** (request/response — a slow server can never be mistaken for a clean file), which is also how the Rust gate drives rust-analyzer.
 - **Fast startup:** the SCIP index is cached and validated by a content-hash fingerprint of the source (plus pinned tool versions) — a warm start on an unchanged repo is **~0.1s instead of ~26s**; any doubt reindexes, never a stale load.
 - **Reads stay true in-session:** symbol ranges are re-anchored against the current file content on every read, and after a committed edit the write engine **re-describes the changed files** (new symbols, new import edges) back into the read path — a function you just added is immediately visible to `list_anchors`/`find_symbols`, no reindex. The Rust scip graph gets the same treatment: fingerprinted at build, with drifted/edited files served fresh tree-sitter edges.
 
@@ -131,9 +131,11 @@ Environment variables:
 | `CI_MODEL_DIR` | Model2Vec model directory | **required** (set it) |
 | `CI_NPM_CACHE` | npm cache dir for `npx` (scip / tsserver) | system temp |
 | `CI_TSMORPH_DIR` | where the ts-morph sidecar is installed | `<tmp>/ci-tsmorph` |
-| `CI_EDIT_ENGINE` | write engine: `tsmorph` (default) or `lsp` | `tsmorph` |
+| `CI_EDIT_ENGINE` | force a TS write-engine tier: `tsgo` · `tsmorph` · `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names) | auto: tsgo if local, else ts-morph, else tsls |
+| `CI_TSGO` | path to a `tsgo` binary (TS7 native) — enables the fastest gate tier and the `CI_TS_MODE=lsp` sweep without npx | unset (PATH is probed) |
+| `CI_TS_LSP_SERVER` | full command line for an alternative TS LSP server on the `lsp` tier (whitespace-split) | unset |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
-| `CI_TS_MODE` | TypeScript read-path ablation: `full` (default — SCIP + tree-sitter + gate) · `treesitter-gated` (tree-sitter read, same ts-morph gate, no scip/Node at startup) · `treesitter` (pure tree-sitter, ungated) — benchmarking knob, see docs/benchmarks.md | `full` |
+| `CI_TS_MODE` | TypeScript read-path ablation: `full` (default — SCIP + tree-sitter + gate) · `treesitter-gated` (tree-sitter read, same ts-morph gate, no scip/Node at startup) · `treesitter` (pure tree-sitter, ungated) · `lsp` (index produced by sweeping the tsgo language server via `ci-lsp-index` — same read path, different producer) — benchmarking knob, see docs/benchmarks.md §6 | `full` |
 | `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off), e.g. `CI_SCIP_RUST` — Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) vs `mod`-only; generated at index time (≈ a `cargo check`) and content-fingerprinted: files edited since serve fresh tree-sitter edges, and a cache without a fingerprint is refused rather than trusted stale | the `scip.<lang>` config value |
 | `MARKSMAN_ROOT` | repo root for the MCP server (legacy `CODEINDEX_ROOT` still honored) | current directory |
 
