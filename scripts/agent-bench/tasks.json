@@ -144,5 +144,47 @@
   "prompt": "Rename the struct DocEntry to IndexEntry everywhere in this crate (definition, impls, and every use). Keep `cargo check` passing.",
   "check": "! grep -rq 'DocEntry' src && grep -q 'pub struct IndexEntry' src/types.rs && cargo check -q",
   "why": "T6's type rename: the symbol is used across four files including impls and struct literals."
+ },
+ {
+  "id": "TS1-rename",
+  "fixture": "fixture-ts",
+  "prompt": "Rename the function blendScores to fuseScores everywhere in this codebase (definition and all call sites). Keep everything compiling.",
+  "check": "! grep -rq 'blendScores' src && grep -q 'export function fuseScores' src/rank.ts && grep -q 'fuseScores' src/query.ts && npm run -s typecheck",
+  "why": "R1's twin on the SAME-shaped codebase in TS — cross-language comparability by construction."
+ },
+ {
+  "id": "TS2-move",
+  "fixture": "fixture-ts",
+  "prompt": "Move the tokenizer module: src/tokenize.ts should become src/text/tokenize.ts. Update every import so everything still compiles.",
+  "check": "test ! -f src/tokenize.ts && test -f src/text/tokenize.ts && grep -rq 'text/tokenize' src && npm run -s typecheck",
+  "why": "R2's twin: file move with import rewriting."
+ },
+ {
+  "id": "TS3-locate-edit",
+  "fixture": "fixture-ts",
+  "prompt": "The rank-fusion tail dampening constant in this codebase is too aggressive. Find it and change its value to 90. Keep everything compiling.",
+  "check": "grep -Eq 'RRF_K = 90' src/rank.ts && npm run -s typecheck",
+  "why": "R3's twin: locate by concept, not filename."
+ },
+ {
+  "id": "TS4-body-edit",
+  "fixture": "fixture-ts",
+  "prompt": "In the query search function, add an early return: when `top === 0` (or top <= 0), return an empty array immediately, before any lookups run. Keep everything compiling.",
+  "check": "grep -Eq 'top (===|<=) 0' src/query.ts && npm run -s typecheck",
+  "why": "R4's twin: one statement at a described position."
+ },
+ {
+  "id": "TS5-schema-field",
+  "fixture": "fixture-ts",
+  "prompt": "Add a required field `nameLower: string` to the DocEntry interface — the lowercase form of the entry's `name` — and set it at every place a DocEntry object is constructed (use name.toLowerCase() or the equivalent). Keep everything compiling.",
+  "check": "grep -q 'nameLower: string' src/types.ts && grep -q 'nameLower' src/store.ts && grep -q 'nameLower' src/query.ts && npm run -s typecheck",
+  "why": "R5's twin: the required-field gate exercise, tsc enforcing both construction sites."
+ },
+ {
+  "id": "TS6-type-rename",
+  "fixture": "fixture-ts",
+  "prompt": "Rename the interface DocEntry to IndexEntry everywhere in this codebase (definition and every use, including type-only imports). Keep everything compiling.",
+  "check": "! grep -rq 'DocEntry' src && grep -q 'export interface IndexEntry' src/types.ts && npm run -s typecheck",
+  "why": "R6's twin: type rename across four files including type-only imports."
  }
 ]
