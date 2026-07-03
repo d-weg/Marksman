@@ -77,7 +77,15 @@ impl LspClient {
             "processId": null,
             "rootUri": file_uri(root),
             "capabilities": {
-                "textDocument": { "publishDiagnostics": {}, "synchronization": {}, "diagnostic": {} },
+                "textDocument": {
+                    "publishDiagnostics": {},
+                    "synchronization": {},
+                    "diagnostic": {},
+                    // Hierarchical DocumentSymbol[] (selectionRange + children) instead of flat
+                    // SymbolInformation[] — ci-lsp-index needs real name ranges and full nesting
+                    // chains; servers without support keep returning the flat shape.
+                    "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
+                },
                 "workspace": { "fileOperations": { "willRename": true } },
                 "experimental": { "serverStatusNotification": true },
             },
