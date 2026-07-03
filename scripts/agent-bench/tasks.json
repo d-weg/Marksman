@@ -80,111 +80,123 @@
   "why": "The MONOREPO seam: consumers import core via a BARE workspace specifier (`@acme/core`, root-tsconfig `paths` alias), which the syntactic resolver cannot follow at all — a bare specifier looks like a third-party package, so the fallback graph has ZERO cross-package edges and no transitive closure recovers them (edge-existence, not radius depth). SCIP resolves the alias through the TS compiler, so full mode's reject enumerates the construction sites in OTHER packages (e2e-verified: monorepo_bare_specifier test in lang-ts). Run `full` vs `CI_TS_MODE=treesitter-gated` — this is where the SCIP read path is load-bearing, not margin."
  },
  {
-  "id": "R1-rename",
-  "fixture": "fixture-rust",
-  "arms": [
-   "baseline",
-   "rust"
-  ],
-  "prompt": "Rename the function blend_scores to fuse_scores everywhere in this crate (definition and all call sites). Keep `cargo check` passing.",
-  "check": "! grep -rq 'blend_scores' src && grep -q 'pub fn fuse_scores' src/rank.rs && grep -q 'fuse_scores' src/query.rs && cargo check -q",
-  "why": "T1's cross-file rename, on Rust: one apply_edits rename vs N str_replace, gated by rust-analyzer instead of tsc."
+  "id": "rename",
+  "why": "Cross-file rename on the shared corpus fixture — one task identity, the suite picks the language/repo.",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "Rename the function blendScores to fuseScores everywhere in this codebase (definition and all call sites). Keep everything compiling.",
+    "check": "! grep -rq 'blendScores' src && grep -q 'export function fuseScores' src/rank.ts && grep -q 'fuseScores' src/query.ts && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "Rename the function blend_scores to fuse_scores everywhere in this crate (definition and all call sites). Keep `cargo check` passing.",
+    "check": "! grep -rq 'blend_scores' src && grep -q 'pub fn fuse_scores' src/rank.rs && grep -q 'fuse_scores' src/query.rs && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
  },
  {
-  "id": "R2-move",
-  "fixture": "fixture-rust",
-  "arms": [
-   "baseline",
-   "rust"
-  ],
-  "prompt": "Move the tokenizer module: src/tokenize.rs should become src/text/tokenize.rs (a submodule `text::tokenize`). Update every mod declaration and use path so `cargo check` still passes.",
-  "check": "test ! -f src/tokenize.rs && test -f src/text/tokenize.rs && grep -rq 'text::tokenize' src && cargo check -q",
-  "why": "T2's file move, on Rust: module moves touch mod decls AND every use path — the analog of import rewriting."
+  "id": "move",
+  "why": "File/module move with import (or mod-decl/use-path) rewriting — the task that caught the staged-deletion false-clean.",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "Move the tokenizer module: src/tokenize.ts should become src/text/tokenize.ts. Update every import so everything still compiles.",
+    "check": "test ! -f src/tokenize.ts && test -f src/text/tokenize.ts && grep -rq 'text/tokenize' src && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "Move the tokenizer module: src/tokenize.rs should become src/text/tokenize.rs (a submodule `text::tokenize`). Update every mod declaration and use path so `cargo check` still passes.",
+    "check": "test ! -f src/tokenize.rs && test -f src/text/tokenize.rs && grep -rq 'text::tokenize' src && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
  },
  {
-  "id": "R3-locate-edit",
-  "fixture": "fixture-rust",
-  "arms": [
-   "baseline",
-   "rust"
-  ],
-  "prompt": "The rank-fusion tail dampening constant in this crate is too aggressive. Find it and change its value to 90.0. Keep `cargo check` passing.",
-  "check": "grep -Eq 'RRF_K: f32 = 90(\\.0)?' src/rank.rs && cargo check -q",
-  "why": "T3's locate-then-edit: the task names a CONCEPT, not a file — retrieval quality decides how fast the site is found."
+  "id": "locate-edit",
+  "why": "Locate by CONCEPT, not filename — retrieval quality decides how fast the site is found.",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "The rank-fusion tail dampening constant in this codebase is too aggressive. Find it and change its value to 90. Keep everything compiling.",
+    "check": "grep -Eq 'RRF_K = 90' src/rank.ts && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "The rank-fusion tail dampening constant in this crate is too aggressive. Find it and change its value to 90.0. Keep `cargo check` passing.",
+    "check": "grep -Eq 'RRF_K: f32 = 90(\\.0)?' src/rank.rs && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
  },
  {
-  "id": "R4-body-edit",
-  "fixture": "fixture-rust",
-  "arms": [
-   "baseline",
-   "rust"
-  ],
-  "prompt": "In the query search function, add an early return: when `top == 0`, return an empty Vec immediately, before any lookups run. Keep `cargo check` passing.",
-  "check": "grep -q 'top == 0' src/query.rs && cargo check -q",
-  "why": "T4's surgical body edit: one statement inserted at a described position inside an existing function."
+  "id": "body-edit",
+  "why": "One statement inserted at a described position inside an existing function.",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "In the query search function, add an early return: when `top === 0` (or top <= 0), return an empty array immediately, before any lookups run. Keep everything compiling.",
+    "check": "grep -Eq 'top (===|<=) 0' src/query.ts && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "In the query search function, add an early return: when `top == 0`, return an empty Vec immediately, before any lookups run. Keep `cargo check` passing.",
+    "check": "grep -q 'top == 0' src/query.rs && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
  },
  {
-  "id": "R5-schema-field",
-  "fixture": "fixture-rust",
-  "arms": [
-   "baseline",
-   "rust"
-  ],
-  "prompt": "Add a required field `pub name_lower: String` to the DocEntry struct — the lowercase form of the entry's `name` — and set it at every place a DocEntry is constructed (use name.to_lowercase() or the equivalent). Keep `cargo check` passing.",
-  "check": "grep -q 'pub name_lower: String' src/types.rs && grep -q 'name_lower' src/store.rs && grep -q 'name_lower' src/query.rs && cargo check -q",
-  "why": "T5's wide schema change: Rust struct literals are exhaustive, so a REQUIRED field breaks every construction site until updated — the same ungameable gate exercise, enforced by rustc instead of tsc."
+  "id": "schema-field",
+  "why": "The gate exercise: a REQUIRED field on a type constructed in two files — the compiler fails until every site is updated, ungameable in both languages.",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "Add a required field `nameLower: string` to the DocEntry interface — the lowercase form of the entry's `name` — and set it at every place a DocEntry object is constructed (use name.toLowerCase() or the equivalent). Keep everything compiling.",
+    "check": "grep -q 'nameLower: string' src/types.ts && grep -q 'nameLower' src/store.ts && grep -q 'nameLower' src/query.ts && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "Add a required field `pub name_lower: String` to the DocEntry struct — the lowercase form of the entry's `name` — and set it at every place a DocEntry is constructed (use name.to_lowercase() or the equivalent). Keep `cargo check` passing.",
+    "check": "grep -q 'pub name_lower: String' src/types.rs && grep -q 'name_lower' src/store.rs && grep -q 'name_lower' src/query.rs && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
  },
  {
-  "id": "R6-type-rename",
-  "fixture": "fixture-rust",
-  "arms": [
-   "baseline",
-   "rust"
-  ],
-  "prompt": "Rename the struct DocEntry to IndexEntry everywhere in this crate (definition, impls, and every use). Keep `cargo check` passing.",
-  "check": "! grep -rq 'DocEntry' src && grep -q 'pub struct IndexEntry' src/types.rs && cargo check -q",
-  "why": "T6's type rename: the symbol is used across four files including impls and struct literals."
- },
- {
-  "id": "TS1-rename",
-  "fixture": "fixture-ts",
-  "prompt": "Rename the function blendScores to fuseScores everywhere in this codebase (definition and all call sites). Keep everything compiling.",
-  "check": "! grep -rq 'blendScores' src && grep -q 'export function fuseScores' src/rank.ts && grep -q 'fuseScores' src/query.ts && npm run -s typecheck",
-  "why": "R1's twin on the SAME-shaped codebase in TS — cross-language comparability by construction."
- },
- {
-  "id": "TS2-move",
-  "fixture": "fixture-ts",
-  "prompt": "Move the tokenizer module: src/tokenize.ts should become src/text/tokenize.ts. Update every import so everything still compiles.",
-  "check": "test ! -f src/tokenize.ts && test -f src/text/tokenize.ts && grep -rq 'text/tokenize' src && npm run -s typecheck",
-  "why": "R2's twin: file move with import rewriting."
- },
- {
-  "id": "TS3-locate-edit",
-  "fixture": "fixture-ts",
-  "prompt": "The rank-fusion tail dampening constant in this codebase is too aggressive. Find it and change its value to 90. Keep everything compiling.",
-  "check": "grep -Eq 'RRF_K = 90' src/rank.ts && npm run -s typecheck",
-  "why": "R3's twin: locate by concept, not filename."
- },
- {
-  "id": "TS4-body-edit",
-  "fixture": "fixture-ts",
-  "prompt": "In the query search function, add an early return: when `top === 0` (or top <= 0), return an empty array immediately, before any lookups run. Keep everything compiling.",
-  "check": "grep -Eq 'top (===|<=) 0' src/query.ts && npm run -s typecheck",
-  "why": "R4's twin: one statement at a described position."
- },
- {
-  "id": "TS5-schema-field",
-  "fixture": "fixture-ts",
-  "prompt": "Add a required field `nameLower: string` to the DocEntry interface — the lowercase form of the entry's `name` — and set it at every place a DocEntry object is constructed (use name.toLowerCase() or the equivalent). Keep everything compiling.",
-  "check": "grep -q 'nameLower: string' src/types.ts && grep -q 'nameLower' src/store.ts && grep -q 'nameLower' src/query.ts && npm run -s typecheck",
-  "why": "R5's twin: the required-field gate exercise, tsc enforcing both construction sites."
- },
- {
-  "id": "TS6-type-rename",
-  "fixture": "fixture-ts",
-  "prompt": "Rename the interface DocEntry to IndexEntry everywhere in this codebase (definition and every use, including type-only imports). Keep everything compiling.",
-  "check": "! grep -rq 'DocEntry' src && grep -q 'export interface IndexEntry' src/types.ts && npm run -s typecheck",
-  "why": "R6's twin: type rename across four files including type-only imports."
+  "id": "type-rename",
+  "why": "Type rename across four files (impls / type-only imports included).",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "Rename the interface DocEntry to IndexEntry everywhere in this codebase (definition and every use, including type-only imports). Keep everything compiling.",
+    "check": "! grep -rq 'DocEntry' src && grep -q 'export interface IndexEntry' src/types.ts && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "Rename the struct DocEntry to IndexEntry everywhere in this crate (definition, impls, and every use). Keep `cargo check` passing.",
+    "check": "! grep -rq 'DocEntry' src && grep -q 'pub struct IndexEntry' src/types.rs && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
  }
 ]

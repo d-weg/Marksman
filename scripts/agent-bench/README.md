@@ -111,25 +111,32 @@ Two optional per-task fields power T7:
 - **`arms`** — restricts which arms run the task. T7 sets `["baseline", "rust"]`: the Node
   oracle is TypeScript-only, so a `ts` arm would measure a tool on a repo it can't index.
 
-## Per-language fixture suites (the convention)
+## Suite-parameterized tasks (the convention)
 
-Every language at the gated tier gets the SAME six basic tasks on the SAME-shaped fixture —
-a small search-index codebase (tokenize / store / rank / query / dedupe over a doc-entry
-table) ported per language, so cross-language numbers compare by construction:
+The six basic tasks have ONE identity each — `rename`, `move`, `locate-edit`, `body-edit`,
+`schema-field`, `type-rename` — and `--suite` points them at a language's fixture. Same
+task, different repo:
 
-| suite | fixture | gate | ids |
-|---|---|---|---|
-| TypeScript | `fixture-ts/` | tsc | `TS1`–`TS6` (rename · move · locate-edit · body-edit · schema-field · type-rename) |
-| Rust | `fixture-rust/` | rustc / rust-analyzer | `R1`–`R6` (same six) |
+```bash
+python3 run.py --task schema-field --suite rust     # rustc as the gate
+python3 run.py --task schema-field --suite ts       # tsc as the gate
+python3 run.py --task rename --suite ts,rust        # both, in one invocation
+python3 run.py --list-tasks                         # ids + available suites
+```
+
+Every suite is a port of the SAME corpus codebase (tokenize / store / rank / query / dedupe
+over a doc-entry table) — `fixture-ts/` and `fixture-rust/` today — so cross-language numbers
+compare by construction: the only variables are the language, its compiler, and the provider
+behind it. Reports and transcripts use the expanded id (`schema-field-rust`).
 
 The schema-field task is each suite's gate exercise: a REQUIRED field on a type constructed
 in two files, so the compiler fails until every construction site is updated — ungameable.
 Checkers are verified both ways before a suite lands: every check FAILS on the untouched
 fixture, and a hand-applied reference solution passes.
 
-**Promoting a language to the gated tier ships its suite**: port the corpus fixture, add
-`<Lang>1`–`<Lang>6` to `tasks.json`, verify checkers both ways. (T1–T6 remain the legacy
-`--repo` TS tasks against the Node-prototype checkout — the published §1 numbers are tied to
-them; TS1–TS6 are the self-contained equivalents.)
+**Promoting a language to the gated tier ships its suite**: port the corpus fixture, add a
+`suites.<lang>` binding (fixture + language-native prompt/check) to each of the six tasks,
+verify checkers both ways. (T1–T6 remain the legacy `--repo` TS tasks against the
+Node-prototype checkout — the published §1 numbers are tied to them.)
 
 Latest results and analysis live in [docs/benchmarks.md](../../docs/benchmarks.md).

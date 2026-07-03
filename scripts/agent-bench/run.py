@@ -272,11 +272,46 @@ def main():
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
                     help="cost lever: claude-haiku-4-5 (cheapest) · claude-sonnet-4-6 (default) · claude-opus-4-8")
     ap.add_argument("--save-transcript", help="dir to dump per-run stream-json transcripts + a tool-usage summary (to see where tokens go)")
+    ap.add_argument("--suite", help="language suite(s) for suite-parameterized tasks (comma list, e.g. rust or ts,rust): ONE task identity, the suite just points it at that language's fixture")
+    ap.add_argument("--list-tasks", action="store_true", help="print task ids (with available suites) and exit")
     args = ap.parse_args()
+    if args.list_tasks:
+        for t in TASKS:
+            suites = f"  [suites: {', '.join(sorted(t['suites']))}]" if "suites" in t else ""
+            print(f"{t['id']}{suites}")
+        return
     arms = [a for a in args.arms.split(",") if a in ARMS]
     tasks = [t for t in TASKS if not args.task or t["id"] == args.task]
     if not tasks:
         sys.exit(f"ERROR: no task matches {args.task!r}")
+    # Suite-parameterized tasks: ONE task identity (rename, schema-field, …) bound to a
+    # language by --suite — same task, different repo. Each suite binding carries the
+    # fixture + the language-native prompt/check; the expanded id is `<task>-<suite>` so
+    # reports and transcripts stay distinguishable.
+    expanded = []
+    for t in tasks:
+        if "suites" not in t:
+            expanded.append(t)
+            continue
+        if not args.suite:
+            if args.task:
+                sys.exit(f"ERROR: task {t['id']!r} is suite-parameterized — add --suite ({', '.join(sorted(t['suites']))})")
+            continue  # no --suite and no explicit --task: skip suite tasks, run the legacy set
+        for suite in args.suite.split(","):
+            b = t["suites"].get(suite)
+            if b is None:
+                sys.exit(f"ERROR: task {t['id']!r} has no {suite!r} suite (available: {', '.join(sorted(t['suites']))})")
+            expanded.append({
+                "id": f"{t['id']}-{suite}",
+                "fixture": b["fixture"],
+                "prompt": b["prompt"],
+                "check": b["check"],
+                "why": t.get("why", ""),
+                **({"arms": b["arms"]} if "arms" in b else {}),
+            })
+    tasks = expanded
+    if not tasks:
+        sys.exit("ERROR: selection left no runnable tasks (suite tasks need --suite)")
     if any("fixture" not in t for t in tasks) and not args.repo:
         sys.exit("ERROR: --repo is required (some selected tasks don't carry their own `fixture`)")
 
