@@ -118,6 +118,10 @@ pub struct PbCommitResult {
     pub failed_op_index: i64,
     #[prost(string, tag = "6")]
     pub feedback: String,
+    /// JSON-encoded `Vec<Diag>` of pre-existing radius errors excused by the baseline diff
+    /// (empty = clean radius). JSON keeps the wire stable while the Diag shape evolves.
+    #[prost(string, tag = "7")]
+    pub preexisting_json: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -345,13 +349,18 @@ fn pb_to_opts(p: &PbEditOpts) -> EditOpts {
 
 fn commit_to_pb(c: &CommitResult) -> PbCommitResult {
     match c {
-        CommitResult::Ok { applied_ops, changed_files, repair_rounds } => PbCommitResult {
+        CommitResult::Ok { applied_ops, changed_files, repair_rounds, preexisting_in_radius } => PbCommitResult {
             ok: true,
             applied_ops: *applied_ops as u64,
             changed_files: changed_files.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
             repair_rounds: *repair_rounds,
             failed_op_index: 0,
             feedback: String::new(),
+            preexisting_json: if preexisting_in_radius.is_empty() {
+                String::new()
+            } else {
+                serde_json::to_string(preexisting_in_radius).unwrap_or_default()
+            },
         },
         CommitResult::Rejected { failed_op_index, feedback } => PbCommitResult {
             ok: false,
@@ -360,6 +369,7 @@ fn commit_to_pb(c: &CommitResult) -> PbCommitResult {
             repair_rounds: 0,
             failed_op_index: *failed_op_index,
             feedback: feedback.clone(),
+            preexisting_json: String::new(),
         },
     }
 }
@@ -369,6 +379,7 @@ fn pb_to_commit(p: &PbCommitResult) -> CommitResult {
             applied_ops: p.applied_ops as usize,
             changed_files: p.changed_files.iter().map(PathBuf::from).collect(),
             repair_rounds: p.repair_rounds,
+            preexisting_in_radius: serde_json::from_str(&p.preexisting_json).unwrap_or_default(),
         }
     } else {
         CommitResult::Rejected { failed_op_index: p.failed_op_index, feedback: p.feedback.clone() }

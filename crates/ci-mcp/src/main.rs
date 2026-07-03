@@ -915,11 +915,13 @@ impl Server {
                     // Every gate passed — commit each group (skipped on dry_run) and merge.
                     let mut applied = 0usize;
                     let mut changed: Vec<PathBuf> = Vec::new();
+                    let mut preexisting: Vec<ci_core::Diag> = Vec::new();
                     for (gi, (slot, gops)) in groups.iter().enumerate() {
                         match provider_of(*slot).apply_edits(gops, &opts).map_err(|e| e.to_string())? {
-                            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
+                            ci_core::CommitResult::Ok { applied_ops, changed_files, preexisting_in_radius, .. } => {
                                 applied += applied_ops;
                                 changed.extend(changed_files);
+                                preexisting.extend(preexisting_in_radius);
                             }
                             ci_core::CommitResult::Rejected { feedback, .. } => {
                                 // Gate passed but the write-run rejected (nondeterministic
@@ -934,7 +936,7 @@ impl Server {
                     }
                     changed.sort();
                     changed.dedup();
-                    ci_core::CommitResult::Ok { applied_ops: applied, changed_files: changed, repair_rounds: 0 }
+                    ci_core::CommitResult::Ok { applied_ops: applied, changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting }
                 }
             }
         };
@@ -953,6 +955,31 @@ impl Server {
                 Ok(format!(
                     "Applied {applied_ops} edit(s){}; no file changes were necessary.",
                     if dry_run { " (dry run)" } else { "" }
+                ))
+            }
+            ci_core::CommitResult::Ok { applied_ops, changed_files, ref preexisting_in_radius, .. }
+                if all_gated && !preexisting_in_radius.is_empty() =>
+            {
+                // Committed AND legal (pre-existing breakage never blocks an edit), but the
+                // radius is NOT clean — claiming "COMPLETE, do not verify" here sent agents
+                // away from errors one `use`-path fix away (bench move-rust round 4).
+                let mut sites: Vec<String> = preexisting_in_radius
+                    .iter()
+                    .take(12)
+                    .map(|d| format!("  {}:{} {}", d.file, d.line, d.message))
+                    .collect();
+                if preexisting_in_radius.len() > 12 {
+                    sites.push(format!("  … and {} more", preexisting_in_radius.len() - 12));
+                }
+                Ok(format!(
+                    "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; no NEW errors introduced — but {} PRE-EXISTING \
+                     error(s) remain in the touched files (they predate this batch and did not block it). Fix them next or \
+                     the build stays broken:\n{}\nFiles changed:\n{}",
+                    if dry_run { " (dry run — nothing written yet)" } else { "" },
+                    changed_files.len(),
+                    preexisting_in_radius.len(),
+                    sites.join("\n"),
+                    changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
                 ))
             }
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if all_gated => Ok(format!(

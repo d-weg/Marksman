@@ -284,6 +284,38 @@ impl LspClient {
             .collect();
         if !changes.is_empty() {
             self.send_notification("workspace/didChangeWatchedFiles", json!({"changes": changes}))?;
+            // The events invalidate the server's PROJECT view (crate graph / module tree); a
+            // pull issued against the old view returns stale-clean — a false-clean gate on
+            // moves/deletes (bench move-rust round 4: E0432s invisible to the gate). For
+            // status-reporting servers (rust-analyzer), demand a FRESH quiescent: mark
+            // non-quiescent and give the server a short window to signal. A busy signal keeps
+            // the next pull waiting for real; total silence means no reload was triggered and
+            // quiescence is restored.
+            if self.saw_server_status {
+                self.quiescent = false;
+                let mut saw_status = false;
+                let grace = Instant::now() + Duration::from_millis(2000);
+                while !self.quiescent && Instant::now() < grace {
+                    match self.rx.recv_timeout(Duration::from_millis(100)) {
+                        Ok(msg) => {
+                            if msg.get("method").and_then(Value::as_str) == Some("experimental/serverStatus") {
+                                saw_status = true;
+                            }
+                            self.observe(&msg);
+                            if msg.get("id").is_some() && msg.get("method").is_some() {
+                                self.reply_server_request(&msg)?;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            return Err(Error::Driver("lsp server disconnected".into()))
+                        }
+                    }
+                }
+                if !saw_status && !self.quiescent {
+                    self.quiescent = true; // silence: the events triggered no reload
+                }
+            }
         }
         Ok(())
     }

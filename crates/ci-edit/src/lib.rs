@@ -481,6 +481,13 @@ pub fn apply_structural(
                     vfs.write(Path::new(&rel), content.replacen(old_text.as_str(), new_text, 1));
                     Ok(())
                 }
+                0 if !new_text.is_empty() && content.contains(new_text.as_str()) => {
+                    // The batch already produced this op's end state (a move's own rewrite
+                    // covered it). Same-intent redundancy is SATISFIED, not an error — agents
+                    // pair moves with helper edits, and rejecting the pair over our own
+                    // automation cost whole bench runs (move-rust rounds 3 and 4).
+                    Ok(())
+                }
                 0 => Err(Error::Other(format!(
                     "replace_in_file: oldText not found in {rel} — it must match the file's current text exactly"
                 ))),
@@ -498,6 +505,11 @@ pub fn apply_structural(
                 ))
             })?;
             match text.matches(old_text.as_str()).count() {
+                0 if !new_text.is_empty() && text.contains(new_text.as_str()) => {
+                    // End state already present (a rename/move's own rewrite got here first) —
+                    // satisfied, not a miss.
+                    return Ok(());
+                }
                 // Echo the node's ACTUAL text so the agent can fix oldText in one retry instead
                 // of spiraling into read_node/Read calls to discover what it should have been.
                 0 => {
@@ -961,7 +973,7 @@ pub fn commit_edits(
     }
 
     if vfs.is_empty() {
-        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: vec![], repair_rounds: 0 });
+        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: vec![], repair_rounds: 0, preexisting_in_radius: vec![] });
     }
 
     let changed = vfs.changed();
@@ -1077,7 +1089,7 @@ pub fn commit_edits(
     // After = overlay (edited) content for the changed files; disk content for the dependents
     // (their source is unchanged, but tsserver re-checks them against the overlaid changed
     // files, so a freshly-broken caller surfaces here).
-    let after_files: Vec<(String, String)> = affected
+    let mut after_files: Vec<(String, String)> = affected
         .iter()
         .filter_map(|rel| {
             if changed_set.contains(rel) {
@@ -1088,11 +1100,21 @@ pub fn commit_edits(
             .map(|c| (rel.clone(), c))
         })
         .collect();
+    // Deleted files ride along as EMPTY open buffers: didOpen is the one project-view update
+    // every server applies SYNCHRONOUSLY (ordered with the pull), so consumers of a deleted/
+    // moved file fail deterministically even while the server's ASYNC file watcher is still
+    // ingesting the disk-level deletion (bench move-rust round 4: the E0432s raced the notify
+    // loader and gated "clean"). The transient disk removal + watched-file events remain the
+    // durable signal; this is the synchronous one.
+    for rel in &deleted_rels {
+        after_files.push((rel.clone(), String::new()));
+    }
     let after = engine.diagnostics(&after_files)?;
     // Gate as a diff, computed LAZILY: if the post-edit state is clean, there can be no newly
     // introduced error, so we commit WITHOUT the baseline pass — the happy path (a good edit), which
     // halves the gate's type-check work. Only when `after` has errors do we pay the baseline pass, to
     // tell a freshly-introduced error from one that was already there (disk is untouched until commit).
+    let mut preexisting: Vec<Diag> = Vec::new();
     let new: Vec<&Diag> = if after.is_empty() {
         Vec::new()
     } else {
@@ -1114,15 +1136,22 @@ pub fn commit_edits(
             *baseline_counts.entry(diag_key(&d)).or_default() += 1;
         }
         let mut seen: HashMap<String, usize> = HashMap::new();
-        after
-            .iter()
-            .filter(|d| {
-                let k = diag_key(d);
-                let n = seen.entry(k.clone()).or_default();
-                *n += 1;
-                *n > baseline_counts.get(&k).copied().unwrap_or(0)
-            })
-            .collect()
+        let mut split: Vec<&Diag> = Vec::new();
+        for d in &after {
+            let k = diag_key(d);
+            let n = seen.entry(k.clone()).or_default();
+            *n += 1;
+            if *n > baseline_counts.get(&k).copied().unwrap_or(0) {
+                split.push(d);
+            } else {
+                // Excused by the baseline: PRE-EXISTING breakage in the radius. Legal to
+                // commit past (clause 5), but the result must CARRY it — a "clean/COMPLETE"
+                // claim over a still-broken radius sent agents away from real errors
+                // (bench move-rust round 4).
+                preexisting.push(d.clone());
+            }
+        }
+        split
     };
 
     if !new.is_empty() {
@@ -1212,8 +1241,11 @@ pub fn commit_edits(
         // guards so their drops neither delete the former nor resurrect the latter.
         transient.0.clear();
         transient_del.0.clear();
+        // Close the empty stand-in buffers for deleted files: left open, they'd shadow the
+        // REAL deletion (an empty module resolves; an absent one errors) for every later gate.
+        let _ = engine.fs_events(&[], &deleted_rels);
     }
-    Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0 })
+    Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting })
 }
 
 // ── Composed: ReadIndex × GateEngine = LanguageProvider ─────────────────────────────────────

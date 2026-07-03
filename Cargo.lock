@@ -204,6 +204,7 @@ version = "0.1.0"
 dependencies = [
  "ci-core",
  "prost",
+ "serde_json",
  "tempfile",
 ]
 

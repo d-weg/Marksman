@@ -269,6 +269,12 @@ pub enum CommitResult {
         changed_files: Vec<PathBuf>,
         #[serde(default)]
         repair_rounds: u32,
+        /// PRE-EXISTING errors in the touched radius, excused by the baseline diff (clause 5:
+        /// prior breakage never blocks an edit). Non-empty means the commit is legal but the
+        /// radius is NOT clean — responses must say so instead of claiming "clean/COMPLETE"
+        /// (bench move-rust round 4: a mid-flight repo stayed broken behind a COMPLETE claim).
+        #[serde(default)]
+        preexisting_in_radius: Vec<Diag>,
     },
     Rejected {
         #[serde(default)]

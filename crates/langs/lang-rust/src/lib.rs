@@ -34,6 +34,72 @@ struct RustEngine {
     lsp: LspClient,
 }
 
+/// Diagnostics for references to files the CURRENT BATCH deletes (empty-content buffers, the
+/// gate's deletion convention): `use crate::a::b…` chains and `mod x;` decls resolving to a
+/// deleted path. This is the E0432/E0583 class rust-analyzer's pull diagnostics never report.
+fn deleted_path_references(root: &Path, files: &[(String, String)]) -> Vec<ci_core::Diag> {
+    let deleted: std::collections::HashSet<&str> =
+        files.iter().filter(|(_, c)| c.is_empty()).map(|(f, _)| f.as_str()).collect();
+    if deleted.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (rel, content) in files.iter().filter(|(_, c)| !c.is_empty()) {
+        for (i, line) in content.lines().enumerate() {
+            // `crate::a::b::…` — walk the segment chain; any prefix landing on a deleted
+            // module file is a stranded reference.
+            let mut rest = line;
+            while let Some(pos) = rest.find("crate::") {
+                let tail = &rest[pos + 7..];
+                let segs: Vec<&str> = tail
+                    .split("::")
+                    .map(|s| s.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_')))
+                    .take_while(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                    .collect();
+                for n in 1..=segs.len() {
+                    let base = segs[..n].join("/");
+                    for cand in [format!("src/{base}.rs"), format!("src/{base}/mod.rs")] {
+                        if deleted.contains(cand.as_str()) {
+                            out.push(ci_core::Diag {
+                                file: rel.clone(),
+                                code: 0,
+                                message: format!(
+                                    "unresolved import `crate::{}` — {cand} is deleted/moved by this batch (E0432); update the path",
+                                    segs[..n].join("::")
+                                ),
+                                line: i as u32 + 1,
+                            });
+                        }
+                    }
+                }
+                rest = &rest[pos + 7..];
+            }
+            // `mod x;` decls whose file this batch deletes (E0583-class, decl side).
+            let t = line.trim_start();
+            let decl = t.strip_prefix("pub ").unwrap_or(t);
+            if let Some(m) = decl.strip_prefix("mod ") {
+                if let Some(name) = m.trim_end().strip_suffix(';') {
+                    if let Some(target) = resolve_mod(root, rel, name.trim()) {
+                        let target = target.to_string_lossy().replace('\\', "/");
+                        if deleted.contains(target.as_str()) {
+                            out.push(ci_core::Diag {
+                                file: rel.clone(),
+                                code: 0,
+                                message: format!(
+                                    "`mod {}` points at {target}, which this batch deletes/moves (E0583); update or remove the declaration",
+                                    name.trim()
+                                ),
+                                line: i as u32 + 1,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn workspace_edit_is_empty(we: &serde_json::Value) -> bool {
     use serde_json::Value;
     let dc = we.get("documentChanges").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true);
@@ -47,7 +113,16 @@ fn workspace_edit_is_empty(we: &serde_json::Value) -> bool {
 
 impl GateEngine for RustEngine {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
-        self.lsp.diagnostics(files)
+        let mut out = self.lsp.diagnostics(files)?;
+        // Gap-fill a rust-analyzer blind spot: its native (pull) diagnostics DO NOT include
+        // unresolved imports — `use crate::gone::x;` returns ZERO diagnostics even steady-
+        // state (verified directly; rustc-grade errors live in its cargo-check integration,
+        // which is far too slow per edit). So every move/delete that stranded a consumer
+        // gated "clean" (bench move-rust, three rounds of it). The gate marks batch-deleted
+        // files as EMPTY buffers; flag any `crate::…` path or `mod x;` decl that resolves to
+        // one of them — deterministic, buffer-aware, zero false positives on live code.
+        out.extend(deleted_path_references(&self.root, files));
+        Ok(out)
     }
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<serde_json::Value> {
         GateEngine::rename(&mut self.lsp, file, line, character, new_name)
@@ -215,21 +290,18 @@ impl RustProvider {
         Some(graph)
     }
 
-    /// The instant in-process graph: tree-sitter `mod` edges over the whole repo.
+    /// The instant in-process graph: tree-sitter `mod` + resolved `use` edges over the whole
+    /// repo — the SAME per-file machinery the scip drift overlay uses. It must include `use`
+    /// edges: a file's importers via `use crate::x::…` are exactly the blast radius a
+    /// move/delete needs, and the `mod`-only graph left them out (a moved module's consumers
+    /// were invisible to the gate when no scip cache existed — bench move-rust round 4).
     fn syntactic_graph(&self) -> ImportGraph {
         let mut graph: ImportGraph = BTreeMap::new();
         for rel in rust_files(&self.root) {
-            let abs = self.root.join(&rel);
-            let Ok(content) = std::fs::read_to_string(&abs) else { continue };
-            let Some(tree) = Self::parse(&content) else { continue };
-            let mut edges = Vec::new();
-            for module in mod_decls(tree.root_node(), content.as_bytes()) {
-                if let Some(target) = resolve_mod(&self.root, &rel, &module) {
-                    edges.push(target);
+            if let Some(edges) = self.edges_from_disk(&rel) {
+                if !edges.is_empty() {
+                    graph.insert(PathBuf::from(&rel), edges);
                 }
-            }
-            if !edges.is_empty() {
-                graph.insert(PathBuf::from(&rel), edges);
             }
         }
         graph
@@ -781,12 +853,14 @@ mod tests {
         fs::write(root.join("src/lexer.rs"), "pub struct Token;\n").unwrap();
         fs::write(root.join("src/parser.rs"), "use crate::lexer::Token;\npub fn parse(_t: Token) {}\n").unwrap();
 
-        // tree-sitter mod graph: parser is NOT linked to lexer.
+        // The syntactic fallback graph carries `use` edges too (mod + resolved use — the
+        // same per-file machinery as the drift overlay): a moved module's consumers must be
+        // in the blast radius even with no scip cache (bench move-rust round 4).
         let p = RustProvider::new(root);
-        let mod_g = p.import_graph().unwrap();
+        let syn_g = p.import_graph().unwrap();
         assert!(
-            !mod_g.get(&PathBuf::from("src/parser.rs")).map(|e| e.contains(&PathBuf::from("src/lexer.rs"))).unwrap_or(false),
-            "mod graph should NOT have parser->lexer"
+            syn_g.get(&PathBuf::from("src/parser.rs")).map(|e| e.contains(&PathBuf::from("src/lexer.rs"))).unwrap_or(false),
+            "syntactic graph must carry the use edge parser->lexer"
         );
 
         // SCIP graph: the `use crate::lexer::Token` dependency IS captured.
@@ -868,10 +942,15 @@ mod tests {
         let p2 = RustProvider::new(root).with_scip(true);
         assert!(has_edge(&p2.import_graph().unwrap()), "drift overlay serves the edge across sessions");
 
-        // No fingerprint -> the cache is refused (mod-graph fallback), never served stale.
+        // No fingerprint -> the SCIP cache is refused; the syntactic fallback (mod + use,
+        // which now also carries this edge) serves instead — never a cache of unknown age.
+        // Distinguish the sources by scope: delete the USE line on disk; a refused cache
+        // means the syntactic graph re-reads disk and the edge disappears, while a (wrongly)
+        // trusted cache would still serve the stale edge.
         fs::remove_file(root.join(".marksman/rust.scip.fingerprint.json")).unwrap();
+        fs::write(root.join("src/parser.rs"), "pub fn parse() {}\n").unwrap();
         let p3 = RustProvider::new(root).with_scip(true);
-        assert!(!has_edge(&p3.import_graph().unwrap()), "fingerprint-less cache must not be trusted");
+        assert!(!has_edge(&p3.import_graph().unwrap()), "fingerprint-less cache must not be trusted (edge must reflect DISK, not the stale cache)");
     }
 
     #[test]
@@ -950,6 +1029,81 @@ mod tests {
         assert!(matches!(res, CommitResult::Ok { .. }), "redundant helper must not sink the batch: {res:?}");
         let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
         assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // Bench move-rust round 4, attempt 1: the agent's COMPLETE plan — move + helper create +
+    // helper text edits that movefix's own rewrite also performs. Same-intent redundancy must
+    // be SATISFIED (idempotent create, satisfied replace), committing the whole batch in ONE
+    // call. #[ignore]; `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn move_batch_with_redundant_text_helpers_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"mv4\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod store;\npub mod tokenize;\n").unwrap();
+        fs::write(root.join("src/tokenize.rs"), "pub fn normalize(t: &str) -> String {\n    t.to_lowercase()\n}\n").unwrap();
+        fs::write(root.join("src/store.rs"), "use crate::tokenize::normalize;\n\npub fn add(t: &str) -> String {\n    normalize(t)\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let res = p
+            .apply_edits(
+                &[
+                    EditOp::MoveFile { from: "src/tokenize.rs".into(), to: "src/text/tokenize.rs".into() },
+                    EditOp::CreateFile { path: "src/text/mod.rs".into(), code: "pub mod tokenize;\n".into() },
+                    EditOp::ReplaceInFile { path: "src/lib.rs".into(), old_text: "pub mod tokenize;".into(), new_text: "pub mod text;".into() },
+                    EditOp::ReplaceInFile { path: "src/store.rs".into(), old_text: "use crate::tokenize::normalize;".into(), new_text: "use crate::text::tokenize::normalize;".into() },
+                ],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "the complete redundant batch commits in ONE call: {res:?}");
+        let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // Bench move-rust round 4, attempt 3: the repo was ALREADY broken pre-batch (the mod decl
+    // hand-edited, use paths not), so the baseline diff legally excuses those errors — the
+    // commit is fine per clause 5. What was WRONG was the result claiming a clean radius.
+    // The commit must CARRY the excused breakage (preexisting_in_radius naming store.rs) so
+    // the response can hand the agent the remaining fixes instead of "COMPLETE, don't verify".
+    // A reject naming store.rs is also acceptable (engine-dependent timing).
+    // #[ignore]; `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn move_after_manual_decl_edit_must_not_false_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"mv5\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        // The decl already points at `text` (agent hand-edited it); the use path does NOT.
+        fs::write(root.join("src/lib.rs"), "pub mod store;\npub mod text;\n").unwrap();
+        fs::write(root.join("src/tokenize.rs"), "pub fn normalize(t: &str) -> String {\n    t.to_lowercase()\n}\n").unwrap();
+        fs::write(root.join("src/store.rs"), "use crate::tokenize::normalize;\n\npub fn add(t: &str) -> String {\n    normalize(t)\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let res = p
+            .apply_edits(
+                &[
+                    EditOp::MoveFile { from: "src/tokenize.rs".into(), to: "src/text/tokenize.rs".into() },
+                    EditOp::CreateFile { path: "src/text/mod.rs".into(), code: "pub mod tokenize;\n".into() },
+                ],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        match res {
+            CommitResult::Rejected { feedback, .. } => {
+                assert!(feedback.contains("store.rs"), "reject must name the broken importer:\n{feedback}");
+                assert!(root.join("src/tokenize.rs").is_file(), "reject leaves disk untouched");
+            }
+            CommitResult::Ok { preexisting_in_radius, .. } => {
+                assert!(
+                    preexisting_in_radius.iter().any(|d| d.file.contains("store.rs")),
+                    "a commit over a pre-broken radius must CARRY the excused breakage naming store.rs, got: {preexisting_in_radius:?}"
+                );
+            }
+        }
     }
 
     // The R2-bench false-clean, as an invariant: a COMMITTED move must leave a compiling
