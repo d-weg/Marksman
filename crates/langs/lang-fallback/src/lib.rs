@@ -131,6 +131,26 @@ impl FallbackProvider {
         parser.parse(content, None)
     }
 
+    /// Outgoing import edges for ONE file — the per-file slice of `import_graph()`, so a
+    /// post-commit freshness refresh parses just the changed files instead of re-walking
+    /// the whole repo. Languages without cheap-and-reliable resolution return no edges,
+    /// same as the whole-graph path.
+    pub fn file_imports(&self, rel: &str) -> Vec<PathBuf> {
+        if !matches!(self.lang, FbLang::Python | FbLang::Js | FbLang::Ts) {
+            return Vec::new();
+        }
+        let Ok(content) = std::fs::read_to_string(self.root.join(rel)) else { return Vec::new() };
+        let Some(tree) = self.parse(&content) else { return Vec::new() };
+        let mut edges: Vec<PathBuf> = Vec::new();
+        match self.lang {
+            FbLang::Python => collect_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+            _ => collect_js_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+        }
+        edges.sort();
+        edges.dedup();
+        edges
+    }
+
     fn rel(&self, file: &Path) -> String {
         let p = if file.is_absolute() { file.strip_prefix(&self.root).unwrap_or(file) } else { file };
         p.to_string_lossy().replace('\\', "/")
@@ -193,21 +213,10 @@ impl LanguageProvider for FallbackProvider {
         // (dotted modules) and JS/TS (relative specifiers). Other fallback languages honestly
         // report NO edges (retrieval still works — graph expansion just doesn't) rather than
         // guessing edges from partially-understood import syntax.
-        if !matches!(self.lang, FbLang::Python | FbLang::Js | FbLang::Ts) {
-            return Ok(BTreeMap::new());
-        }
         let mut graph: ImportGraph = BTreeMap::new();
         for ext in self.lang.exts() {
             for rel in source_files(&self.root, ext) {
-                let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
-                let Some(tree) = self.parse(&content) else { continue };
-                let mut edges: Vec<PathBuf> = Vec::new();
-                match self.lang {
-                    FbLang::Python => collect_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges),
-                    _ => collect_js_imports(tree.root_node(), content.as_bytes(), &rel, &self.root, &mut edges),
-                }
-                edges.sort();
-                edges.dedup();
+                let edges = self.file_imports(&rel);
                 if !edges.is_empty() {
                     graph.insert(PathBuf::from(&rel), edges);
                 }

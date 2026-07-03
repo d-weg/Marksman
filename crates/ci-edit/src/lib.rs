@@ -1126,12 +1126,17 @@ pub type EngineFactory = std::sync::Arc<dyn Fn(&Path) -> Result<Box<dyn GateEngi
 use ci_core::{Granularity, ImportGraph, LanguageProvider, ReadIndex};
 use std::sync::{Arc, Mutex};
 
+/// Live re-description of one repo-relative file (current-disk symbols + imports) for
+/// artifact readers whose ENGINE can't provide `file_summaries` — e.g. a tree-sitter parse.
+pub type LiveSummarizer = Arc<dyn Fn(&str) -> Option<FileSummary> + Send + Sync>;
+
 pub struct Composed<R: ReadIndex> {
     root: PathBuf,
     read: R,
     engine_factory: EngineFactory,
     engine: Arc<Mutex<Option<Box<dyn GateEngine + Send>>>>,
     fresh: Arc<Mutex<HashMap<String, FileSummary>>>,
+    live_summarizer: Option<LiveSummarizer>,
 }
 
 impl<R: ReadIndex> Composed<R> {
@@ -1142,7 +1147,23 @@ impl<R: ReadIndex> Composed<R> {
             engine_factory,
             engine: Arc::new(Mutex::new(None)),
             fresh: Arc::new(Mutex::new(HashMap::new())),
+            live_summarizer: None,
         }
+    }
+
+    /// The freshness fallback for artifact readers: when the engine returns no
+    /// `file_summaries` (LSP engines), re-describe committed files with this instead of
+    /// letting reads lag until the next reindex. Irrelevant for `live()` readers.
+    pub fn with_live_summarizer(mut self, s: LiveSummarizer) -> Self {
+        self.live_summarizer = Some(s);
+        self
+    }
+
+    /// Repo-relative posix key — callers pass relative OR absolute paths; the fresh map
+    /// must not miss an override because of the spelling.
+    fn rel(&self, file: &Path) -> String {
+        let p = if file.is_absolute() { file.strip_prefix(&self.root).unwrap_or(file) } else { file };
+        p.to_string_lossy().replace('\\', "/")
     }
 }
 
@@ -1153,9 +1174,8 @@ impl<R: ReadIndex> LanguageProvider for Composed<R> {
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
         if !self.read.live() {
-            let rel = file.to_string_lossy().replace('\\', "/");
             if let Ok(m) = self.fresh.lock() {
-                if let Some(s) = m.get(&rel) {
+                if let Some(s) = m.get(&self.rel(file)) {
                     return Ok(if s.deleted { vec![] } else { s.nodes.clone() });
                 }
             }
@@ -1231,7 +1251,19 @@ impl<R: ReadIndex> LanguageProvider for Composed<R> {
                                 }
                             }
                         }
-                        Ok(None) => {} // engine can't re-describe: reads lag until reindex
+                        Ok(None) => {
+                            // Engine can't re-describe (LSP engines): use the recipe's live
+                            // summarizer if it has one; else reads lag until the next reindex.
+                            if let Some(summarize) = &self.live_summarizer {
+                                if let Ok(mut m) = self.fresh.lock() {
+                                    for rel in &rels {
+                                        if let Some(s) = summarize(rel) {
+                                            m.insert(rel.clone(), s);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Err(e) => eprintln!("[composed] post-edit read refresh failed ({e}); reads lag until reindex"),
                     }
                 }

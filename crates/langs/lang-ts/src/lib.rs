@@ -206,7 +206,9 @@ fn local_tsgo() -> Option<PathBuf> {
         return Some(PathBuf::from(bin));
     }
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).map(|d| d.join("tsgo")).find(|p| p.is_file())
+    std::env::split_paths(&path)
+        .flat_map(|d| ["tsgo", "tsgo.exe", "tsgo.cmd"].map(|n| d.join(n)))
+        .find(|p| p.is_file())
 }
 
 impl TsProvider {
@@ -503,18 +505,20 @@ impl LanguageProvider for TsProvider {
                         // the ts-morph sidecar does. Approximate from tree-sitter on CURRENT
                         // disk — the same read shape TsTreeGated serves — so reads track the
                         // commit instead of serving pre-edit state; scip fidelity (flattened
-                        // barrels, semantic edges) returns at the next reindex.
+                        // barrels, semantic edges) returns at the next reindex. Per-file: only
+                        // the changed files are parsed, never a whole-repo walk per commit.
                         let fb = lang_fallback::FallbackProvider::new(&self.root, lang_fallback::FbLang::Ts);
-                        let graph = fb.import_graph().unwrap_or_default();
                         if let Ok(mut m) = self.fresh.lock() {
                             for rel in &rels {
                                 let deleted = !self.root.join(rel).exists();
-                                let nodes = if deleted {
-                                    vec![]
+                                let (nodes, imports) = if deleted {
+                                    (vec![], vec![])
                                 } else {
-                                    fb.structure(Path::new(rel)).unwrap_or_default()
+                                    (
+                                        fb.structure(Path::new(rel)).unwrap_or_default(),
+                                        fb.file_imports(rel),
+                                    )
                                 };
-                                let imports = graph.get(&PathBuf::from(rel)).cloned().unwrap_or_default();
                                 m.insert(
                                     rel.clone(),
                                     FileSummary { path: rel.clone(), deleted, nodes, imports },
@@ -1016,17 +1020,24 @@ mod tests {
         let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
         let rename = EditOp::Rename { node_id: "src/math.ts#add".into(), new_name: "sum".into() };
 
+        // Restores CI_EDIT_ENGINE even if apply_edits panics — a leaked forced engine would
+        // silently change what every later ignored test measures.
+        struct EnvGuard(Option<String>);
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var("CI_EDIT_ENGINE", v),
+                    None => std::env::remove_var("CI_EDIT_ENGINE"),
+                }
+            }
+        }
         let run_with_engine = |engine: &str| -> (String, String) {
-            let saved = std::env::var("CI_EDIT_ENGINE").ok();
+            let _guard = EnvGuard(std::env::var("CI_EDIT_ENGINE").ok());
             std::env::set_var("CI_EDIT_ENGINE", engine);
             let dir = tempfile::tempdir().unwrap();
             write_fixture(dir.path());
             let p = TsProvider::index(dir.path()).expect("scip-typescript indexing");
             let res = p.apply_edits(std::slice::from_ref(&rename), &opts).unwrap();
-            match saved {
-                Some(v) => std::env::set_var("CI_EDIT_ENGINE", v),
-                None => std::env::remove_var("CI_EDIT_ENGINE"),
-            }
             assert!(matches!(res, CommitResult::Ok { .. }), "[{engine}] rename must commit: {res:?}");
             (
                 fs::read_to_string(dir.path().join("src/math.ts")).unwrap(),
