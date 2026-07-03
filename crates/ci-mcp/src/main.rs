@@ -526,9 +526,16 @@ impl Server {
             let ids: Vec<String> = named.iter().filter_map(|(f, n)| id_in(f, n)).collect();
             return match ids.len() {
                 1 => Ok(ids.into_iter().next().unwrap()),
-                _ => self
-                    .resolve_by_containment(registry, path, op_needle)
-                    .ok_or_else(|| candidate_msg(query, &ids)),
+                _ => self.resolve_by_containment(registry, path, op_needle).ok_or_else(|| {
+                    let viable = self.viable_candidates(registry, &ids, op_needle);
+                    if viable.is_empty() && op_needle.is_some_and(|n| !n.is_empty()) {
+                        no_containing_symbol_msg(query)
+                    } else if !viable.is_empty() {
+                        candidate_msg(query, &viable)
+                    } else {
+                        candidate_msg(query, &ids)
+                    }
+                }),
             };
         }
         // 2) retrieval fallback — only auto-resolve when unambiguous.
@@ -551,10 +558,52 @@ impl Server {
                 if ids.is_empty() {
                     format!("query {query:?} resolved to no symbol — use retrieve_context to find it, then edit by name/id")
                 } else {
-                    candidate_msg(query, &ids)
+                    let viable = self.viable_candidates(registry, &ids, op_needle);
+                    if viable.is_empty() && op_needle.is_some_and(|n| !n.is_empty()) {
+                        no_containing_symbol_msg(query)
+                    } else if !viable.is_empty() {
+                        candidate_msg(query, &viable)
+                    } else {
+                        candidate_msg(query, &ids)
+                    }
                 }
             }),
         }
+    }
+
+    /// Keep only candidate ids whose node text CONTAINS the op's own target text — a
+    /// suggestion the op is guaranteed to fail on is worse than none (bench R2: a file-top
+    /// `use` line token-matched symbol NAMES whose bodies couldn't contain it, and the agent
+    /// obeyed the suggestion into two dead-end retries).
+    fn viable_candidates(&self, registry: &ProviderRegistry, ids: &[String], needle: Option<&str>) -> Vec<String> {
+        let Some(needle) = needle.filter(|n| !n.is_empty()) else { return ids.to_vec() };
+        fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
+            for n in nodes {
+                if n.id == id {
+                    return Some(n);
+                }
+                if let Some(f) = find(&n.children, id) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let mut cache: std::collections::HashMap<String, (String, Vec<Node>)> = std::collections::HashMap::new();
+        ids.iter()
+            .filter(|id| {
+                let file = file_of(id).to_string();
+                let (content, nodes) = cache.entry(file.clone()).or_insert_with(|| {
+                    (
+                        std::fs::read_to_string(self.root.join(&file)).unwrap_or_default(),
+                        registry.structure(Path::new(&file)).unwrap_or_default(),
+                    )
+                });
+                find(nodes, id)
+                    .map(|n| slice_lines(content, n.range.start_line, n.range.end_line).contains(needle))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
     }
 
     /// The one symbol in `path` whose source contains `needle` — resolution by the op's own
@@ -1086,6 +1135,14 @@ fn op_file(op: &ci_core::EditOp) -> Option<String> {
         CreateFile { path, .. } | DeleteFile { path } => path.to_string_lossy().replace('\\', "/"),
     };
     (!f.is_empty()).then_some(f)
+}
+
+/// No symbol's text contains the op's target: the truthful answer, instead of candidate ids
+/// the op is guaranteed to fail on. File-top statements are the usual cause.
+fn no_containing_symbol_msg(reference: &str) -> String {
+    format!(
+        "{reference:?}: no named symbol's source contains the op's target text — file-level          statements (imports, `mod` declarations) sit outside every symbol anchor. rename/move          ops update imports automatically; for other file-top edits, modify the file directly."
+    )
 }
 
 /// Ask the agent to re-issue with one of the candidate node ids (the disambiguation reply shared

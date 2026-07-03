@@ -461,9 +461,11 @@ pub fn apply_structural(
         EditOp::ReplaceText { node_id, old_text, new_text } => {
             let file = file_of(node_id);
             let node = node_by_id(node_id, structure_of)?;
-            let text = vfs
-                .read_range(Path::new(file), &node.range)
-                .ok_or_else(|| Error::Other("node text unavailable".into()))?;
+            let text = vfs.read_range(Path::new(file), &node.range).ok_or_else(|| {
+                Error::Other(format!(
+                    "cannot read the text of '{node_id}' (its file is missing or was deleted/moved                      earlier in this batch) — re-target the op at the file's NEW path, or drop it                      if a rename/move already covers this edit"
+                ))
+            })?;
             match text.matches(old_text.as_str()).count() {
                 // Echo the node's ACTUAL text so the agent can fix oldText in one retry instead
                 // of spiraling into read_node/Read calls to discover what it should have been.
@@ -527,9 +529,11 @@ pub fn apply_structural(
         EditOp::InsertMember { node_id, code } => {
             let file = file_of(node_id);
             let node = node_by_id(node_id, structure_of)?;
-            let text = vfs
-                .read_range(Path::new(file), &node.range)
-                .ok_or_else(|| Error::Other("node text unavailable".into()))?;
+            let text = vfs.read_range(Path::new(file), &node.range).ok_or_else(|| {
+                Error::Other(format!(
+                    "cannot read the text of '{node_id}' (its file is missing or was deleted/moved                      earlier in this batch) — re-target the op at the file's NEW path, or drop it                      if a rename/move already covers this edit"
+                ))
+            })?;
             let open = block_open(&text).ok_or_else(|| {
                 Error::Other(format!("INSERT_MEMBER: node '{node_id}' has no `{{ … }}` block to insert into"))
             })?;
