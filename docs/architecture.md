@@ -34,7 +34,7 @@ Agent / CLI / MCP  (pure Rust)
         │              (loaded, O(1))   (warm process)
         │                     │              │
         │    TS:  scip-typescript index  ×  tsgo LSP → ts-morph → tsls
-        │    Rust: tree-sitter (live)    ×  rust-analyzer
+        │    Rust: tree-sitter (live) + ra scip use-graph  ×  rust-analyzer
         │    new:  tree-sitter or the ci-lsp-index sweep  ×  the language's LSP
         ▼
      READ   ── the artifact + tree-sitter deepening ── what the agent PLANS against
@@ -136,7 +136,7 @@ producers to the same expectations (`conformance_ts_scip` / `conformance_ts_lsp_
 | `ci-lsp-index` | SCIP emitter over any LSP (documentSymbol + references sweep) | ✅ |
 | `ci-edit` | gated atomic edits + anchored repair + `Composed` (ReadIndex × GateEngine) | ✅ |
 | `lang-ts` | TS provider: SCIP + tree-sitter read; gate tiers tsgo → ts-morph → tsls | ✅ |
-| `lang-rust` | Rust provider: tree-sitter read, rust-analyzer gated write | ✅ |
+| `lang-rust` | Rust provider: tree-sitter read + default `rust-analyzer scip` use-graph (fingerprinted, drift-overlaid), rust-analyzer gated write | ✅ |
 | `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Java, Ruby, C, C++): read path + ungated edits; the `ReadIndex` reference impl | ✅ |
 | `lang-template` | copyable Step-1 skeleton: `Composed` over tree-sitter reads + your checker | ✅ |
 | `ci-cli` | `index` / `retrieve` binaries | ✅ |

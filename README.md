@@ -135,11 +135,11 @@ Environment variables:
 | `CI_TSGO` | path to a `tsgo` binary (TS7 native) — enables the fastest gate tier and the `CI_TS_MODE=lsp` sweep without npx | unset (PATH is probed) |
 | `CI_TS_LSP_SERVER` | full command line for an alternative TS LSP server on the `lsp` tier (whitespace-split) | unset |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
-| `CI_TS_MODE` | TypeScript read-path ablation: `full` (default — SCIP + tree-sitter + gate) · `treesitter-gated` (tree-sitter read, same ts-morph gate, no scip/Node at startup) · `treesitter` (pure tree-sitter, ungated) · `lsp` (index produced by sweeping the tsgo language server via `ci-lsp-index` — same read path, different producer) — benchmarking knob, see docs/benchmarks.md §6 | `full` |
-| `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off), e.g. `CI_SCIP_RUST` — Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) vs `mod`-only; generated at index time (≈ a `cargo check`) and content-fingerprinted: files edited since serve fresh tree-sitter edges, and a cache without a fingerprint is refused rather than trusted stale | the `scip.<lang>` config value |
+| `CI_TS_MODE` | benchmark-reproduction knob only (read-path ablation arms + the `lsp` sweep producer; docs/benchmarks.md §2/§6) — not a supported configuration | `full` |
+| `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off). **Rust defaults ON**: the compiler-accurate `use` graph is generated on first open / refreshed at `index` when stale (≈ a `cargo check`), content-fingerprinted, with drifted files served fresh tree-sitter edges; `CI_SCIP_RUST=0` opts out | rust: on · others: the `scip.<lang>` config value |
 | `MARKSMAN_ROOT` | repo root for the MCP server (legacy `CODEINDEX_ROOT` still honored) | current directory |
 
-An optional `marksman.config.json` in the repo root (the legacy `codeindex.config.json` name is still read) overrides retrieval / index settings (top-N, RRF k, weights, …). For example, `{ "scip": { "rust": true } }` builds the Rust import graph from `rust-analyzer scip` (compiler-accurate `use` edges) instead of the `mod`-only tree-sitter graph (`scip` is a per-language map; `CI_SCIP_RUST` overrides it per-run).
+An optional `marksman.config.json` in the repo root (the legacy `codeindex.config.json` name is still read) overrides retrieval / index settings (top-N, RRF k, weights, …). For example, `{ "scip": { "rust": false } }` turns off the default `rust-analyzer scip` use-graph and serves the `mod`-only tree-sitter graph instead (`scip` is a per-language map; `CI_SCIP_RUST` overrides it per-run).
 
 ## Status
 

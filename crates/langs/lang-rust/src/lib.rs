@@ -79,6 +79,21 @@ impl RustProvider {
         }
     }
 
+    /// TS-parity startup (`TsProvider::open` is the model): when the semantic graph is
+    /// enabled and its artifact is MISSING, generate it on first open (≈ a `cargo check`,
+    /// exactly like TypeScript's first scip-typescript run); afterwards the cached graph
+    /// loads instantly and drift is overlaid per file — startup never regenerates. Reads are
+    /// never blocked: a failed generation warns and serves the tree-sitter graph.
+    pub fn open(root: &Path, use_scip: bool) -> Self {
+        if use_scip && !root.join(".marksman").join("rust.scip").is_file() {
+            eprintln!("[lang-rust] generating rust-analyzer scip graph (first open, ≈ cargo check) …");
+            if let Err(e) = refresh_scip(root) {
+                eprintln!("[lang-rust] scip graph unavailable ({e}); using the tree-sitter graph");
+            }
+        }
+        Self::new(root).with_scip(use_scip)
+    }
+
     /// Enable the compiler-accurate `rust-analyzer scip` graph (see [`RustProvider::use_scip`]).
     pub fn with_scip(mut self, use_scip: bool) -> Self {
         self.use_scip = use_scip;
@@ -153,6 +168,26 @@ impl RustProvider {
         Some(graph)
     }
 
+    /// The instant in-process graph: tree-sitter `mod` edges over the whole repo.
+    fn syntactic_graph(&self) -> ImportGraph {
+        let mut graph: ImportGraph = BTreeMap::new();
+        for rel in rust_files(&self.root) {
+            let abs = self.root.join(&rel);
+            let Ok(content) = std::fs::read_to_string(&abs) else { continue };
+            let Some(tree) = Self::parse(&content) else { continue };
+            let mut edges = Vec::new();
+            for module in mod_decls(tree.root_node(), content.as_bytes()) {
+                if let Some(target) = resolve_mod(&self.root, &rel, &module) {
+                    edges.push(target);
+                }
+            }
+            if !edges.is_empty() {
+                graph.insert(PathBuf::from(&rel), edges);
+            }
+        }
+        graph
+    }
+
     /// Current outgoing edges of `rel` from disk (`None` = file gone).
     fn edges_from_disk(&self, rel: &str) -> Option<Vec<PathBuf>> {
         let content = std::fs::read_to_string(self.root.join(rel)).ok()?;
@@ -166,6 +201,21 @@ impl RustProvider {
 /// (`CI_RUST_SCIP`). Run at index time (a batch step); `import_graph` then reads it. Slow (≈ a
 /// `cargo check`), so it's never on the live path. Errors propagate so the caller can warn and
 /// fall back to the tree-sitter `mod` graph.
+/// `refresh_scip`, skipped when the cache is already true to the source (fingerprint match,
+/// zero drifted files) — `index` calls this so a fresh `open()`-generated cache isn't paid
+/// for twice, while a stale one is regenerated at the batch step where slow is acceptable.
+pub fn refresh_scip_if_stale(root: &Path) -> Result<bool> {
+    if root.join(".marksman").join("rust.scip").is_file() {
+        if let Some(drift) = usegraph::drifted_files(root) {
+            if drift.is_empty() {
+                return Ok(false); // cache fresh — nothing to do
+            }
+        }
+    }
+    refresh_scip(root)?;
+    Ok(true)
+}
+
 pub fn refresh_scip(root: &Path) -> Result<()> {
     let out = root.join(".marksman").join("rust.scip");
     if let Some(d) = out.parent() {
@@ -221,22 +271,7 @@ impl LanguageProvider for RustProvider {
                 return Ok(g);
             }
         }
-        let mut graph: ImportGraph = BTreeMap::new();
-        for rel in rust_files(&self.root) {
-            let abs = self.root.join(&rel);
-            let Ok(content) = std::fs::read_to_string(&abs) else { continue };
-            let Some(tree) = Self::parse(&content) else { continue };
-            let mut edges = Vec::new();
-            for module in mod_decls(tree.root_node(), content.as_bytes()) {
-                if let Some(target) = resolve_mod(&self.root, &rel, &module) {
-                    edges.push(target);
-                }
-            }
-            if !edges.is_empty() {
-                graph.insert(PathBuf::from(&rel), edges);
-            }
-        }
-        Ok(graph)
+        Ok(self.syntactic_graph())
     }
 
     /// Start rust-analyzer and load the cargo workspace NOW, on a background thread, so the
@@ -282,10 +317,22 @@ impl LanguageProvider for RustProvider {
 
         let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
 
-        // Reverse import map (file -> who `mod`-includes it) for the blast-radius gate + delete
-        // safety, derived from the tree-sitter mod graph.
-        let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
-        let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
+        // Blast-radius policy follows the graph's edge semantics (the ReadIndex rule, bench
+        // T9): the compiler-accurate scip `use` graph flattens re-exports, so ONE reverse hop
+        // is sound; the syntactic fallback does not, so its radius must expand TRANSITIVELY
+        // or a `pub use` chain hides consumers from the gate.
+        let (graph, semantic) = match self.use_scip.then(|| self.scip_graph()).flatten() {
+            Some(g) => (g, true),
+            None => (self.syntactic_graph(), false),
+        };
+        let reverse = ci_core::reverse_import_map(&graph);
+        let reverse_imports = |file: &str| {
+            if semantic {
+                reverse.get(file).cloned().unwrap_or_default()
+            } else {
+                ci_core::transitive_reverse_imports(&reverse, file)
+            }
+        };
 
         let r = ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
         // Keep the scip-backed graph true in-session: re-describe each committed file's edges

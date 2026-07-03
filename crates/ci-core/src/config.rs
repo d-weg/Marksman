@@ -138,7 +138,10 @@ impl Config {
                 return on(v);
             }
         }
-        self.scip.get(lang).copied().unwrap_or(false)
+        // Rust defaults ON: its semantic graph is a first-class artifact like TypeScript's
+        // (generated on first open, cached + drift-overlaid after). `scip.rust=false` or
+        // `CI_SCIP_RUST=0` opts out.
+        self.scip.get(lang).copied().unwrap_or(lang == "rust")
     }
 
     /// Whether `lang`'s provider is enabled (the manifest's `enabled`, defaulting to `true`), with
@@ -196,6 +199,7 @@ mod tests {
         assert_eq!(c.scip.get("rust"), Some(&true), "scip.rust parsed");
         assert!(c.scip_enabled("rust"), "rust enabled via config");
         assert!(!c.scip_enabled("go"), "unset language off");
+        assert!(Config::default().scip_enabled("rust"), "rust semantic graph is on by default");
         assert!(Config::default().scip.is_empty(), "empty by default");
     }
 

@@ -14,7 +14,7 @@ crates (referenced per clause below); they are instances of this contract, not e
 | tier | read path | edit gate | `gated()` | examples |
 |---|---|---|---|---|
 | **full** | SCIP (semantic) + tree-sitter | the language's compiler | `true` | TypeScript, Rust |
-| **tree-sitter + gate** | tree-sitter + syntactic imports | the language's compiler | `true` | (rollout Step 1 — `TsTreeGated` is the template) |
+| **tree-sitter + gate** | tree-sitter + syntactic imports | the language's compiler | `true` | (rollout Step 1 — copy `lang-template`) |
 | **ungated fallback** | tree-sitter + syntactic imports | syntax only (new parse errors reject) | `false` | Python, JS, Go, Java, Ruby, C, C++ |
 
 New languages enter at the tier the [rollout ladder](benchmarks.md#3-what-this-settles--the-provider-rollout-ladder)

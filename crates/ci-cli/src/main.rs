@@ -68,8 +68,8 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             if let Some(missing) = lang_rust::toolchain().describe_missing() {
                 eprintln!("[marksman] warning: {missing}\n  (rust indexing/reads work; type-checked edits will fail until installed)");
             }
-            eprintln!("[marksman] language: rust (tree-sitter, in-process — no Node)");
-            ProviderBuild::Ready(Arc::new(RustProvider::new(root).with_scip(config.scip_enabled("rust"))))
+            eprintln!("[marksman] language: rust (tree-sitter reads + rust-analyzer scip graph; gate: rust-analyzer)");
+            ProviderBuild::Ready(Arc::new(RustProvider::open(root, config.scip_enabled("rust"))))
         }
         "ts" => {
             // CI_TS_MODE ablation arms (docs/benchmarks.md): serve TS from tree-sitter instead
@@ -157,14 +157,15 @@ fn cmd_index(root: &Path) {
     }
     let registry = built.registry;
 
-    // Opt-in (`rustScip` config / `CI_RUST_SCIP` env): generate the compiler-accurate Rust `use`
-    // graph BEFORE indexing so it's the one persisted (import_graph reads the cache). Slow
-    // (≈ cargo check); off by default. Only when a Rust provider is actually active.
+    // Default-on (disable with `scip.rust=false` / `CI_SCIP_RUST=0`): keep the
+    // compiler-accurate Rust `use` graph true at the batch step — regenerated only when the
+    // cache is stale (provider `open()` generates a missing one; a fresh cache is free here).
     let rust_active = registry.provider_for(Path::new("_.rs")).is_some();
     if rust_active && config.scip_enabled("rust") {
-        eprintln!("[marksman] scip[rust] enabled: generating rust-analyzer scip graph (one-time, ~cargo check) …");
-        if let Err(e) = lang_rust::refresh_scip(root) {
-            eprintln!("[marksman] scip graph unavailable ({e}); using the tree-sitter mod graph");
+        match lang_rust::refresh_scip_if_stale(root) {
+            Ok(true) => eprintln!("[marksman] rust scip graph regenerated (source drifted since the cache)"),
+            Ok(false) => {}
+            Err(e) => eprintln!("[marksman] rust scip graph unavailable ({e}); using the tree-sitter mod graph"),
         }
     }
 
