@@ -270,6 +270,8 @@ fn request_retry(client: &mut LspClient, method: &str, params: Value) -> Result<
                 let m = e.to_string().to_lowercase();
                 let transient = m.contains("content modified")
                     || m.contains("-32801")
+                    || m.contains("-32802") // ServerCancelled: the server asks for a retry
+                    || m.contains("server cancelled")
                     || m.contains("-32602")
                     || m.contains("loading")
                     || m.contains("not ready");

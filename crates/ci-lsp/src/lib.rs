@@ -238,6 +238,8 @@ impl LspClient {
                     let msg = err.to_string().to_lowercase();
                     let transient = msg.contains("content modified")
                         || msg.contains("-32801")
+                        || msg.contains("-32802") // ServerCancelled + retriggerRequest: an explicit "retry me"
+                        || msg.contains("server cancelled")
                         || msg.contains("loading")
                         || msg.contains("not ready");
                     if transient && Instant::now() < deadline {

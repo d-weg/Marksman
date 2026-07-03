@@ -16,11 +16,58 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use tree_sitter::{Node as TsNode, Parser};
 
+mod movefix;
 mod usegraph;
 
 /// The rust-analyzer LSP server, loaded once and reused as the edit/gate engine — the same
 /// `GateEngine`/`LspClient` path TypeScript uses, just rust-analyzer instead of tsserver.
-type WarmEngine = Arc<Mutex<Option<LspClient>>>;
+type WarmEngine = Arc<Mutex<Option<RustEngine>>>;
+
+/// The Rust write engine: rust-analyzer for diagnostics/rename, plus a SYNTACTIC module-move
+/// fallback for the one operation ra's `willRenameFiles` doesn't cover (moves into a
+/// submodule return NO edits, leaving the `mod` decl and every `crate::` path dangling —
+/// bench `move-rust`). The fallback emits a genuine WorkspaceEdit (see `movefix`); the gate
+/// still verifies the result, so an unsupported shape degrades to a REJECT with named sites,
+/// never a silent break.
+struct RustEngine {
+    root: PathBuf,
+    lsp: LspClient,
+}
+
+fn workspace_edit_is_empty(we: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    let dc = we.get("documentChanges").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true);
+    let ch = we
+        .get("changes")
+        .and_then(Value::as_object)
+        .map(|o| o.values().all(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(true)))
+        .unwrap_or(true);
+    dc && ch
+}
+
+impl GateEngine for RustEngine {
+    fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
+        self.lsp.diagnostics(files)
+    }
+    fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<serde_json::Value> {
+        GateEngine::rename(&mut self.lsp, file, line, character, new_name)
+    }
+    fn will_rename(&mut self, from: &str, to: &str) -> Result<serde_json::Value> {
+        let we = GateEngine::will_rename(&mut self.lsp, from, to)?;
+        if workspace_edit_is_empty(&we) {
+            if let Some(fix) = movefix::move_workspace_edit(&self.root, from, to) {
+                return Ok(fix);
+            }
+        }
+        Ok(we)
+    }
+    fn sync_disk(&mut self) -> Result<()> {
+        self.lsp.sync_disk()
+    }
+    fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
+        self.lsp.fs_events(created, deleted)
+    }
+}
 
 #[derive(Clone)]
 pub struct RustProvider {
@@ -292,7 +339,7 @@ impl LanguageProvider for RustProvider {
                 if let Some((f, content)) = warm {
                     let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
                 }
-                *guard = Some(client);
+                *guard = Some(RustEngine { root: root.clone(), lsp: client });
             }
         });
     }
@@ -303,7 +350,7 @@ impl LanguageProvider for RustProvider {
         // baseline-diff + blast-radius path as TypeScript, through the GateEngine seam.
         let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
         if guard.is_none() {
-            *guard = Some(LspClient::start(&self.root, rust_analyzer_command()).map_err(|e| {
+            let lsp = LspClient::start(&self.root, rust_analyzer_command()).map_err(|e| {
                 // When the toolchain itself is the problem, say THAT (with the install hint)
                 // instead of a raw spawn error — reads worked fine, so this is the user's first
                 // signal that the WRITE path has a missing dependency.
@@ -311,7 +358,8 @@ impl LanguageProvider for RustProvider {
                     Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
                     None => e,
                 }
-            })?);
+            })?;
+            *guard = Some(RustEngine { root: self.root.clone(), lsp });
         }
         let engine: &mut dyn GateEngine = guard.as_mut().unwrap();
 
@@ -838,6 +886,39 @@ mod tests {
         let g = p.import_graph().unwrap();
         let edges = g.get(&PathBuf::from("src/lib.rs")).expect("lib.rs edges");
         assert!(edges.contains(&PathBuf::from("src/foo.rs")), "mod foo -> foo.rs: {edges:?}");
+    }
+
+    // The bench `move-rust` shape end-to-end: ONE move op must complete the whole module
+    // move — decl repurposed in lib.rs, parent mod file created, use paths rewritten —
+    // via the movefix fallback (ra's willRenameFiles returns nothing here), committing
+    // clean with zero manual follow-up. #[ignore]; `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn move_into_submodule_commits_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"mv2\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod store;\npub mod tokenize;\n").unwrap();
+        fs::write(root.join("src/tokenize.rs"), "pub fn normalize(t: &str) -> String {\n    t.to_lowercase()\n}\n").unwrap();
+        fs::write(root.join("src/store.rs"), "use crate::tokenize::normalize;\n\npub fn add(t: &str) -> String {\n    normalize(t)\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let res = p
+            .apply_edits(
+                &[EditOp::MoveFile { from: "src/tokenize.rs".into(), to: "src/text/tokenize.rs".into() }],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "one move op completes the whole move: {res:?}");
+        assert!(root.join("src/text/tokenize.rs").is_file() && !root.join("src/tokenize.rs").exists());
+        let modrs = fs::read_to_string(root.join("src/text/mod.rs")).expect("parent module file created");
+        assert!(modrs.contains("pub mod tokenize;"), "child declared: {modrs}");
+        let lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("mod text") && !lib.contains("mod tokenize;"), "decl repurposed: {lib}");
+        assert!(fs::read_to_string(root.join("src/store.rs")).unwrap().contains("crate::text::tokenize::normalize"), "use path rewritten");
+        let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
     }
 
     // The R2-bench false-clean, as an invariant: a COMMITTED move must leave a compiling

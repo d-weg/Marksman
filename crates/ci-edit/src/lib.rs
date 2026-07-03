@@ -52,10 +52,19 @@ pub trait GateEngine {
 /// LSP request errors that mean "the server is still loading the project" rather than a real
 /// failure — worth retrying with backoff. rust-analyzer mid-index returns these transiently
 /// (JSON-RPC `-32602`/`-32801`, "content modified", "still loading", …).
+/// Diagnostic code token for reject text: `TS2554 ` for numeric codes (the TypeScript
+/// convention agents pattern-match), empty when the engine's code wasn't numeric
+/// (rust-analyzer's `E0583` already lives in the message — "TS0" was noise).
+fn code_token(code: i64) -> String {
+    if code > 0 { format!("TS{code} ") } else { String::new() }
+}
+
 fn is_transient_lsp_error(msg: &str) -> bool {
     let m = msg.to_lowercase();
     m.contains("-32602")
         || m.contains("-32801")
+        || m.contains("-32802") // ServerCancelled: the server asks for a retry
+        || m.contains("server cancelled")
         || m.contains("content modified")
         || m.contains("not ready")
         || m.contains("loading")
@@ -786,6 +795,16 @@ fn apply_workspace_edit(vfs: &mut Vfs, root: &Path, we: &Value) -> Result<()> {
     let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
     if let Some(dc) = we.get("documentChanges").and_then(Value::as_array) {
         for d in dc {
+            // LSP resource operations: `documentChanges` may mix CreateFile ops with text
+            // edits (ordered — a created file's content edit follows its create op).
+            if d.get("kind").and_then(Value::as_str) == Some("create") {
+                if let Some(uri) = d.get("uri").and_then(Value::as_str) {
+                    let rel = uri_to_rel(uri, root)
+                        .ok_or_else(|| Error::Other(format!("create uri outside root: {uri}")))?;
+                    vfs.create(Path::new(&rel), String::new())?;
+                }
+                continue;
+            }
             if let (Some(uri), Some(edits)) = (
                 d.get("textDocument").and_then(|t| t.get("uri")).and_then(Value::as_str),
                 d.get("edits").and_then(Value::as_array),
@@ -1125,7 +1144,7 @@ pub fn commit_edits(
                         if anchored_op < 0 {
                             anchored_op = i as i64;
                         }
-                        (format!("op #{i} ({node_id}) -> {}:{} TS{} {}", d.file, d.line, d.code, d.message), None)
+                        (format!("op #{i} ({node_id}) -> {}:{} {}{}", d.file, d.line, code_token(d.code), d.message), None)
                     }
                     // A blast-radius error at a site NO op touched (e.g. a construction site that must
                     // now set a newly-required field). Name its enclosing symbol so the agent edits it
@@ -1134,9 +1153,9 @@ pub fn commit_edits(
                     None => match enclosing_symbol(&structure_of(&d.file), d.line) {
                         Some(id) => {
                             let fix = suggest_fix(&id, &w);
-                            (format!("{}:{} (in {id}) TS{} {}", d.file, d.line, d.code, d.message), fix)
+                            (format!("{}:{} (in {id}) {}{}", d.file, d.line, code_token(d.code), d.message), fix)
                         }
-                        None => (format!("{}:{} TS{} {}", d.file, d.line, d.code, d.message), None),
+                        None => (format!("{}:{} {}{}", d.file, d.line, code_token(d.code), d.message), None),
                     },
                 };
                 format!("{head}{}{}", snippet(&w), fix.unwrap_or_default())

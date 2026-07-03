@@ -704,7 +704,7 @@ impl Server {
             // error, it silently changes WHERE the code lands (end of body). A clear one-round-trip
             // correction beats a wrong edit that type-checks.
             if let Some(obj) = a.as_object() {
-                const KNOWN: [&str; 8] = ["action", "name", "query", "path", "value", "oldText", "newText", "target"];
+                const KNOWN: [&str; 9] = ["action", "name", "query", "path", "value", "oldText", "newText", "target", "file"];
                 for k in obj.keys() {
                     if !KNOWN.contains(&k.as_str()) {
                         let hint = if k == "after" {
@@ -724,7 +724,9 @@ impl Server {
                 }
             }
             let act = a["action"].as_str().unwrap_or("");
-            let path = a["path"].as_str().unwrap_or("").to_string();
+            // `file` is accepted as an alias for `path` — agents guess it constantly (bench:
+            // one retry per guess), and the two words mean the same thing here.
+            let path = a["path"].as_str().or_else(|| a["file"].as_str()).unwrap_or("").to_string();
             let mut name = a["name"].as_str().map(str::to_string);
             // The op's containment constraint, for auto-disambiguation of fuzzy addressing:
             // replace_text/delete_in_body's oldText and insert_in_body's `after` anchor must all
