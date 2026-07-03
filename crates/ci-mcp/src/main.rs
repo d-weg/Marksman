@@ -425,10 +425,25 @@ impl Server {
         // A path pins the file, but the name can still collide WITHIN it — collect every match there
         // and disambiguate, rather than taking the first. Only fall through to the index-wide search
         // when the name isn't defined in this file at all.
+        // With a needle AND a path, candidates must actually CONTAIN the op's target before
+        // they resolve — even a unique name match can't hold a file-top line, and resolving
+        // it anyway guarantees an apply-time miss. Zero viable → the caller's file-level
+        // fallback (path + unique oldText) takes over.
+        let gate = |ids: Vec<String>| -> Result<Vec<String>, String> {
+            if !path.is_empty() && op_needle.is_some_and(|n| !n.is_empty()) {
+                let viable = self.viable_candidates(registry, &ids, op_needle);
+                if viable.is_empty() {
+                    return Err(no_containing_symbol_msg(reference));
+                }
+                return Ok(viable);
+            }
+            Ok(ids)
+        };
         if !path.is_empty() {
             let nodes = registry.structure(Path::new(path)).unwrap_or_default();
             let ids = resolve_all_in(&nodes, reference);
             if !ids.is_empty() {
+                let ids = gate(ids)?;
                 return self.one_or_candidates(registry, reference, ids, op_needle);
             }
         }
@@ -442,6 +457,7 @@ impl Server {
                 "symbol '{reference}' not found in the index — pass a `path`, or a node id from list_anchors/retrieve_context"
             ));
         }
+        let ids = gate(ids)?;
         self.one_or_candidates(registry, reference, ids, op_needle)
     }
 
@@ -531,7 +547,18 @@ impl Server {
             named.retain(|(f, _)| f == path);
         }
         if !named.is_empty() {
-            let ids: Vec<String> = named.iter().filter_map(|(f, n)| id_in(f, n)).collect();
+            let mut ids: Vec<String> = named.iter().filter_map(|(f, n)| id_in(f, n)).collect();
+            // With a needle AND a path, even a SINGLE candidate must actually contain the
+            // op's target — a name-token match that can't hold the text sent the op into a
+            // guaranteed apply-time miss (bench move-rust round 5: `Store` matched, the
+            // file-top `use` line didn't live in it). Zero viable → the caller's file-level
+            // fallback takes over.
+            if !path.is_empty() && op_needle.is_some_and(|n| !n.is_empty()) {
+                ids = self.viable_candidates(registry, &ids, op_needle);
+                if ids.is_empty() {
+                    return Err(no_containing_symbol_msg(query));
+                }
+            }
             return match ids.len() {
                 1 => Ok(ids.into_iter().next().unwrap()),
                 _ => self.resolve_by_containment(registry, path, op_needle).ok_or_else(|| {
@@ -562,6 +589,12 @@ impl Server {
         ids.dedup();
         if !path.is_empty() {
             ids.retain(|id| file_of(id) == path);
+            if op_needle.is_some_and(|n| !n.is_empty()) {
+                ids = self.viable_candidates(registry, &ids, op_needle);
+                if ids.is_empty() {
+                    return Err(no_containing_symbol_msg(query));
+                }
+            }
         }
         match ids.len() {
             1 => Ok(ids.into_iter().next().unwrap()),
