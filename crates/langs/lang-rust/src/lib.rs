@@ -100,17 +100,6 @@ fn deleted_path_references(root: &Path, files: &[(String, String)]) -> Vec<ci_co
     out
 }
 
-fn workspace_edit_is_empty(we: &serde_json::Value) -> bool {
-    use serde_json::Value;
-    let dc = we.get("documentChanges").and_then(Value::as_array).map(|a| a.is_empty()).unwrap_or(true);
-    let ch = we
-        .get("changes")
-        .and_then(Value::as_object)
-        .map(|o| o.values().all(|v| v.as_array().map(|a| a.is_empty()).unwrap_or(true)))
-        .unwrap_or(true);
-    dc && ch
-}
-
 impl GateEngine for RustEngine {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
         let mut out = self.lsp.diagnostics(files)?;
