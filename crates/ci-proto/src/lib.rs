@@ -280,6 +280,12 @@ fn op_to_pb(op: &EditOp) -> PbEditOp {
             p.node_id = node_id.clone();
             p.text = new_name.clone();
         }
+        EditOp::ReplaceInFile { path, old_text, new_text } => {
+            p.op = "replace_in_file".into();
+            p.path = path.to_string_lossy().into_owned();
+            p.old_text = old_text.clone();
+            p.new_text = new_text.clone();
+        }
         EditOp::MoveFile { from, to } => {
             p.op = "move_file".into();
             p.from = from.to_string_lossy().into_owned();
@@ -314,6 +320,11 @@ fn pb_to_op(p: &PbEditOp) -> Result<EditOp> {
         "add_parameter" => EditOp::AddParameter { node_id: p.node_id.clone(), param: p.text.clone() },
         "set_return_type" => EditOp::SetReturnType { node_id: p.node_id.clone(), ty: p.text.clone() },
         "rename" => EditOp::Rename { node_id: p.node_id.clone(), new_name: p.text.clone() },
+        "replace_in_file" => EditOp::ReplaceInFile {
+            path: PathBuf::from(&p.path),
+            old_text: p.old_text.clone(),
+            new_text: p.new_text.clone(),
+        },
         "move_file" => EditOp::MoveFile { from: PathBuf::from(&p.from), to: PathBuf::from(&p.to) },
         "create_file" => EditOp::CreateFile { path: PathBuf::from(&p.path), code: p.text.clone() },
         "delete_file" => EditOp::DeleteFile { path: PathBuf::from(&p.path) },

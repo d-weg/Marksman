@@ -522,6 +522,14 @@ impl Server {
             .collect();
         named.sort();
         named.dedup();
+        // An op that STATES its file must never be hijacked to a symbol in another file —
+        // name-token matches outside `path` did exactly that (bench move-rust: a lib.rs
+        // mod-decl edit resolved to src/tokenize.rs#tokenize and every retry compounded).
+        // Zero in-path matches fall through to retrieval/containment and the caller's
+        // file-level fallback.
+        if !path.is_empty() {
+            named.retain(|(f, _)| f == path);
+        }
         if !named.is_empty() {
             let ids: Vec<String> = named.iter().filter_map(|(f, n)| id_in(f, n)).collect();
             return match ids.len() {
@@ -552,6 +560,9 @@ impl Server {
             .collect();
         ids.sort();
         ids.dedup();
+        if !path.is_empty() {
+            ids.retain(|id| file_of(id) == path);
+        }
         match ids.len() {
             1 => Ok(ids.into_iter().next().unwrap()),
             _ => self.resolve_by_containment(registry, path, op_needle).ok_or_else(|| {
@@ -737,9 +748,13 @@ impl Server {
             };
             // `query` — the fuzziest target: resolve a free-text description to a node_id via the
             // index/retrieval (fuse locate+edit). Only when no explicit name/id was given.
+            let mut resolution_err: Option<String> = None;
             if name.is_none() {
                 if let Some(q) = a["query"].as_str() {
-                    name = Some(self.resolve_query(&registry, q, &path, op_needle)?);
+                    match self.resolve_query(&registry, q, &path, op_needle) {
+                        Ok(id) => name = Some(id),
+                        Err(e) => resolution_err = Some(e),
+                    }
                 }
             }
             // For a symbol-targeting action, resolve the reference to a node_id UP FRONT through
@@ -752,10 +767,51 @@ impl Server {
                 "rename" | "replace_node" | "replace_text" | "set_body" | "insert_before"
                     | "insert_in_body" | "delete_in_body" | "insert_member" | "add_parameter" | "set_return_type"
             );
-            if symbol_action {
+            if symbol_action && resolution_err.is_none() {
                 if let Some(reference) = name.as_deref() {
-                    name = Some(self.resolve_symbol(&registry, &path, reference, op_needle)?);
+                    match self.resolve_symbol(&registry, &path, reference, op_needle) {
+                        Ok(id) => name = Some(id),
+                        Err(e) => {
+                            resolution_err = Some(e);
+                            name = None;
+                        }
+                    }
                 }
+            }
+            // FILE-LEVEL replace_text: text outside every symbol anchor (imports, `mod`
+            // declarations, file-top statements) is addressed by `path` + a UNIQUE `oldText` —
+            // either because no symbol was named at all, or because symbol resolution failed.
+            // Same VFS + gate as any other op; uniqueness in the file is the whole address.
+            if act == "replace_text" && !path.is_empty() && name.is_none() {
+                let old = a["oldText"].as_str().unwrap_or("");
+                let new_text = a["newText"].as_str().unwrap_or("");
+                if !old.is_empty() {
+                    let content = std::fs::read_to_string(self.root.join(&path))
+                        .map_err(|e| format!("action #{ai}: cannot read {path}: {e}"))?;
+                    match content.matches(old).count() {
+                        1 => {
+                            ops.push(ci_core::EditOp::ReplaceInFile {
+                                path: path.clone().into(),
+                                old_text: old.to_string(),
+                                new_text: new_text.to_string(),
+                            });
+                            continue;
+                        }
+                        0 => {
+                            return Err(resolution_err.unwrap_or_else(|| {
+                                format!("action #{ai}: oldText not found in {path} — it must match the file's current text exactly")
+                            }))
+                        }
+                        n => {
+                            return Err(format!(
+                                "action #{ai}: oldText occurs {n} times in {path} — extend it until unique (file-level edit), or address a symbol by name"
+                            ))
+                        }
+                    }
+                }
+            }
+            if let Some(e) = resolution_err {
+                return Err(e);
             }
             let action = Action {
                 path,
@@ -1134,7 +1190,7 @@ fn op_file(op: &ci_core::EditOp) -> Option<String> {
         | SetReturnType { node_id, .. }
         | Rename { node_id, .. } => file_of(node_id).to_string(),
         MoveFile { from, .. } => from.to_string_lossy().replace('\\', "/"),
-        CreateFile { path, .. } | DeleteFile { path } => path.to_string_lossy().replace('\\', "/"),
+        CreateFile { path, .. } | DeleteFile { path } | ReplaceInFile { path, .. } => path.to_string_lossy().replace('\\', "/"),
     };
     (!f.is_empty()).then_some(f)
 }
@@ -1143,7 +1199,7 @@ fn op_file(op: &ci_core::EditOp) -> Option<String> {
 /// the op is guaranteed to fail on. File-top statements are the usual cause.
 fn no_containing_symbol_msg(reference: &str) -> String {
     format!(
-        "{reference:?}: no named symbol's source contains the op's target text — file-level          statements (imports, `mod` declarations) sit outside every symbol anchor. rename/move          ops update imports automatically; for other file-top edits, modify the file directly."
+        "{reference:?}: no named symbol's source contains the op's target text — file-level statements (imports, `mod` declarations) sit outside every symbol anchor. rename/move ops update imports automatically; for other file-top edits use replace_text with `path` + a UNIQUE `oldText` and NO name/query — that edits the file directly, still gate-verified."
     )
 }
 
@@ -1241,7 +1297,7 @@ fn tools_list() -> Value {
         },
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move (it also updates module declarations and creates a needed parent module file); do NOT add create_file/replace_text helpers for imports or module decls alongside it (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first. • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
+            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move (it also updates module declarations and creates a needed parent module file); do NOT add create_file/replace_text helpers for imports or module decls alongside it (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
             "inputSchema": {"type":"object","properties":{
                 "actions":{"type":"array","description":"One or more edits, applied atomically and type-checked together — batch related edits here instead of separate calls.","items":{"type":"object","additionalProperties":false,"properties":{
                     "action":{"type":"string","enum":["rename","replace_text","replace_node","set_body","insert_in_body","delete_in_body","insert_member","add_parameter","set_return_type","insert_before","move_file","create_file","delete_file"],"description":"Fields per action — rename: name, value(new name) · replace_text: name, oldText, newText · replace_node: name, value(new code), target? · set_body: name, value · insert_in_body: name, value, oldText? · delete_in_body: name, oldText · insert_member: name, value · add_parameter: name, value · set_return_type: name, value · insert_before: name, value · move_file: path, value(new path) · create_file: path, value(source) · delete_file: path. For symbol actions `query` may replace `name`, and `path` may scope a bare `name`."},

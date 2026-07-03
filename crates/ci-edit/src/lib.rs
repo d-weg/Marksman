@@ -302,6 +302,7 @@ fn file_of(node_id: &str) -> &str {
 fn op_paths(op: &EditOp) -> Vec<PathBuf> {
     match op {
         EditOp::CreateFile { path, .. } | EditOp::DeleteFile { path } => vec![path.clone()],
+        EditOp::ReplaceInFile { path, .. } => vec![path.clone()],
         EditOp::MoveFile { from, to } => vec![from.clone(), to.clone()],
         EditOp::ReplaceNode { node_id, .. }
         | EditOp::InsertBefore { node_id, .. }
@@ -466,6 +467,27 @@ pub fn apply_structural(
         EditOp::InsertBefore { node_id, code } => {
             let node = node_by_id(node_id, structure_of)?;
             vfs.insert_before(Path::new(file_of(node_id)), &node.range, &format!("{code}\n\n"))
+        }
+        EditOp::ReplaceInFile { path, old_text, new_text } => {
+            // File-scoped: the escape hatch for text OUTSIDE every symbol anchor (imports,
+            // `mod` declarations). Uniqueness in the whole file is the addressing; the gate
+            // still verifies the result like any other op.
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let content = vfs
+                .read(Path::new(&rel))
+                .ok_or_else(|| Error::Other(format!("replace_in_file: {rel} does not exist")))?;
+            match content.matches(old_text.as_str()).count() {
+                1 => {
+                    vfs.write(Path::new(&rel), content.replacen(old_text.as_str(), new_text, 1));
+                    Ok(())
+                }
+                0 => Err(Error::Other(format!(
+                    "replace_in_file: oldText not found in {rel} — it must match the file's current text exactly"
+                ))),
+                n => Err(Error::Other(format!(
+                    "replace_in_file: oldText occurs {n} times in {rel} — extend it until it is unique"
+                ))),
+            }
         }
         EditOp::ReplaceText { node_id, old_text, new_text } => {
             let file = file_of(node_id);
@@ -886,7 +908,11 @@ pub fn commit_edits(
     let is_structural = |op: &EditOp| {
         !matches!(
             op,
-            EditOp::Rename { .. } | EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } | EditOp::CreateFile { .. }
+            EditOp::Rename { .. }
+                | EditOp::MoveFile { .. }
+                | EditOp::DeleteFile { .. }
+                | EditOp::CreateFile { .. }
+                | EditOp::ReplaceInFile { .. }
         )
     };
     let mut order: Vec<usize> = (0..ops.len()).collect();
@@ -1646,6 +1672,46 @@ mod tests {
         }
         fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
             Ok(json!({}))
+        }
+    }
+
+    // File-level replace: `path` + a UNIQUE oldText addresses text OUTSIDE every symbol
+    // anchor (imports, `mod` decls). Unique commits; ambiguous rejects with a count.
+    #[test]
+    fn replace_in_file_unique_commits_ambiguous_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("lib.rs"), "pub mod tokenize;\npub mod store;\n").unwrap();
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let structure_of = |_: &str| Vec::new();
+        let no_rev = |_: &str| Vec::new();
+
+        let ok = commit_edits(
+            root,
+            &[EditOp::ReplaceInFile { path: "lib.rs".into(), old_text: "pub mod tokenize;".into(), new_text: "pub mod text;".into() }],
+            &structure_of,
+            &mut NoopEngine,
+            &opts,
+            &no_rev,
+        )
+        .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "unique file-level replace commits: {ok:?}");
+        assert!(std::fs::read_to_string(root.join("lib.rs")).unwrap().contains("pub mod text;"));
+
+        let bad = commit_edits(
+            root,
+            &[EditOp::ReplaceInFile { path: "lib.rs".into(), old_text: "pub mod".into(), new_text: "mod".into() }],
+            &structure_of,
+            &mut NoopEngine,
+            &opts,
+            &no_rev,
+        )
+        .unwrap();
+        match bad {
+            CommitResult::Rejected { feedback, .. } => {
+                assert!(feedback.contains("2 times") || feedback.contains("occurs"), "counts the matches: {feedback}")
+            }
+            other => panic!("ambiguous oldText must reject: {other:?}"),
         }
     }
 

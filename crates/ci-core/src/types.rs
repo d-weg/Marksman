@@ -202,6 +202,11 @@ pub enum EditOp {
     SetReturnType { node_id: String, ty: String },
     #[serde(rename = "RENAME")]
     Rename { node_id: String, new_name: String },
+    /// File-scoped text replacement: `old_text` must occur EXACTLY ONCE in `path`. The escape
+    /// hatch for text outside every symbol anchor (imports, `mod` declarations, file-top
+    /// statements) — same VFS + gate as every other op, no node addressing required.
+    #[serde(rename = "REPLACE_IN_FILE")]
+    ReplaceInFile { path: PathBuf, old_text: String, new_text: String },
     #[serde(rename = "MOVE_FILE")]
     MoveFile { from: PathBuf, to: PathBuf },
     #[serde(rename = "CREATE_FILE")]
