@@ -288,9 +288,15 @@ def main():
     # language by --suite — same task, different repo. Each suite binding carries the
     # fixture + the language-native prompt/check; the expanded id is `<task>-<suite>` so
     # reports and transcripts stay distinguishable.
+    # --suite without --task selects ONLY the suite tasks — `--suite rust` means "run the
+    # rust suite", never "…plus every legacy task alongside it".
+    if args.suite and not args.task:
+        tasks = [t for t in tasks if "suites" in t]
     expanded = []
     for t in tasks:
         if "suites" not in t:
+            if args.suite:
+                sys.exit(f"ERROR: task {t['id']!r} is not suite-parameterized — drop --suite (its repo is fixed)")
             expanded.append(t)
             continue
         if not args.suite:
