@@ -182,6 +182,67 @@ def run_agent(repo, prompt, mcp_config, model, transcript=None):
         return {"in": 0, "out": 0, "turns": 0, "cost": 0.0, "dur": dur, "err": (r.stderr or r.stdout)[:200]}
 
 
+def normalize_transcript(path):
+    """Write `<path minus .jsonl>.calls.jsonl` — ONE record per API call, deduped.
+
+    The raw stream-json is the CLI's ground truth but it is a TRAP for accounting: an
+    assistant message streams as MULTIPLE events (one per content block), each repeating the
+    SAME cumulative usage — naive summing triple-counted a bench run's tokens. This sidecar
+    is the canonical shape for any analysis. Schema (v1), one JSON object per line:
+      {"schema": 1, "call": <0-based index>, "id": <api message id>,
+       "usage": {"fresh": n, "cache_write": n, "cache_read": n, "output": n},
+       "tools": [{"name": str, "id": str}...], "stop": <stop_reason>}
+    plus one TRAILER record {"schema": 1, "call": -1, "id": "result", "usage_total": {...},
+    "cost_usd": x} carrying the API's authoritative totals. Caveat: per-call `output` is a
+    lower bound (stream chunks snapshot output_tokens mid-message); the trailer's total is
+    exact — use it for any output/cost accounting.
+    """
+    calls = {}   # id -> record (chunks merge: max usage, union of tool blocks)
+    order = []
+    result_line = None
+    for line in pathlib.Path(path).read_text().splitlines():
+        try:
+            m = json.loads(line)
+        except Exception:
+            continue
+        if m.get("type") == "result":
+            result_line = m
+            continue
+        if m.get("type") != "assistant":
+            continue
+        msg = m.get("message", {})
+        mid = msg.get("id", "?")
+        if mid not in calls:
+            order.append(mid)
+            calls[mid] = {"schema": 1, "call": len(order) - 1, "id": mid,
+                          "usage": {"fresh": 0, "cache_write": 0, "cache_read": 0, "output": 0},
+                          "tools": [], "stop": None}
+        rec = calls[mid]
+        u = msg.get("usage", {})
+        rec["usage"]["fresh"] = max(rec["usage"]["fresh"], u.get("input_tokens", 0))
+        rec["usage"]["cache_write"] = max(rec["usage"]["cache_write"], u.get("cache_creation_input_tokens", 0))
+        rec["usage"]["cache_read"] = max(rec["usage"]["cache_read"], u.get("cache_read_input_tokens", 0))
+        rec["usage"]["output"] = max(rec["usage"]["output"], u.get("output_tokens", 0))
+        rec["stop"] = msg.get("stop_reason") or rec["stop"]
+        for c in msg.get("content", []) if isinstance(msg.get("content"), list) else []:
+            if isinstance(c, dict) and c.get("type") == "tool_use":
+                if not any(t["id"] == c.get("id") for t in rec["tools"]):
+                    rec["tools"].append({"name": c.get("name", "?"), "id": c.get("id", "?")})
+    out = pathlib.Path(str(path).removesuffix(".jsonl") + ".calls.jsonl")
+    body = "".join(json.dumps(calls[mid]) + "\n" for mid in order)
+    ru = (result_line or {}).get("usage", {}) if result_line else {}
+    trailer = {"schema": 1, "call": -1, "id": "result",
+               "usage_total": {"fresh": ru.get("input_tokens", 0),
+                                "cache_write": ru.get("cache_creation_input_tokens", 0),
+                                "cache_read": ru.get("cache_read_input_tokens", 0),
+                                "output": ru.get("output_tokens", 0)},
+               "cost_usd": (result_line or {}).get("total_cost_usd")}
+    out.write_text(body + json.dumps(trailer) + "\n")
+    t = trailer["usage_total"]
+    print(f"  normalized: {len(order)} api calls -> {out.name}  "
+          f"(in={t['fresh']+t['cache_write']+t['cache_read']} out={t['output']} cost=${trailer['cost_usd']})")
+
+
 def summarize_transcript(path):
     """Print the agent's tool calls (name + response size) from a saved stream-json transcript —
     so we can see WHERE the tokens went (e.g. a big retrieve_context response re-read each turn)."""
@@ -274,7 +335,15 @@ def main():
     ap.add_argument("--save-transcript", help="dir to dump per-run stream-json transcripts + a tool-usage summary (to see where tokens go)")
     ap.add_argument("--suite", help="language suite(s) for suite-parameterized tasks (comma list, e.g. rust or ts,rust): ONE task identity, the suite just points it at that language's fixture")
     ap.add_argument("--list-tasks", action="store_true", help="print task ids (with available suites) and exit")
+    ap.add_argument("--normalize", metavar="DIR", help="write deduped .calls.jsonl sidecars for every raw transcript in DIR and exit (no agent runs)")
     args = ap.parse_args()
+    if args.normalize:
+        for f in sorted(pathlib.Path(args.normalize).glob("*.run*.jsonl")):
+            if f.name.endswith(".calls.jsonl"):
+                continue
+            print(f.name)
+            normalize_transcript(f)
+        return
     if args.list_tasks:
         for t in TASKS:
             suites = f"  [suites: {', '.join(sorted(t['suites']))}]" if "suites" in t else ""
@@ -355,6 +424,7 @@ def main():
                 agg[arm].append(m)
                 if tx:
                     print(f"[{task['id']} {arm} run{ri}] in={m['in']} out={m['out']} turns={m['turns']} ok={m['ok']}")
+                    normalize_transcript(tx)
                     summarize_transcript(tx)
         reset(ctx["repo"], ctx["base"], ctx["snap"])
         rows.append((task["id"], agg))

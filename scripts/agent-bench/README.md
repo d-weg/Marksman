@@ -111,6 +111,20 @@ Two optional per-task fields power T7:
 - **`arms`** — restricts which arms run the task. T7 sets `["baseline", "rust"]`: the Node
   oracle is TypeScript-only, so a `ts` arm would measure a tool on a repo it can't index.
 
+## Transcript format — read the `.calls.jsonl`, not the raw stream
+
+`--save-transcript` writes two files per run: the CLI's raw `stream-json` (`….jsonl`, ground
+truth, grep it for tool inputs/outputs) and a normalized `….calls.jsonl` sidecar — ONE record
+per API call, deduped, plus a trailer with the API's authoritative totals and cost.
+
+**The raw stream is an accounting TRAP**: an assistant message streams as multiple events
+(one per content block), each repeating the SAME cumulative input usage — naive summing
+triple-counted a bench run's tokens before this sidecar existed. Any token/cost analysis must
+read `.calls.jsonl` (or the trailer). Per-call `output` in the sidecar is a lower bound
+(chunks snapshot it mid-message); the trailer's `usage_total.output` is exact.
+
+`python3 run.py --normalize <dir>` retrofits sidecars onto existing transcript dirs.
+
 ## Suite-parameterized tasks (the convention)
 
 The six basic tasks have ONE identity each — `rename`, `move`, `locate-edit`, `body-edit`,
