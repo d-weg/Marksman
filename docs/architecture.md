@@ -12,9 +12,10 @@ gated structural edits, **language-agnostic** via a provider seam.
   `ci-retrieve`, `ci-build`, `ci-vfs`, `ci-lsp` (generic LSP *transport*), `ci-arch`,
   `ci-cli`. No subprocess, no Node, no per-language knowledge.
 - **Provider (`lang-ts`) owns all external/language-specific deps:** `scip-typescript`
-  (read), `typescript-language-server` (write gate) — both via `npx`, no global install —
-  and the in-process `tree-sitter-typescript` grammar. Adding a language = a new provider
-  crate, not a change to the core.
+  (read artifact), the gate engines (`tsgo` when locally present, else the ts-morph
+  sidecar, else `typescript-language-server`) — external tools via `npx`, no global
+  install — and the in-process `tree-sitter-typescript` grammar. Adding a language = a new
+  provider crate, not a change to the core.
 
 `ci-lsp` is a language-agnostic LSP client: the provider passes it the server `Command`;
 `ci-lsp` itself knows nothing about TypeScript.
@@ -27,10 +28,57 @@ Agent / CLI / MCP  (pure Rust)
    ci-core  (BM25 · Model2Vec · RRF · weighting · retrieval)   ← language-blind
         │  LanguageProvider:  granularity() · structure()->Node tree · import_graph() · apply_edits()
         ▼
-   lang-ts  (TypeScript provider, owns the external tooling)
-     READ   ── SCIP (scip-typescript -> index.scip)  + tree-sitter (in-process)  ── merged
-     WRITE  ── VFS overlay (ci-vfs) + type-check gate (ts-morph sidecar, warm; ci-lsp -> tsls fallback)
+   a language provider  =  ReadIndex  ×  WriteEngine
+        │                     │              │
+        │              the ARTIFACT     the live CHECKER
+        │              (loaded, O(1))   (warm process)
+        │                     │              │
+        │    TS:  scip-typescript index  ×  tsgo LSP → ts-morph → tsls
+        │    Rust: tree-sitter (live)    ×  rust-analyzer
+        │    new:  tree-sitter or the ci-lsp-index sweep  ×  the language's LSP
+        ▼
+     READ   ── the artifact + tree-sitter deepening ── what the agent PLANS against
+     WRITE  ── VFS overlay (ci-vfs) + baseline-diff gate over the blast radius
 ```
+
+### The two halves: `ReadIndex` × `WriteEngine`
+
+A provider is two independently swappable parts, and they are DIFFERENT KINDS of thing —
+the naming is deliberate:
+
+- **`ReadIndex`** (`ci-core`) — the read half is an **artifact or a live parser, never a
+  running checker**: a loaded SCIP index, or tree-sitter over current disk. It answers the
+  *planning* phase — many speculative queries over unpredictable symbols (who uses this, how
+  central is it, what breaks) where most answers are discarded. That access pattern needs
+  O(1) lookups from something already loaded; measured on microsoft/TypeScript, rebuilding
+  the same answers with live per-symbol LSP queries costs 38× the indexer's one compiler
+  pass (`docs/benchmarks.md`). **Planning needs the artifact.**
+- **`GateEngine`** (`ci-edit`) — the write half IS a live process: by edit time the changed
+  symbols are known, the queries are few and targeted, and the answer must reflect the
+  post-edit state, not a snapshot. TypeScript's engine tiers: **tsgo** (TS7 native LSP —
+  ~138× faster warm gate, identical verdicts; auto-picked only when it costs no network:
+  `CI_TSGO` or `tsgo` on PATH) → **ts-morph sidecar** → **tsls**. `CI_EDIT_ENGINE=
+  tsgo|tsmorph|lsp` forces a tier; `CI_TS_LSP_SERVER` swaps the LSP-tier server command.
+
+`ci_edit::Composed<R: ReadIndex>` assembles the two halves into a `LanguageProvider`
+(`lang-template`'s `GatedTreeSitter` is the reference instance; `lang-ts`/`lang-rust` wire
+the same channels by hand pending migration). The halves talk over **exactly three
+channels**, and the wiring policy is *derived* from two properties the reader advertises —
+not hand-wired per language:
+
+| channel | direction | policy source |
+|---|---|---|
+| **radius** — the reverse-import set the gate checks | read → engine | `semantic_edges()`: compiler-accurate graphs (SCIP) flatten barrels, one hop is sound; syntactic graphs must expand **transitively** or a barrel hides its consumers (bench T9) |
+| **freshness** — post-commit read overrides | engine → read | `live()`: tree-sitter readers re-parse disk, nothing to do; artifact readers take `file_summaries` overrides (or a tree-sitter approximation when the engine can't re-describe) so reads track the commit until the next reindex |
+| **anchors** — edit ops resolve against the structure the agent saw | read → engine | always: the ids `list_anchors` advertised must be the ids `apply_edits` accepts |
+
+**Artifact producers are swappable too.** The same `index.scip` consumer accepts:
+`scip-typescript` (the default for TS — earns its cold-index cost at scale), the
+**`ci-lsp-index` sweep** (documentSymbol + references over any LSP → a genuine SCIP
+protobuf; `CI_TS_MODE=lsp` arm — full parity on fixtures/bench, 38× slower at 380k-line
+scale, so it is the producer for languages that have an LSP but *no* scip indexer, not a
+scip replacement), or tree-sitter directly (live, syntactic). The conformance suite pins
+producers to the same expectations (`conformance_ts_scip` / `conformance_ts_lsp_sweep`).
 
 ### Read = SCIP **+** tree-sitter (merged)
 - **SCIP** gives compiler-grade semantics: symbol identity, cross-file references → the
@@ -81,10 +129,12 @@ Agent / CLI / MCP  (pure Rust)
 | `ci-build` | build pipeline + incremental `update_index` | ✅ |
 | `ci-vfs` | in-memory overlay transaction | ✅ |
 | `ci-lsp` | **generic** LSP transport (provider supplies the command) | ✅ |
-| `ci-edit` | gated atomic edits + anchored repair | ✅ |
-| `lang-ts` | TS provider: SCIP + tree-sitter read, ts-morph/LSP gated write | ✅ |
+| `ci-lsp-index` | SCIP emitter over any LSP (documentSymbol + references sweep) | ✅ |
+| `ci-edit` | gated atomic edits + anchored repair + `Composed` (ReadIndex × GateEngine) | ✅ |
+| `lang-ts` | TS provider: SCIP + tree-sitter read; gate tiers tsgo → ts-morph → tsls | ✅ |
 | `lang-rust` | Rust provider: tree-sitter read, rust-analyzer gated write | ✅ |
-| `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Java, Ruby, C, C++): read path + ungated edits | ✅ |
+| `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Java, Ruby, C, C++): read path + ungated edits; the `ReadIndex` reference impl | ✅ |
+| `lang-template` | copyable Step-1 skeleton: `Composed` over tree-sitter reads + your checker | ✅ |
 | `ci-cli` | `index` / `retrieve` binaries | ✅ |
 | `ci-arch` | zero-API architecture map (detects module templates) | ✅ |
 | `ci-mcp` | Rust MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits | ✅ |

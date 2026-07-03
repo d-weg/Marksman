@@ -191,8 +191,7 @@ Adopted policy (roadmap Batch 8), directly from the data:
    either way — it's what keeps the gate *sound* on barrels and package boundaries without
    the agent hand-verifying. The ablation modes exist for measurement, not as configurations.
 2. **New languages land as tree-sitter + the language's own compiler gate first** (−36% with
-   zero startup dependencies is most of the win), with a SCIP indexer added later, when that
-   language's users hit monorepos or large repos. The `treesitter-gated` provider is the
+   zero startup dependencies is most of the win), with a SCIP indexer added later. The `treesitter-gated` provider is the
    template.
 3. **The ungated tier is only for languages without a usable checker**, and its replies must
    keep saying so.
