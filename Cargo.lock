@@ -168,6 +168,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ci-lsp-index"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "ci-lsp",
+ "protobuf",
+ "scip",
+ "serde_json",
+]
+
+[[package]]
 name = "ci-mcp"
 version = "0.1.0"
 dependencies = [
@@ -603,6 +614,7 @@ dependencies = [
  "ci-core",
  "ci-edit",
  "ci-lsp",
+ "ci-lsp-index",
  "ci-proto",
  "ci-scip",
  "ci-treesitter",

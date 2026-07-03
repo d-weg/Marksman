@@ -387,3 +387,40 @@ fn conformance_ts_scip() {
         },
     );
 }
+
+// Real-tool tier: the SAME product TS provider, indexed by the tsgo LSP SWEEP (ci-lsp-index)
+// instead of scip-typescript — the CI_TS_MODE=lsp comparison arm. Identical fixture and
+// expectations as `conformance_ts_scip`: the two producers must be indistinguishable to the
+// read path. `cargo test -p ci-conformance -- --ignored`
+#[test]
+#[ignore]
+fn conformance_ts_lsp_sweep() {
+    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        Box::new(lang_ts::TsProvider::index_with_lsp_sweep(root).expect("tsgo LSP-sweep indexing"))
+    });
+    run_read_battery(
+        &mk,
+        &ReadFixture {
+            label: "ts/lsp-sweep",
+            files: &[
+                (
+                    "src/rank.ts",
+                    "import { clamp } from \"./util/math.js\";\nexport interface RankRow {\n  score: number;\n}\nexport class Ranker {\n  top(rows: RankRow[]): RankRow[] {\n    return rows;\n  }\n}\nexport function rankAll(rows: RankRow[]): number {\n  return clamp(rows.length);\n}\n",
+                ),
+                ("src/util/math.ts", "export function clamp(x: number): number {\n  return x;\n}\n"),
+            ],
+            target: "src/rank.ts",
+            want_ids: &["src/rank.ts#RankRow", "src/rank.ts#Ranker.top", "src/rank.ts#rankAll"],
+            fn_symbol: "src/rank.ts#rankAll",
+            expect_params: true,
+            doc_symbol: None,
+            edge: Some(("src/rank.ts", "src/util/math.ts")),
+            expect_gated: true,
+        },
+    );
+}

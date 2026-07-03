@@ -17,6 +17,7 @@ members = [
     "crates/ci-cli",
     "crates/ci-vfs",
     "crates/ci-lsp",
+    "crates/ci-lsp-index",
     "crates/ci-edit",
     "crates/ci-arch",
     "crates/ci-mcp",

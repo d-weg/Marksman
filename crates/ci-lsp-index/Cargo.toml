@@ -1,0 +1,13 @@
+[package]
+name = "ci-lsp-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Build a SCIP index by sweeping a language server: documentSymbol + references over ci-lsp."
+
+[dependencies]
+ci-core = { path = "../ci-core" }
+ci-lsp = { path = "../ci-lsp" }
+scip = "0.8.1"
+protobuf = "3.7"
+serde_json = { workspace = true }

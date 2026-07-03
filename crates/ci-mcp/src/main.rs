@@ -69,6 +69,22 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
                     eprintln!("[marksman-mcp] language: typescript (ABLATION: tree-sitter read + ts-morph gate — CI_TS_MODE=treesitter-gated)");
                     return ProviderBuild::Ready(Arc::new(lang_ts::TsTreeGated::new(root)));
                 }
+                Ok("lsp") => {
+                    // COMPARISON arm: index by sweeping the tsgo language server (ci-lsp-index)
+                    // instead of scip-typescript; same SCIP read path, different producer.
+                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
+                        eprintln!("[marksman-mcp] typescript DISABLED (the LSP sweep still needs Node for tsgo via npx):\n{missing}");
+                        return ProviderBuild::Unavailable(missing);
+                    }
+                    eprintln!("[marksman-mcp] language: typescript (COMPARISON: tsgo LSP-sweep index — CI_TS_MODE=lsp)");
+                    return match TsProvider::index_with_lsp_sweep(root) {
+                        Ok(p) => ProviderBuild::Ready(Arc::new(p)),
+                        Err(e) => {
+                            eprintln!("[marksman-mcp] tsgo LSP-sweep indexing failed ({e}); skipping TS files");
+                            ProviderBuild::Failed(e.to_string())
+                        }
+                    };
+                }
                 _ => {}
             }
             // TypeScript needs Node for BOTH paths (scip-typescript index + the gate). Missing

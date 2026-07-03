@@ -62,6 +62,32 @@ pub(crate) fn npm_cache() -> PathBuf {
     std::env::var("CI_NPM_CACHE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
 }
 
+/// The TS/TSX sources the LSP sweep indexes: gitignore-aware walk, `.d.ts` and the usual
+/// build/dependency dirs excluded (scip-typescript's own discovery is tsconfig-driven; this
+/// walk is the sweep arm's approximation of it).
+fn discover_ts_files(root: &Path) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for entry in ignore::WalkBuilder::new(root).hidden(true).build().flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let rel = match p.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().replace('\\', "/"),
+            Err(_) => continue,
+        };
+        let is_ts = rel.ends_with(".ts") || rel.ends_with(".tsx") || rel.ends_with(".mts") || rel.ends_with(".cts");
+        if !is_ts || rel.ends_with(".d.ts") || rel.starts_with("node_modules/") || rel.contains("/node_modules/") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(p) {
+            out.push((rel, content));
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// A best-effort cross-process advisory lock so concurrent `npx` invocations don't corrupt the
 /// SHARED npm cache. `npx --yes` stages packages into `<cache>/_npx/<hash>` with atomic renames;
 /// two invocations racing there produce `ENOTEMPTY` / half-installed packages (`Cannot find module
@@ -230,6 +256,22 @@ impl TsProvider {
         Ok(provider)
     }
 
+    /// Index `root` by SWEEPING the tsgo language server (documentSymbol + references via
+    /// [`ci_lsp_index`]) instead of running scip-typescript — the `CI_TS_MODE=lsp` comparison
+    /// arm. Emits a genuine SCIP protobuf to `.marksman/index.lspx.scip`, so the whole read
+    /// path (structure, import graph, blast radius) is byte-for-byte the same consumer as the
+    /// scip-typescript index. No fingerprint cache yet: this arm always re-sweeps.
+    pub fn index_with_lsp_sweep(root: &Path) -> Result<Self> {
+        let files = discover_ts_files(root)?;
+        let bytes = ci_lsp_index::sweep_index(root, &files, Self::tsgo_lsp_command(), "lspx-ts")?;
+        let out = root.join(".marksman").join("index.lspx.scip");
+        if let Some(dir) = out.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&out, bytes)?;
+        Self::from_index(root, &out)
+    }
+
     /// Load a provider from an existing `index.scip` (skip running the indexer).
     pub fn from_index(root: &Path, index_scip: &Path) -> Result<Self> {
         Ok(Self {
@@ -240,9 +282,38 @@ impl TsProvider {
         })
     }
 
+    /// The tsgo (TypeScript 7 native) LSP command for the sweep indexer. `CI_TSGO` points at
+    /// a tsgo binary directly; the default fetches the native preview via npx (the `typescript`
+    /// RC npm package ships only `tsc` — the LSP binary lives in `@typescript/native-preview`).
+    fn tsgo_lsp_command() -> Command {
+        if let Ok(bin) = std::env::var("CI_TSGO") {
+            let mut c = Command::new(bin);
+            c.args(["--lsp", "-stdio"]);
+            return c;
+        }
+        let mut c = Command::new("npx");
+        c.arg("--yes")
+            .arg("-p")
+            .arg("@typescript/native-preview")
+            .args(["tsgo", "--lsp", "-stdio"])
+            .env("npm_config_cache", npm_cache());
+        c
+    }
+
     /// The TS language-server command (npx tsls). All external/Node tooling lives
     /// here in the provider — the core + ci-lsp stay pure Rust.
+    ///
+    /// `CI_TS_LSP_SERVER` overrides the whole command line (whitespace-split, no quoting) —
+    /// e.g. `".../node_modules/.bin/tsgo --lsp -stdio"` runs the TS7 native-port server.
     fn ts_lsp_command() -> Command {
+        if let Ok(raw) = std::env::var("CI_TS_LSP_SERVER") {
+            let mut parts = raw.split_whitespace();
+            if let Some(prog) = parts.next() {
+                let mut c = Command::new(prog);
+                c.args(parts);
+                return c;
+            }
+        }
         let mut c = Command::new("npx");
         c.arg("--yes")
             .arg("-p")

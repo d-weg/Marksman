@@ -9,6 +9,7 @@ description = "TypeScript LanguageProvider: SCIP read (scip-typescript) + (P2) L
 ci-core = { path = "../../ci-core" }
 ci-scip = { path = "../../ci-scip" }
 ci-lsp = { path = "../../ci-lsp" }
+ci-lsp-index = { path = "../../ci-lsp-index" }
 ci-edit = { path = "../../ci-edit" }
 ci-proto = { path = "../../ci-proto" }
 ci-treesitter = { path = "../../ci-treesitter" }
