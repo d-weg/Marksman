@@ -36,6 +36,35 @@ fn mtime_ms(p: &Path) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Embedding is ~75% of a full index build and pure per-chunk CPU work (the model is a
+/// Model2Vec static embedder — table lookups + mean pooling), so it shards across scoped
+/// threads: measured 5.6x on 10 cores, near-linear on the performance cores, with byte-
+/// identical output ordering (each shard writes its own contiguous slice of the result).
+/// `std::thread::scope`, not rayon — one flat map doesn't earn a dependency.
+fn embed_threads(n_items: usize) -> usize {
+    if n_items < 64 {
+        return 1; // shard overhead beats the win on tiny corpora
+    }
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+}
+
+fn embed_all(items: &[Item], embed: &(impl Fn(&str) -> Vec<f32> + Sync)) -> Vec<Vec<f32>> {
+    let threads = embed_threads(items.len());
+    if threads <= 1 {
+        return items.iter().map(|i| embed(&i.text)).collect();
+    }
+    let shard = items.len().div_ceil(threads);
+    let mut out: Vec<Vec<Vec<f32>>> = Vec::new();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = items
+            .chunks(shard)
+            .map(|sh| s.spawn(move || sh.iter().map(|i| embed(&i.text)).collect::<Vec<Vec<f32>>>()))
+            .collect();
+        out = handles.into_iter().map(|h| h.join().expect("embed shard panicked")).collect();
+    });
+    out.into_iter().flatten().collect()
+}
+
 /// Inclusive 1-based line slice of `text`.
 fn slice_lines(text: &str, start_line: u32, end_line: u32) -> String {
     if start_line == 0 {
@@ -54,14 +83,21 @@ pub fn build_index(
     root: &Path,
     config: &Config,
     registry: &ProviderRegistry,
-    embed: impl Fn(&str) -> Vec<f32>,
+    embed: impl Fn(&str) -> Vec<f32> + Sync,
 ) -> Result<IndexData> {
+    // CI_TIMING=1: per-phase wall times on stderr (profiling only, no behavior change).
+    let timing = std::env::var("CI_TIMING").is_ok();
+    let t = std::time::Instant::now();
     let files = discover(root, config)?;
     let ws = detect_workspace(root)?;
+    if timing {
+        eprintln!("[timing] discover+workspace {:.3}s ({} files)", t.elapsed().as_secs_f64(), files.len());
+    }
 
     let mut items: Vec<Item> = Vec::new();
     let mut file_records: BTreeMap<String, FileRecord> = BTreeMap::new();
 
+    let t = std::time::Instant::now();
     for f in &files {
         let rel = f.rel.to_string_lossy().replace('\\', "/");
         let abs = root.join(&f.rel);
@@ -76,9 +112,16 @@ pub fn build_index(
         }
         file_records.insert(rel.clone(), FileRecord { mtime_ms: mtime_ms(&abs), pkg });
     }
+    if timing {
+        eprintln!("[timing] read+structure {:.3}s ({} items)", t.elapsed().as_secs_f64(), items.len());
+    }
 
     // Embed (injected) — vectors are row-aligned with `items`.
-    let vecs: Vec<Vec<f32>> = items.iter().map(|i| embed(&i.text)).collect();
+    let t = std::time::Instant::now();
+    let vecs = embed_all(&items, &embed);
+    if timing {
+        eprintln!("[timing] embed {:.3}s ({} threads)", t.elapsed().as_secs_f64(), embed_threads(items.len()));
+    }
     let dims = vecs.first().map(|v| v.len()).unwrap_or(256);
     let mut vectors = Vec::with_capacity(vecs.len() * dims);
     for v in &vecs {
@@ -86,15 +129,23 @@ pub fn build_index(
     }
 
     // BM25.
+    let t = std::time::Instant::now();
     let mut bm25 = Bm25::new();
     for i in &items {
         bm25.add_doc(&i.chunk.id, &i.chunk.file, &tokenize(&i.text));
+    }
+    if timing {
+        eprintln!("[timing] bm25 {:.3}s", t.elapsed().as_secs_f64());
     }
 
     // Import graph: the UNION of each active provider's graph. Import edges are within-language
     // and each provider scopes its graph to its own files, so the file keys are disjoint across
     // languages — a plain union, no cross-language merge.
+    let t = std::time::Instant::now();
     let forward = forward_adjacency(registry)?;
+    if timing {
+        eprintln!("[timing] import-graph {:.3}s", t.elapsed().as_secs_f64());
+    }
 
     let meta = IndexMeta {
         version: ci_index::INDEX_VERSION,
@@ -123,7 +174,7 @@ pub fn build_index(
 pub fn update_index(
     root: &Path,
     registry: &ProviderRegistry,
-    embed: impl Fn(&str) -> Vec<f32>,
+    embed: impl Fn(&str) -> Vec<f32> + Sync,
     mut data: IndexData,
     changed: &[String],
 ) -> Result<IndexData> {
@@ -161,12 +212,12 @@ pub fn update_index(
             node_items(&node, rel, &pkg, &content, &mut new_items);
         }
     }
-    for item in &new_items {
-        let v = embed(&item.text);
+    let new_vecs = embed_all(&new_items, &embed);
+    for (item, v) in new_items.iter().zip(&new_vecs) {
         debug_assert_eq!(v.len(), dims, "embedder dim must match the index");
         chunks.push(item.chunk.clone());
         symbols.push(item.sym.clone());
-        vectors.extend_from_slice(&v);
+        vectors.extend_from_slice(v);
     }
 
     // 3. BM25: drop changed-file docs, add the re-extracted ones.

@@ -158,7 +158,11 @@ fn cmd_index(root: &Path) {
     })
     .unwrap_or_else(|e| die(e));
 
+    let t = std::time::Instant::now();
     save_index(root, &config, &index).unwrap_or_else(|e| die(e));
+    if std::env::var("CI_TIMING").is_ok() {
+        eprintln!("[timing] save_index {:.3}s", t.elapsed().as_secs_f64());
+    }
     eprintln!(
         "[marksman] done: {} symbols · {} chunks · dim {} -> {}/",
         index.symbols.len(),
