@@ -44,6 +44,22 @@ impl Vfs {
     }
 
     pub fn create(&mut self, rel: &Path, content: String) -> Result<()> {
+        // A file created EARLIER IN THIS BATCH (overlay-present, nothing on disk — e.g. a
+        // move_file that supplied its parent module file automatically) makes a redundant
+        // create with the same intent SATISFIED, not an error: agents pair move_file with a
+        // helper create_file, and rejecting the pair over our own automation cost real turns
+        // (bench move-rust). Genuinely different content still conflicts, loudly.
+        if !self.abs(rel).exists() {
+            if let Some(FileState::Present(existing)) = self.overlay.get(rel) {
+                if existing.trim() == content.trim() {
+                    return Ok(());
+                }
+                return Err(Error::Other(format!(
+                    "create: {} was already created by an earlier op in this batch (a move_file                      supplies its parent module file automatically) with DIFFERENT content — drop                      this create_file, or match what the batch already wrote:\n{existing}",
+                    rel.display()
+                )));
+            }
+        }
         if self.read(rel).is_some() {
             return Err(Error::Other(format!("create: {} already exists", rel.display())));
         }

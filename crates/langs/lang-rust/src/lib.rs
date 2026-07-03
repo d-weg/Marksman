@@ -921,6 +921,37 @@ mod tests {
         assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
     }
 
+    // The bench attempt-2 shape: agents pair move_file with a redundant helper create_file
+    // for the parent module file — which the move's fallback ALREADY created in the same
+    // batch. That pair must COMMIT (idempotent same-content create), not reject over our own
+    // automation. #[ignore]; `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn move_with_redundant_helper_create_still_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"mv3\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod store;\npub mod tokenize;\n").unwrap();
+        fs::write(root.join("src/tokenize.rs"), "pub fn normalize(t: &str) -> String {\n    t.to_lowercase()\n}\n").unwrap();
+        fs::write(root.join("src/store.rs"), "use crate::tokenize::normalize;\n\npub fn add(t: &str) -> String {\n    normalize(t)\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let res = p
+            .apply_edits(
+                &[
+                    EditOp::MoveFile { from: "src/tokenize.rs".into(), to: "src/text/tokenize.rs".into() },
+                    // trailing space, no newline — must still count as the same intent
+                    EditOp::CreateFile { path: "src/text/mod.rs".into(), code: "pub mod tokenize; ".into() },
+                ],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "redundant helper must not sink the batch: {res:?}");
+        let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+
     // The R2-bench false-clean, as an invariant: a COMMITTED move must leave a compiling
     // crate. The gate has to SEE the staged deletion — rust-analyzer resolves module paths
     // against the file system, so a move whose source is still on disk (and still open as a
