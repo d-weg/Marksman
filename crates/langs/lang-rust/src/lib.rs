@@ -128,13 +128,15 @@ impl GateEngine for RustEngine {
         GateEngine::rename(&mut self.lsp, file, line, character, new_name)
     }
     fn will_rename(&mut self, from: &str, to: &str) -> Result<serde_json::Value> {
-        let we = GateEngine::will_rename(&mut self.lsp, from, to)?;
-        if workspace_edit_is_empty(&we) {
-            if let Some(fix) = movefix::move_workspace_edit(&self.root, from, to) {
-                return Ok(fix);
-            }
+        // movefix FIRST: for the move shapes it understands, ra's willRenameFiles both
+        // returns NOTHING and takes ~12s to say so (the request queues behind cache priming
+        // on the main loop — measured: 12.4s of an 18s gate). movefix is deterministic
+        // syntax, and the type-check gate rejects any rewrite it gets wrong, so asking ra
+        // first buys nothing but the wait. Shapes movefix declines still go to ra.
+        if let Some(fix) = movefix::move_workspace_edit(&self.root, from, to) {
+            return Ok(fix);
         }
-        Ok(we)
+        GateEngine::will_rename(&mut self.lsp, from, to)
     }
     fn sync_disk(&mut self) -> Result<()> {
         self.lsp.sync_disk()

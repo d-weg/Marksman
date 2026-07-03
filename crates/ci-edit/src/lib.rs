@@ -797,7 +797,11 @@ fn workspace_edit_is_empty(we: &Value) -> bool {
 fn apply_move(vfs: &mut Vfs, from: &Path, to: &Path, root: &Path, engine: &mut dyn GateEngine) -> Result<()> {
     let from_rel = from.to_string_lossy().replace('\\', "/");
     let to_rel = to.to_string_lossy().replace('\\', "/");
+    let t_wr = std::time::Instant::now();
     if let Ok(we) = engine.will_rename(&from_rel, &to_rel) {
+        if std::env::var("CI_TIMING").is_ok() {
+            eprintln!("[timing]   will_rename() {:?}", t_wr.elapsed());
+        }
         if std::env::var("CI_LSP_DEBUG").is_ok() {
             eprintln!("willRename -> {we}");
         }

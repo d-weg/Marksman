@@ -40,6 +40,14 @@ pub struct LspClient {
     /// One-time grace window granted, so the first pull can't race the server's FIRST
     /// serverStatus notification (sent moments after `initialized`) and skip the wait.
     status_grace_done: bool,
+    /// A fresh-quiescence demand from `fs_events` that hasn't been resolved yet: the deadline
+    /// of its silence window. `fs_events` doesn't block on it — `wait_quiescent` settles it at
+    /// the NEXT pull (busy signal since the demand → wait for real quiescence; total silence
+    /// through the window → the events triggered no reload, quiescence restored). Post-commit
+    /// events thus cost nothing at apply time.
+    fresh_demand: Option<Instant>,
+    /// Whether any `experimental/serverStatus` arrived AFTER the current fresh demand.
+    status_since_demand: bool,
 }
 
 impl LspClient {
@@ -71,6 +79,8 @@ impl LspClient {
             saw_server_status: false,
             quiescent: false,
             status_grace_done: false,
+            fresh_demand: None,
+            status_since_demand: false,
         };
 
         let init = json!({
@@ -91,8 +101,12 @@ impl LspClient {
             },
             "workspaceFolders": [ { "uri": file_uri(root), "name": "root" } ],
         });
+        let t_init = Instant::now();
         let id = client.send_request("initialize", init)?;
         let resp = client.pump_until_response(id, Duration::from_secs(60))?;
+        if std::env::var("CI_TIMING").is_ok() {
+            eprintln!("[timing]   lsp initialize {:?}", t_init.elapsed());
+        }
         client.pull_diagnostics = resp
             .pointer("/result/capabilities/diagnosticProvider")
             .map(|v| !v.is_null())
@@ -292,28 +306,25 @@ impl LspClient {
             // the next pull waiting for real; total silence means no reload was triggered and
             // quiescence is restored.
             if self.saw_server_status {
+                // Demand a fresh quiescent WITHOUT blocking here: mark non-quiescent, open a
+                // silence window, and let the next `wait_quiescent` (i.e. the next pull)
+                // settle it. Post-commit events — where nothing pulls afterwards — thus cost
+                // zero at apply time; pre-pull events pay exactly the wait the pull needed
+                // anyway. Drain already-arrived messages so a status the server sent between
+                // the notification and now counts as "since the demand".
                 self.quiescent = false;
-                let mut saw_status = false;
-                let grace = Instant::now() + Duration::from_millis(2000);
-                while !self.quiescent && Instant::now() < grace {
-                    match self.rx.recv_timeout(Duration::from_millis(100)) {
+                self.fresh_demand = Some(Instant::now() + Duration::from_millis(2000));
+                self.status_since_demand = false;
+                loop {
+                    match self.rx.try_recv() {
                         Ok(msg) => {
-                            if msg.get("method").and_then(Value::as_str) == Some("experimental/serverStatus") {
-                                saw_status = true;
-                            }
                             self.observe(&msg);
                             if msg.get("id").is_some() && msg.get("method").is_some() {
                                 self.reply_server_request(&msg)?;
                             }
                         }
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
-                            return Err(Error::Driver("lsp server disconnected".into()))
-                        }
+                        Err(_) => break,
                     }
-                }
-                if !saw_status && !self.quiescent {
-                    self.quiescent = true; // silence: the events triggered no reload
                 }
             }
         }
@@ -360,6 +371,7 @@ impl LspClient {
     fn observe(&mut self, msg: &Value) {
         if msg.get("method").and_then(|m| m.as_str()) == Some("experimental/serverStatus") {
             self.saw_server_status = true;
+            self.status_since_demand = true;
             self.quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
         }
     }
@@ -368,6 +380,8 @@ impl LspClient {
     /// that never sent `experimental/serverStatus` (tsls): their pulls are request-scoped and
     /// don't depend on a background workspace load.
     fn wait_quiescent(&mut self, deadline: Instant) -> Result<()> {
+        let t_wait = Instant::now();
+        let timing = std::env::var("CI_TIMING").is_ok();
         if !self.saw_server_status && !self.status_grace_done {
             let grace = Instant::now() + Duration::from_secs(3);
             while !self.saw_server_status && Instant::now() < grace {
@@ -387,11 +401,20 @@ impl LspClient {
             self.status_grace_done = true;
         }
         while self.saw_server_status && !self.quiescent {
+            // A pending fresh demand (fs_events) resolves by silence: no serverStatus at all
+            // through its window means the events triggered no reload — quiescence restored.
+            // Any status since the demand switches to waiting for the real quiescent signal.
+            if let Some(window) = self.fresh_demand {
+                if !self.status_since_demand && Instant::now() >= window {
+                    self.quiescent = true;
+                    break;
+                }
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(Error::Driver("lsp server not quiescent before deadline".into()));
             }
-            match self.rx.recv_timeout(remaining.min(Duration::from_millis(300))) {
+            match self.rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
                 Ok(msg) => {
                     self.observe(&msg);
                     if msg.get("id").is_some() && msg.get("method").is_some() {
@@ -403,6 +426,10 @@ impl LspClient {
                     return Err(Error::Driver("lsp server disconnected".into()))
                 }
             }
+        }
+        self.fresh_demand = None;
+        if timing && t_wait.elapsed() > Duration::from_millis(10) {
+            eprintln!("[timing]   wait_quiescent() {:?}", t_wait.elapsed());
         }
         Ok(())
     }
