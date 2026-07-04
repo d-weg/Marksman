@@ -2,7 +2,7 @@
 
 This file answers, in order:
 
-1. [Does the tool actually help an agent?](#1-does-it-help--the-live-agent-ab) — the headline A/B.
+1. [Does the tool actually help an agent?](#1-does-it-help--the-suite-ab) — the headline A/B: six task identities, run identically on a TypeScript and a Rust codebase, under intent-level prompts.
 2. [Which parts of the design earn their keep?](#2-which-parts-of-the-design-earn-their-keep--the-read-path-ablation) — an ablation, and the language-rollout policy it settled.
 3. [Does it hold up on a big real repo?](#3-does-it-hold-up-on-a-big-real-repo)
 4. [How do the client and middleware change the numbers?](#4-how-the-client-and-middleware-change-the-numbers)
@@ -39,72 +39,106 @@ This file answers, in order:
   get tree-sitter reads and structural edits that are syntax-checked only; every reply says
   `gated: false` so the agent knows the edit was not type-verified.
 
-All results below are single runs unless stated (historical 3-run medians showed the same
-shape); dates are 2026-07-02.
+Headline results are **3-run medians** dated 2026-07-04; other sections state their own
+dates and run counts.
 
 ---
 
-## 1. Does it help? — the live-agent A/B
+## 1. Does it help? — the suite A/B
 
 The experiment: give the same agent the same task on the same repo, with and without
 Marksman, and check the result objectively (a shell command per task: greps + the project's
-own type-checker — an outcome the agent can't fake). Ten tasks: six on a ~600-symbol
-TypeScript repo, plus four purpose-built fixtures — a mixed Rust+TS repo (T7), Python+Go on
-the ungated tier (T8), a barrel-heavy repo (T9), and a TypeScript workspace monorepo (T10).
+own type-checker — an outcome the agent can't fake). Six **task identities** — rename, move,
+locate-edit, body-edit, schema-field, type-rename — each run against two same-shaped
+codebases (`--suite ts` and `--suite rust`), so every number has a cross-language twin.
 
-| arm | input tok | output tok | sec | $ | vs baseline (in/out/sec/$) | success |
-|---|--:|--:|--:|--:|---|--:|
-| baseline | 1,982,003 | 15,726 | 331 | 1.1989 | — | 10/10 |
-| **rust (Marksman)** | **990,222** | **8,388** | **194** | **0.6648** | **−50% / −47% / −42% / −45%** | **10/10** |
+**The prompts are intent-level on purpose.** An earlier revision of this benchmark (now
+[legacy-benchmark.md](legacy-benchmark.md)) named every target outright — the exact class,
+field, and file — which measures the edit machinery at maximum directness but skips the part
+of real sessions where the agent must *find* things. The suite prompts say what a user would
+say: "The rank-fusion tail dampening constant in this codebase is too aggressive. **Find
+it** and change its value…", "Move the tokenizer **module**…". The agent owns the whole loop
+— locate, decide, edit, verify. That makes these margins smaller than the legacy table's and
+more honest; **the two sets of numbers must not be compared against each other**. Checks are
+also strict about intent: type-rename's checker requires prose mentions (a doc comment) to
+follow the rename, which Marksman's rename now does in the same call.
 
-| task | what it tests | baseline turns / $ | rust turns / $ |
-|---|---|--:|--:|
-| T1-rename | cross-file function rename | 10 / 0.1621 | **3 / 0.0477** |
-| T2-move | file move + importer rewrite | 12 / 0.1037 | **3 / 0.0489** |
-| T3-locate-edit | find + change one default | 5 / 0.0486 | **3 / 0.0487** |
-| T4-body-edit | surgical two-spot body edit | 4 / 0.0484 | 3 / 0.0495 |
-| T5-schema-field | required field + all construction sites | 13 / 0.1354 | **4 / 0.0673** |
-| T6-type-rename | interface rename across 5 files | 22 / 0.2444 | **3 / 0.0496** |
-| T7-multilang | Rust + TS renames, two compilers, one session | 13 / 0.1243 | **4 / 0.0522** |
-| T8-fallback | Python + Go renames, ungated tier | 8 / 0.0967 | **6 / 0.0811** |
-| T9-barrel | required field consumed through a barrel | 17 / 0.1485 | **7 / 0.1337** |
-| T10-monorepo | required field consumed cross-package | 10 / 0.0869 | **5 / 0.0860** |
+| suite | arm | input tok | output tok | $ | vs baseline (in/out/$) |
+|---|---|--:|--:|--:|---|
+| ts | baseline | 1,316,082 | 9,524 | 0.6382 | — |
+| ts | **Marksman** | **550,307** | **2,979** | **0.3168** | **−58% / −69% / −50%** |
+| rust | baseline | 1,098,891 | 8,415 | 0.5224 | — |
+| rust | **Marksman** | **605,910** | **4,400** | **0.3478** | **−45% / −48% / −33%** |
+
+Per task (median API calls / median $, Marksman **bold** where it wins on $):
+
+| task | ts baseline | ts Marksman | rust baseline | rust Marksman |
+|---|--:|--:|--:|--:|
+| rename | 9 / 0.1132 | **3 / 0.0414** | 7 / 0.0804 | **3 / 0.0411** |
+| move | 11 / 0.1161 | **3 / 0.0415** | 11 / 0.1343 | **5 / 0.0862** |
+| locate-edit | 8 / 0.0773 | **4 / 0.0526** | 6 / 0.0582 | **4 / 0.0527** |
+| body-edit | 8 / 0.0740 | 5 / 0.0749 | 5 / 0.0470 | 5 / 0.0674 |
+| schema-field | 12 / 0.1383 | **4 / 0.0569** | 8 / 0.0915 | **4 / 0.0582** |
+| type-rename | 8 / 0.1193 | **3 / 0.0495** | 10 / 0.1110 | **3 / 0.0422** |
+
+### Direction still pays — but wide prompts win anyway
+
+The spread inside the table is itself a finding. When a task names its target (rename,
+type-rename), the agent goes straight to one `apply_edits` — 3 calls, −49…−63% — the same
+directness the legacy benchmark measured. When the prompt withholds the target
+(locate-edit's "find it"), the agent spends a retrieval call first and the margin narrows.
+So: **the tool benefits from precise prompt direction, and still saves tokens when it
+doesn't get any** — the wide-prompt totals above are −33/−50% on cost with the agent doing
+its own finding. The one honest exception is body-edit: a task so small (one inserted line)
+that the marksman arm's tool schemas cost more than the baseline's whole grep-and-edit
+trajectory; on the rust suite that's a real +43% loss, on ts a tie. Below roughly a
+$0.05-baseline task there is nothing left to save.
 
 ### Why it wins — three mechanisms
 
 - **One call replaces N hand-edits.** A repo-wide rename is a single `apply_edits`: the
-  server rewrites the definition and every reference, type-checks the result, and commits
-  atomically. The baseline agent reads whole files, edits each site by hand, and iterates
-  the type-checker — T6 is 3 turns vs 22.
+  server rewrites the definition, every reference, *and doc-comment mentions* (through the
+  same gate), type-checks the result, and commits atomically — type-rename is 3 calls vs
+  8–10, with the checker demanding the prose update too.
 - **The type-checker finds the affected sites, so the agent doesn't search.** For a change
-  that breaks many places (add a required field — T5, T9, T10), the agent makes the anchor
-  edit alone; the gate *rejects* it with **every** affected site, each shown with its current
-  source and a ready-to-copy fix. One batch later it's done. No grep can miss a site, because
-  the compiler enumerated them — and this works through barrels (T9) and across package
-  boundaries (T10).
-- **Languages without a compiler still come out ahead** (T8): structural edits honestly
-  labeled "not type-verified," plus a server-side verification scan whose findings each carry
-  a copy-paste-executable fix (see [§5](#5-tool-response-design-the-lesson-that-transfers)).
+  that breaks many places (schema-field), the agent makes the anchor edit alone; the gate
+  *rejects* it with **every** affected site, each shown with its current source and a
+  ready-to-copy fix. One batch later it's done — 4 calls vs 8–12.
+- **Responses carry what the agent would otherwise re-derive.** Retrieval pointers inline
+  single-line symbols (so a constant's type is visible before editing it); `list_anchors`
+  leads with a file's import lines; commits echo the edited block as written; rejects carry
+  the target's original extent. Every one of those lines exists because a benchmark
+  transcript showed an agent paying a turn to fetch it
+  ([§5](#5-tool-response-design-the-lesson-that-transfers) is the general law).
 
 ### Honest caveats
 
-- Single runs; trajectory variance is real (a T5-shaped task occasionally pre-explores and
-  lands at 7–9 turns instead of 4 — still well under baseline).
+- One machine, one model (sonnet 4.6), 3 runs per cell; single-run trajectory variance is
+  real (move especially swings between a direct 3-call run and a survey-first 5–6).
+- **move-rust is the open gap** (5 calls / $0.086 vs move-ts's 3 / $0.041): agents trust the
+  engine to rewrite TS imports but hedge on Rust's module system — they type insurance
+  helper edits (harmless: the server no-ops redundant ones) and research first. The tool
+  answer so far: per-language completeness spelled out in the description, `dryRun` as a
+  one-call survey substitute, and self-sufficient anchor listings. The residual is agent
+  prior, not tool capability — a bare `move_file` has been the complete Rust move since the
+  movefix engine landed.
 - The tool descriptions the agent sees are audited to contain **zero** benchmark-specific
-  content (an early revision leaked task answers into description examples; those runs were
-  discarded).
-- Every arm passed every task, so the gate's *insurance* value — catching a broken edit — is
-  not in these numbers. The measured win is efficiency.
-- Absolute deltas belong to these repos and tasks; the *shape* (structural edits and
-  wide-blast-radius changes are the blowouts) is what generalizes.
+  content; suite prompts and fixtures were built after that audit and keep to it.
+- Every run passed its checker, so the gate's *insurance* value — catching a broken edit —
+  is mostly not in these numbers (it appeared once during development: the cargo gate
+  rejecting a hallucinated `f64` type that an earlier gate had waved through; that class is
+  now regression-tested).
+- Absolute deltas belong to these fixtures; the *shape* (structural edits and
+  wide-blast-radius changes are the blowouts; sub-$0.05 tasks are a wash) is what
+  generalizes.
 - These numbers include a one-turn tool-discovery tax imposed by the client's deferred MCP
-  registration; the same suite measured **−60%** when the tools registered upfront
-  ([§4.1](#41-the-tool-loading-turn-your-mcp-client-may-cost-you-a-turn-per-session)).
+  registration ([§4.1](#41-the-tool-loading-turn-your-mcp-client-may-cost-you-a-turn-per-session)
+  measured the upfront-registration headroom on the legacy suite).
 
-*Historical note:* the first 7-task run also carried the frozen Node.js prototype Marksman
-was rewritten from, as a third arm. Marksman won or tied it on every task (−53% vs baseline
-overall). Details, including a contamination incident that led to stricter arm isolation,
-are in git history (`docs/benchmarks.md` @ 43d4caf).
+*The previous headline benchmark* — ten tasks with fully-named targets, including the
+multilang/ungated/barrel/monorepo fixtures — *lives in*
+[legacy-benchmark.md](legacy-benchmark.md); its T7–T10 fixture tasks remain live and its
+results are still the reference for §2's ablations.
 
 ---
 
@@ -112,8 +146,9 @@ are in git history (`docs/benchmarks.md` @ 43d4caf).
 
 Marksman's TypeScript support stacks three layers: tree-sitter parsing (fast, in-process,
 syntactic), a SCIP index (compiler-accurate symbols and references), and the ts-morph
-compiler gate on edits. Which layer produces §1's win? `CI_TS_MODE` swaps the read path so
-the same suite isolates each one:
+compiler gate on edits. Which layer produces the win? `CI_TS_MODE` swaps the read path so
+the same suite isolates each one (measured on the
+[legacy T1–T10 suite](legacy-benchmark.md), whose task ids the tables below use):
 
 | mode | reads & import graph | edit gate |
 |---|---|---|
@@ -244,8 +279,8 @@ MCP clients register a server's tools in one of two ways: **upfront** (tool defi
 present from the first request) or **deferred** (the agent must call a tool-search tool to
 load them, spending its first turn on discovery). In every measurement above, Claude Code
 deferred Marksman's tools — so **every Marksman number in this file includes one discovery
-turn**. In the one full-suite run where the tools registered upfront, every task dropped a
-turn — renames completed in **2 turns at $0.027** (T1: −83% vs baseline instead of −70%) —
+turn**. In the one full-suite run where the tools registered upfront (legacy suite), every
+task dropped a turn — renames completed in **2 turns at $0.027** (T1: −83% vs baseline instead of −70%) —
 and the suite-level advantage measured **−60%** ($0.59 vs $1.46, −61/−60/−59/−60 in/out/sec/$,
 10/10; a fair within-run comparison, since both arms ran in the same environment). Read the
 −60% with one caveat: that run's baseline also drew expensive trajectories ($1.46 vs
@@ -286,9 +321,9 @@ Recipe: `headroom proxy --port 8787`; a shim that exports
 
 ## 5. Tool-response design: the lesson that transfers
 
-The ungated tier (T8: a Python and a Go rename, no compiler) only started winning when the
-tool's **responses** stopped delegating work back to the agent. Three iterations on the same
-task:
+The ungated tier (T8 in the [legacy suite](legacy-benchmark.md): a Python and a Go rename,
+no compiler) only started winning when the tool's **responses** stopped delegating work back
+to the agent. Three iterations on the same task:
 
 | response design | rust $ | turns | outcome |
 |---|--:|--:|---|
@@ -455,8 +490,10 @@ fixed with regression tests: a same-file batch corruption in the edit engine, th
 being blind to files a batch creates, and the index save destroying the SCIP cache (§3).
 
 ```bash
-# The agent A/B (needs $ANTHROPIC_API_KEY; rebuilds release binaries first):
-bash scripts/agent-bench/go.sh --runs 3
+# The suite A/B (§1 — needs $ANTHROPIC_API_KEY; rebuilds release binaries first):
+bash scripts/agent-bench/go.sh --suite ts,rust --runs 3 --save-transcript /tmp/suites
+# One task, one suite; or the legacy T-tasks (legacy-benchmark.md):
+bash scripts/agent-bench/go.sh --task move --suite rust --runs 1
 bash scripts/agent-bench/go.sh --task T10-monorepo --runs 1
 
 # The ablation arms (§2):
