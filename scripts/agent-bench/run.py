@@ -87,7 +87,11 @@ def snapshot_indexes(repo):
 
 
 def reset(repo, base, snap):
-    sh(["git", "reset", "--hard", base], cwd=repo)
+    r = sh(["git", "reset", "--hard", base], cwd=repo)
+    if r.returncode != 0:
+        # A reset that silently fails leaves the previous run's edits in place and every
+        # subsequent measurement poisoned — fail the bench, never limp on.
+        sys.exit(f"ERROR: git reset failed in {repo}: {r.stderr.strip()}")
     sh(["git", "clean", "-fdq"] + sum([["-e", d] for d in INDEX_DIRS], []), cwd=repo)
     # Restore each index from the pristine, base-consistent snapshot.
     if snap:
@@ -309,7 +313,19 @@ def build_indexes(repo, arms):
 def prepare_repo(repo, arms):
     """Reset to a pristine base, build the indexes from scratch, snapshot them. Returns the
     context every run of every task against this repo starts from."""
-    base = sh(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    # The repo must be a WORKING git checkout — abort loudly if not. The macOS /tmp cleaner
+    # reaps files (not dirs) unused ~3 days, which guts an old /tmp clone in place (.git/
+    # objects and package.json gone, empty dirs left): rev-parse then returns nothing, the
+    # reset silently no-ops, and every run measures agents flailing in wreckage (the
+    # 07-04 T2 "regression" — 18 calls of environment archaeology, zero tool signal).
+    probe = sh(["git", "rev-parse", "HEAD"], cwd=repo)
+    if probe.returncode != 0 or not probe.stdout.strip():
+        sys.exit(
+            f"ERROR: {repo} is not a usable git repository ({probe.stderr.strip() or 'no HEAD'}).\n"
+            f"  A stale /tmp clone was likely gutted by the periodic /tmp cleaner.\n"
+            f"  Delete it and re-run — go.sh re-clones a fresh one: rm -rf {repo}"
+        )
+    base = probe.stdout.strip()
     # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `marksman
     # index` updates INCREMENTALLY (mtime-keyed), so a stale index left by a prior run — or a
     # dirty working tree — would be snapshotted and then restored on every reset, leaving the

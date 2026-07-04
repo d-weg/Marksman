@@ -42,9 +42,12 @@ if [ -z "${CI_MODEL_DIR:-}" ]; then
 fi
 export CI_MODEL_DIR="${CI_MODEL_DIR:?no embedding model found — set CI_MODEL_DIR (see README: Get the embedding model)}"
 
-# Prepare the disposable clone if missing (e.g. after a reboot clears /tmp).
+# Prepare the disposable clone if missing OR gutted. A bare `-d .git` check is not enough:
+# the macOS /tmp cleaner reaps FILES unused ~3 days but leaves directories, so an old clone
+# decays into a hollow shell (.git/ present, objects/HEAD/package.json gone) that passes the
+# dir test and then poisons every run. Probe for a working HEAD instead.
 TARGET=/tmp/bench-target
-if [ ! -d "$TARGET/.git" ]; then
+if ! git -C "$TARGET" rev-parse --verify HEAD >/dev/null 2>&1; then
   echo "preparing disposable clone at $TARGET …"
   rm -rf "$TARGET"
   git clone -q "$CODEINDEX_TS_DIR" "$TARGET"
