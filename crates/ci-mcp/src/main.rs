@@ -359,7 +359,24 @@ impl Server {
         for n in &nodes {
             write_anchors(n, &mut out, 0);
         }
-        Ok(if out.is_empty() { "(no symbols)".into() } else { out })
+        if !out.is_empty() {
+            return Ok(out);
+        }
+        // No symbol anchors ≠ nothing to say. Declaration-only files (a lib.rs of `mod` lines,
+        // a barrel of re-exports) are exactly where agents ask for structure — a bare
+        // "(no symbols)" sent them to `find`/`cat` for the answer (bench move-rust: a 12KB
+        // find dump to learn a 7-line lib.rs). Small files are inlined whole; file-level
+        // statements are edited via replace_text with `path` (no symbol anchor needed).
+        let content = std::fs::read_to_string(self.root.join(&file)).map_err(|e| e.to_string())?;
+        let lines = content.lines().count();
+        Ok(if lines <= 50 {
+            format!(
+                "(no symbol anchors — {file} is declaration-only; its {lines} line(s) inline:)\n```\n{}\n```\nEdit these via replace_text with `path` + unique `oldText` (file-level statements sit outside symbol anchors).",
+                content.trim_end()
+            )
+        } else {
+            format!("(no symbol anchors in {file} — {lines} lines of file-level statements; read_node/Read for content, replace_text with `path` + unique `oldText` to edit)")
+        })
     }
 
     /// Resolve a symbol reference to a provider node_id, cheapest precision first:
