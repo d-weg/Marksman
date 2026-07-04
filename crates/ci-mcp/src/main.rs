@@ -49,7 +49,7 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
             if let Some(missing) = lang_rust::toolchain().describe_missing() {
                 eprintln!("[marksman-mcp] warning: {missing}\n  (rust reads work; type-checked edits will fail until installed)");
             }
-            eprintln!("[marksman-mcp] language: rust (tree-sitter reads + rust-analyzer scip graph; gate: rust-analyzer)");
+            eprintln!("[marksman-mcp] language: rust (tree-sitter reads + rust-analyzer scip graph; gate: cargo check, renames: rust-analyzer)");
             ProviderBuild::Ready(Arc::new(RustProvider::open(root, config.scip_enabled("rust"))))
         }
         "ts" => {
