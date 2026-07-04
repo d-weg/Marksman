@@ -271,7 +271,7 @@ impl Server {
             .as_str()
             .or_else(|| args["detail_level"].as_str())
             .unwrap_or("pointers");
-        let mut out = render_summary(&manifest);
+        let mut out = render_summary(&manifest, &self.root);
         // Skeletal context: inline code for the top entries so the agent gets signatures (and,
         // with `outline`, NOT the bodies) without a separate read. `pointers` keeps it lean.
         if detail != "pointers" {
@@ -1045,18 +1045,26 @@ impl Server {
                 // evidence with copyable fixes, instead of overclaiming and letting the stale
                 // mention surface later (bench type-rename: a doc-comment kept the old name
                 // while the response forbade the grep that would have caught it).
-                let (scan, echo) = if !dry_run {
-                    (
-                        self.rename_scan_section(&registry, &renames, true),
-                        self.post_edit_echo(&registry, &echo_ids),
-                    )
+                let (auto, scan, echo) = if !dry_run {
+                    // Order matters: comment-only mentions are fixed FIRST (same gate), so the
+                    // scan that follows reports only what genuinely needs the agent's judgment.
+                    let applied = self.auto_update_comment_mentions(&registry, &renames);
+                    let auto = if applied.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\ncomment/doc mentions updated to follow the rename (committed through the same gate):\n{}\n",
+                            applied.join("\n")
+                        )
+                    };
+                    (auto, self.rename_scan_section(&registry, &renames, true), self.post_edit_echo(&registry, &echo_ids))
                 } else {
-                    (None, None)
+                    (String::new(), None, None)
                 };
                 Ok(format!(
                     "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
                      including files that import what changed. rename/move already updated every reference/import across the \
-                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{}{}\nFiles changed:\n{}",
+                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{auto}{}{}\nFiles changed:\n{}",
                     if dry_run { " (dry run — nothing written yet)" } else { "" },
                     changed_files.len(),
                     scan.unwrap_or_default(),
@@ -1071,8 +1079,17 @@ impl Server {
             // grep/read per task: the T8 bench arm lost to baseline on exactly that).
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
                 let scan = if !dry_run {
+                    let applied = self.auto_update_comment_mentions(&registry, &renames);
+                    let auto = if applied.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "\ncomment/doc mentions updated to follow the rename (committed through the same pipeline):\n{}\n",
+                            applied.join("\n")
+                        )
+                    };
                     format!(
-                        "{}{}",
+                        "{auto}{}{}",
                         self.rename_scan_section(&registry, &renames, false)
                             .unwrap_or_else(|| "\nRun the project's own checks if correctness is uncertain.\n".to_string()),
                         self.post_edit_echo(&registry, &echo_ids).unwrap_or_default()
@@ -1212,6 +1229,55 @@ impl Server {
         ))
     }
 
+    /// After a committed rename, textual mentions of the old name on WHOLE-LINE COMMENTS
+    /// (`//`, `///`, `/*`, `* `, `#`, …) are updated automatically through the same gated
+    /// pipeline — when the logic's names change, prose that describes them is part of the
+    /// diff (Davi's rule), and a comment-only line cannot change behavior, so there is no
+    /// judgment call to delegate. Everything else (string literals, trailing comments on
+    /// code lines, ambiguous lines) is deliberately LEFT for the scan to report with
+    /// copyable fixes — those can alter behavior or need intent. Returns one description
+    /// line per applied update; the subsequent scan then only lists what genuinely remains.
+    fn auto_update_comment_mentions(
+        &mut self,
+        registry: &ProviderRegistry,
+        renames: &[(String, String, String)],
+    ) -> Vec<String> {
+        const COMMENT_PREFIXES: [&str; 8] = ["///", "//!", "//", "/*", "* ", "*/", "#", "--"];
+        let mut by_slot: std::collections::HashMap<usize, Vec<ci_core::EditOp>> = std::collections::HashMap::new();
+        let mut descs: Vec<(usize, String)> = Vec::new();
+        for (ext, old, new) in renames {
+            for (rel, ln, _) in scan_word(&self.root, ext, old) {
+                let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
+                let Some(raw) = content.lines().nth(ln.saturating_sub(1) as usize) else { continue };
+                let t = raw.trim_start();
+                let is_comment = !t.starts_with("#!") && COMMENT_PREFIXES.iter().any(|p| t.starts_with(p));
+                if !is_comment || content.matches(raw).count() != 1 {
+                    continue; // not provably a comment-only line (or ambiguous): the scan lists it
+                }
+                let Some(slot) = registry.entry_for(Path::new(&rel)) else { continue };
+                by_slot.entry(slot).or_default().push(ci_core::EditOp::ReplaceInFile {
+                    path: rel.clone().into(),
+                    old_text: raw.to_string(),
+                    new_text: raw.replace(old.as_str(), new.as_str()),
+                });
+                descs.push((slot, format!("  {rel}:{ln}: {}", raw.trim().replace(old.as_str(), new.as_str()))));
+            }
+        }
+        let mut applied = Vec::new();
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        for (slot, ops) in &by_slot {
+            let slot = *slot;
+            let Some(provider) = registry.entry_at(slot) else { continue };
+            if let Ok(ci_core::CommitResult::Ok { changed_files, .. }) = provider.apply_edits(ops, &opts) {
+                if let Err(e) = self.reindex_after_edit(&changed_files) {
+                    eprintln!("[marksman-mcp] post-comment-update reindex failed: {e}");
+                }
+                applied.extend(descs.iter().filter(|(s, _)| *s == slot).map(|(_, d)| d.clone()));
+            }
+        }
+        applied
+    }
+
     /// Post-commit echo of each edited symbol's block AS COMMITTED (read back from disk):
     /// the agent verifies the edit against the real result — placement, scope, and the PROSE
     /// around it — without a read_node round-trip. When logic changes, a comment that still
@@ -1270,7 +1336,7 @@ fn write_anchors(n: &Node, out: &mut String, depth: usize) {
     }
 }
 
-fn render_summary(m: &Manifest) -> String {
+fn render_summary(m: &Manifest, root: &Path) -> String {
     let mut out = format!("# Context for: \"{}\"\n# {} files\n\n", m.task, m.entries.len());
     for e in &m.entries {
         out.push_str(&format!(
@@ -1280,9 +1346,30 @@ fn render_summary(m: &Manifest) -> String {
             e.file,
             if e.whole_file == Some(true) { "  (whole file)" } else { "" }
         ));
+        let content = std::fs::read_to_string(root.join(&e.file)).unwrap_or_default();
         for s in &e.matched_symbols {
             // Include the node-id handle so the agent can read_node/apply_edits it directly.
-            out.push_str(&format!("                 ↳ {} {}  L{}-{}  [{}]\n", s.kind.as_str(), s.name, s.line_range[0], s.line_range[1], s.node_id));
+            // SINGLE-LINE symbols (consts, fields, type aliases) get their source INLINE:
+            // an agent that edits such a node without ever seeing it reconstructs the
+            // statement from its prior — bench locate-edit: `replace_node RRF_K` hallucinated
+            // `f64` for an f32 const, burning a reject round-trip the one line would prevent.
+            let inline = if s.line_range[0] == s.line_range[1] {
+                content
+                    .lines()
+                    .nth(s.line_range[0].saturating_sub(1) as usize)
+                    .map(|l| {
+                        let t = l.trim();
+                        let t = if t.len() > 100 { &t[..100] } else { t };
+                        format!("  — `{t}`")
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "                 ↳ {} {}  L{}-{}  [{}]{inline}\n",
+                s.kind.as_str(), s.name, s.line_range[0], s.line_range[1], s.node_id
+            ));
         }
     }
     out

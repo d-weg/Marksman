@@ -1192,6 +1192,13 @@ pub fn commit_edits(
         };
         let snippet =
             |w: &[&str]| if w.is_empty() { String::new() } else { format!("\n```\n{}\n```", w.join("\n")) };
+        // ONE entry per site: compilers stack multiple codes on the same expression (cargo:
+        // E0308 + E0277 for one bad operand), and each duplicate re-prints the same source
+        // window + fix template — a 4x reject for one mistake (bench locate-edit: 4.3KB).
+        // Keep the first diagnostic per (file, line); the fix is identical either way.
+        let mut seen_sites: HashSet<(String, u32)> = HashSet::new();
+        let new: Vec<&Diag> =
+            new.into_iter().filter(|d| seen_sites.insert((d.file.clone(), d.line))).collect();
         // Anchor each new diagnostic to the op that introduced it (scoped repair).
         let mut anchored_op: i64 = -1;
         let feedback = new
