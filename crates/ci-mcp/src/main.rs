@@ -1661,39 +1661,11 @@ fn outline_for(file: &str, content: &str) -> String {
 
 // ── tool schemas ───────────────────────────────────────────────────────────
 fn tools_list() -> Value {
+    // Listing order is deliberate: apply_edits FIRST. This order is what the client shows in
+    // every tools listing and deferred-tools reminder — primacy is a prior, and an
+    // editing-centered tool whose list led with retrieval primed a locate-first workflow the
+    // descriptions then had to argue against. Workhorse first, locate ladder after, the map last.
     json!([
-        {
-            "name": "retrieve_context",
-            "description": "Find files + line-ranges relevant to a task (hybrid BM25 + Model2Vec + symbol match, RRF-fused, expanded along the import graph; no API calls). `detailLevel`: `pointers` (default — file+line pointers only, by far the cheapest; use it to LOCATE code you'll then edit or read_node), `outline` (files inlined with function/method BODIES elided — exact signatures/args/return types, not bodies; a 200-line file → ~15 lines), `full` (whole files; import-graph neighbors stay outline). Use outline/full only when you must read several files' code at once, not merely find them. To EDIT a named symbol you don't need this at all — call apply_edits by name directly.",
-            "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"},"detailLevel":{"type":"string","enum":["pointers","outline","full"]}},"required":["task"]}
-        },
-        {
-            "name": "describe_architecture",
-            "description": "Folder/architecture map (zero-API): per-directory file-kind patterns and detected module templates. Optional `path` scopes to a subtree.",
-            "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}
-        },
-        {
-            "name": "find_symbols",
-            "description": "Exact/substring search over indexed symbol NAMES → self-locating node-id handles (with kind + line range), NOT file:line. The cheap bridge from a known name to an editable handle: results feed straight into read_node (id=…, incl. …:body/:doc) or apply_edits (name=… / the id). Prefer over retrieve_context when you know the name, and over grep when you'll act on the symbol next. Exhaustive (good for audits — every symbol named/containing X), not top-k. `substring:true` matches anywhere in the name; omit for whole-name.",
-            "inputSchema": {"type":"object","properties":{
-                "query":{"type":"string","description":"The symbol name to search for."},
-                "substring":{"type":"boolean","description":"Match anywhere in the name (default false = whole-name match)."}
-            },"required":["query"]}
-        },
-        {
-            "name": "list_anchors",
-            "description": "List AST anchors (node ids + line ranges) in a file — symbols and their sub-nodes (params/return/body) — to target with apply_edits or read_node.",
-            "inputSchema": {"type":"object","properties":{"file":{"type":"string"}},"required":["file"]}
-        },
-        {
-            "name": "read_node",
-            "description": "Full source + metadata of ONE anchor (a symbol, or its :body / :param.N / :return / :doc sub-node) — the drill-down after an `outline` elided a body. Address by `id` (a node id, e.g. 'src/http/retry.ts#RetryPolicy.execute' or '…#execute:body' — self-locating, no `file`) or by `name` (file found via the index; pass `file` only to disambiguate).",
-            "inputSchema": {"type":"object","properties":{
-                "id":{"type":"string","description":"A node id, e.g. 'src/bm25.ts#BM25.search' or a sub-node '…#search:body' — self-locating, needs no `file`. Use ids you were GIVEN; a constructed one may miss a nested symbol's scope (the error lists the file's real ids)."},
-                "name":{"type":"string","description":"A bare symbol name; its file is found via the index. Pass `file` only to disambiguate."},
-                "file":{"type":"string","description":"Optional: repo-relative file to disambiguate a `name` defined in more than one file."}
-            },"anyOf":[{"required":["id"]},{"required":["name"]}]}
-        },
         {
             "name": "apply_edits",
             "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move (it also updates module declarations and creates a needed parent module file); do NOT add create_file/replace_text helpers for imports or module decls alongside it, and when the task states the from/to paths, send it with NO exploration first: enumerating importers or reading files beforehand only re-derives what the commit response will list anyway (every file whose imports/declarations were rewritten), and the type-check gate rejects safely if anything is off (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
@@ -1725,6 +1697,38 @@ fn tools_list() -> Value {
                 ]}},
                 "dryRun":{"type":"boolean","description":"Validate through the type-check gate without writing to disk."}
             },"required":["actions"]}
+        },
+        {
+            "name": "retrieve_context",
+            "description": "Find files + line-ranges relevant to a task (hybrid BM25 + Model2Vec + symbol match, RRF-fused, expanded along the import graph; no API calls). `detailLevel`: `pointers` (default — file+line pointers only, by far the cheapest; use it to LOCATE code you'll then edit or read_node), `outline` (files inlined with function/method BODIES elided — exact signatures/args/return types, not bodies; a 200-line file → ~15 lines), `full` (whole files; import-graph neighbors stay outline). Use outline/full only when you must read several files' code at once, not merely find them. To EDIT a named symbol you don't need this at all — call apply_edits by name directly.",
+            "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"},"detailLevel":{"type":"string","enum":["pointers","outline","full"]}},"required":["task"]}
+        },
+        {
+            "name": "find_symbols",
+            "description": "Exact/substring search over indexed symbol NAMES → self-locating node-id handles (with kind + line range), NOT file:line. The cheap bridge from a known name to an editable handle: results feed straight into read_node (id=…, incl. …:body/:doc) or apply_edits (name=… / the id). Prefer over retrieve_context when you know the name, and over grep when you'll act on the symbol next. Exhaustive (good for audits — every symbol named/containing X), not top-k. `substring:true` matches anywhere in the name; omit for whole-name.",
+            "inputSchema": {"type":"object","properties":{
+                "query":{"type":"string","description":"The symbol name to search for."},
+                "substring":{"type":"boolean","description":"Match anywhere in the name (default false = whole-name match)."}
+            },"required":["query"]}
+        },
+        {
+            "name": "list_anchors",
+            "description": "List AST anchors (node ids + line ranges) in a file — symbols and their sub-nodes (params/return/body) — to target with apply_edits or read_node.",
+            "inputSchema": {"type":"object","properties":{"file":{"type":"string"}},"required":["file"]}
+        },
+        {
+            "name": "read_node",
+            "description": "Full source + metadata of ONE anchor (a symbol, or its :body / :param.N / :return / :doc sub-node) — the drill-down after an `outline` elided a body. Address by `id` (a node id, e.g. 'src/http/retry.ts#RetryPolicy.execute' or '…#execute:body' — self-locating, no `file`) or by `name` (file found via the index; pass `file` only to disambiguate).",
+            "inputSchema": {"type":"object","properties":{
+                "id":{"type":"string","description":"A node id, e.g. 'src/bm25.ts#BM25.search' or a sub-node '…#search:body' — self-locating, needs no `file`. Use ids you were GIVEN; a constructed one may miss a nested symbol's scope (the error lists the file's real ids)."},
+                "name":{"type":"string","description":"A bare symbol name; its file is found via the index. Pass `file` only to disambiguate."},
+                "file":{"type":"string","description":"Optional: repo-relative file to disambiguate a `name` defined in more than one file."}
+            },"anyOf":[{"required":["id"]},{"required":["name"]}]}
+        },
+        {
+            "name": "describe_architecture",
+            "description": "Folder/architecture map (zero-API): per-directory file-kind patterns and detected module templates. Optional `path` scopes to a subtree.",
+            "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}
         }
     ])
 }
