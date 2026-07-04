@@ -360,6 +360,37 @@ impl Server {
             write_anchors(n, &mut out, 0);
         }
         if !out.is_empty() {
+            // Imports/module decls live OUTSIDE symbol anchors, and they're half of what an
+            // agent asks this tool for (bench move-ts: list_anchors on each importer, then a
+            // whole-file Read anyway — just to see two import lines). Surface them up top,
+            // with the file-level edit form, so one call answers both halves.
+            let content = std::fs::read_to_string(self.root.join(&file)).unwrap_or_default();
+            let mut tops = Vec::new();
+            for (i, line) in content.lines().enumerate() {
+                let t = line.trim_start();
+                let is_top = t.starts_with("import ")
+                    || t.starts_with("export ") && (t.contains(" from ") || t.starts_with("export * "))
+                    || t.starts_with("use ")
+                    || t.starts_with("pub use ")
+                    || t.starts_with("mod ")
+                    || t.starts_with("pub mod ")
+                    || t.starts_with("from ")
+                    || t.starts_with("require ")
+                    || t.starts_with("#include");
+                if is_top {
+                    let show = if t.len() > 120 { &t[..120] } else { t };
+                    tops.push(format!("  L{}: {show}", i + 1));
+                    if tops.len() >= 20 {
+                        break;
+                    }
+                }
+            }
+            if !tops.is_empty() {
+                out = format!(
+                    "file-top statements (no symbol anchor — edit via replace_text with `path` + unique `oldText`):\n{}\n{out}",
+                    tops.join("\n")
+                );
+            }
             return Ok(out);
         }
         // No symbol anchors ≠ nothing to say. Declaration-only files (a lib.rs of `mod` lines,
