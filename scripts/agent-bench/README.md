@@ -127,9 +127,9 @@ read `.calls.jsonl` (or the trailer). Per-call `output` in the sidecar is a lowe
 
 ## Suite-parameterized tasks (the convention)
 
-The six basic tasks have ONE identity each — `rename`, `move`, `locate-edit`, `body-edit`,
-`schema-field`, `type-rename` — and `--suite` points them at a language's fixture. Same
-task, different repo:
+The seven basic tasks have ONE identity each — `rename`, `move`, `locate-edit`, `body-edit`,
+`add-symbol`, `schema-field`, `type-rename` — and `--suite` points them at a language's
+fixture. Same task, different repo:
 
 ```bash
 python3 run.py --task schema-field --suite rust     # rustc as the gate
@@ -149,7 +149,7 @@ Checkers are verified both ways before a suite lands: every check FAILS on the u
 fixture, and a hand-applied reference solution passes.
 
 **Promoting a language to the gated tier ships its suite**: port the corpus fixture, add a
-`suites.<lang>` binding (fixture + language-native prompt/check) to each of the six tasks,
+`suites.<lang>` binding (fixture + language-native prompt/check) to each of the seven tasks,
 verify checkers both ways. (T1–T6 remain the legacy `--repo` TS tasks against the
 Node-prototype checkout — the published §1 numbers are tied to them.)
 

@@ -958,6 +958,16 @@ impl Server {
                     }
                 }
             }
+            // add_symbol appends at top level, so its committed id is `path#Name` — the name
+            // read off the snippet's leading declaration. No name derivable ⇒ just no echo.
+            if act == "add_symbol" && !path.is_empty() {
+                if let Some(n) = a["value"].as_str().and_then(ci_edit::leading_symbol_name) {
+                    let id = format!("{path}#{n}");
+                    if !echo_ids.contains(&id) {
+                        echo_ids.push(id);
+                    }
+                }
+            }
             let action = Action {
                 path,
                 action: act.to_string(),
@@ -1017,16 +1027,41 @@ impl Server {
             }
         }
         let mut groups: Vec<(usize, Vec<ci_core::EditOp>)> = Vec::new();
+        let mut text_ops: Vec<ci_core::EditOp> = Vec::new();
         for op in ops {
             let slot = match op_file(&op) {
-                Some(f) => registry.entry_for(Path::new(&f)).ok_or_else(|| {
-                    // The dependency layer: when the language is present but its toolchain is
-                    // missing, hand the agent/user the exact install instruction — not a shrug.
-                    match registry.disabled_reason(Path::new(&f)) {
-                        Some(reason) => format!("no provider for '{f}' — its language is disabled on this machine:\n{reason}"),
-                        None => format!("no language provider for '{f}' — its language isn't active in this repo (is its toolchain available?)"),
+                Some(f) => match registry.entry_for(Path::new(&f)) {
+                    Some(slot) => slot,
+                    None => {
+                        // The config/manifest gap, reopened NARROWLY: a non-provider TEXT file
+                        // (Cargo.toml, package.json, …) accepts file-level replace_text ONLY —
+                        // honestly ungated (syntax-checked at most, never type-checked), and
+                        // committed only after every code group's gate passes, so batch
+                        // atomicity holds for rename-a-crate / add-a-dependency flows. No
+                        // structured TOML/JSON editing (deliberately reverted in faad1c9), no
+                        // create/move/delete here, and a DISABLED language never degrades to
+                        // this path — fix the toolchain, don't ungate the edit.
+                        let disabled = registry.disabled_reason(Path::new(&f));
+                        if disabled.is_none()
+                            && matches!(op, ci_core::EditOp::ReplaceInFile { .. })
+                            && std::fs::read_to_string(self.root.join(&f)).is_ok()
+                        {
+                            text_ops.push(op);
+                            continue;
+                        }
+                        // The dependency layer: when the language is present but its toolchain
+                        // is missing, hand over the exact install instruction — not a shrug.
+                        return Err(match disabled {
+                            Some(reason) => format!("no provider for '{f}' — its language is disabled on this machine:\n{reason}"),
+                            None if matches!(op, ci_core::EditOp::ReplaceInFile { .. }) => format!(
+                                "no language provider for '{f}', and it isn't a readable text file — nothing can edit it"
+                            ),
+                            None => format!(
+                                "no language provider for '{f}' — structural ops need a provider; a config/text file takes replace_text with `path` + a unique `oldText` (file-level, applied ungated)"
+                            ),
+                        });
                     }
-                })?,
+                },
                 None => 0, // path-less op: first provider, as before
             };
             match groups.iter_mut().find(|(s, _)| *s == slot) {
@@ -1034,8 +1069,27 @@ impl Server {
                 None => groups.push((slot, vec![op])),
             }
         }
+        // Manifest edits gate FIRST: a malformed TOML/JSON result must reject the batch before
+        // any code group commits (atomicity) — and commit LAST (below), after every code gate
+        // has passed.
+        if !text_ops.is_empty() {
+            self.apply_text_ops(&text_ops, false).map_err(|e| format!("rejected — nothing written:\n{e}"))?;
+        }
         if groups.is_empty() {
-            return Ok("Applied 0 edit(s); no file changes were necessary.".into());
+            if text_ops.is_empty() {
+                return Ok("Applied 0 edit(s); no file changes were necessary.".into());
+            }
+            // Pure config/text batch: no provider, no compiler — say exactly what was checked.
+            let (files, receipt) = self.apply_text_ops(&text_ops, !dry_run)?;
+            return Ok(format!(
+                "✓ Applied {} file-level edit(s){}; {} config/text file(s) changed. gated: false — no compiler covers \
+                 these files: TOML/JSON syntax is verified (the file still parses), NEVER type-checked. The lines as \
+                 committed:\n{receipt}Files changed:\n{}",
+                text_ops.len(),
+                if dry_run { " (dry run — nothing written yet)" } else { "" },
+                files.len(),
+                files.iter().map(|p| format!("  {p}")).collect::<Vec<_>>().join("\n"),
+            ));
         }
         let provider_of = |slot: usize| registry.entry_at(slot).expect("slot from entry_for");
 
@@ -1101,7 +1155,22 @@ impl Server {
                 }
             }
         }
-        match res {
+        // Manifest edits commit LAST — only after the code result is a committed Ok — so a gate
+        // rejection anywhere leaves the manifests untouched (batch atomicity). They already
+        // passed their own gate pass above; a failure here is I/O-level and reported as partial.
+        let text_section = if !text_ops.is_empty() && matches!(res, ci_core::CommitResult::Ok { .. }) {
+            let (files, receipt) = self.apply_text_ops(&text_ops, !dry_run).map_err(|e| {
+                format!("partial: the code edits are committed, but the config/text edit then failed: {e}")
+            })?;
+            Some(format!(
+                "\nconfig/text file(s) also changed (gated: false — no compiler covers them; TOML/JSON syntax verified, \
+                 NEVER type-checked): {}\nthe lines as committed:\n{receipt}",
+                files.join(", ")
+            ))
+        } else {
+            None
+        };
+        let reply: Result<String, String> = match res {
             ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if changed_files.is_empty() => {
                 Ok(format!(
                     "Applied {applied_ops} edit(s){}; no file changes were necessary.",
@@ -1242,7 +1311,82 @@ impl Server {
                 }
                 Err(msg)
             }
+        };
+        let mut reply = reply?;
+        if let Some(sec) = text_section {
+            reply.push_str(&sec);
         }
+        Ok(reply)
+    }
+
+    /// File-level replace_text on NON-PROVIDER text files (Cargo.toml, package.json, …) — the
+    /// narrow config/manifest surface: `path` + unique `oldText`, honestly ungated. Syntax is
+    /// checked where the format has a parser (TOML/JSON must still parse post-edit); nothing is
+    /// ever type-checked, and there is NO structured TOML/JSON editing (deliberately reverted
+    /// in faad1c9). `write:false` is the gate pass (validate only). Returns the changed files
+    /// and a −/+ receipt of the lines exactly as committed.
+    fn apply_text_ops(&self, text_ops: &[ci_core::EditOp], write: bool) -> Result<(Vec<String>, String), String> {
+        let mut files: Vec<(String, Vec<(&String, &String)>)> = Vec::new();
+        for op in text_ops {
+            if let ci_core::EditOp::ReplaceInFile { path, old_text, new_text } = op {
+                let rel = path.to_string_lossy().replace('\\', "/");
+                match files.iter_mut().find(|(p, _)| *p == rel) {
+                    Some((_, v)) => v.push((old_text, new_text)),
+                    None => files.push((rel, vec![(old_text, new_text)])),
+                }
+            }
+        }
+        let mut changed = Vec::new();
+        let mut receipt = String::new();
+        for (rel, edits) in &files {
+            let orig = std::fs::read_to_string(self.root.join(rel)).map_err(|e| format!("cannot read {rel}: {e}"))?;
+            let mut content = orig.clone();
+            receipt.push_str(&format!("  {rel}:\n"));
+            for (old, new) in edits {
+                match content.matches(old.as_str()).count() {
+                    1 => {
+                        content = content.replacen(old.as_str(), new, 1);
+                        for l in old.lines() {
+                            receipt.push_str(&format!("    - {l}\n"));
+                        }
+                        for l in new.lines() {
+                            receipt.push_str(&format!("    + {l}\n"));
+                        }
+                    }
+                    0 if !new.is_empty() && content.contains(new.as_str()) => {
+                        receipt.push_str("    (already satisfied — the file already carries the newText)\n");
+                    }
+                    0 => {
+                        return Err(format!(
+                            "oldText not found in {rel} — it must match the file's current text exactly"
+                        ))
+                    }
+                    n => return Err(format!("oldText occurs {n} times in {rel} — extend it until unique")),
+                }
+            }
+            // The syntax gate — the honest maximum for a manifest. Formats without a parser
+            // here are applied as plain text (the reply already says gated: false).
+            match Path::new(rel).extension().and_then(|e| e.to_str()) {
+                Some("json") => {
+                    serde_json::from_str::<serde_json::Value>(&content).map_err(|e| {
+                        format!("{rel} would no longer parse as JSON after this edit: {e}")
+                    })?;
+                }
+                Some("toml") => {
+                    content.parse::<toml::Table>().map_err(|e| {
+                        format!("{rel} would no longer parse as TOML after this edit: {e}")
+                    })?;
+                }
+                _ => {}
+            }
+            if content != orig {
+                if write {
+                    std::fs::write(self.root.join(rel), &content).map_err(|e| format!("cannot write {rel}: {e}"))?;
+                }
+                changed.push(rel.clone());
+            }
+        }
+        Ok((changed, receipt))
     }
 
     /// Incrementally reindex `changed` after a committed edit and persist, so the same session's
@@ -1591,7 +1735,9 @@ fn op_file(op: &ci_core::EditOp) -> Option<String> {
         | SetReturnType { node_id, .. }
         | Rename { node_id, .. } => file_of(node_id).to_string(),
         MoveFile { from, .. } => from.to_string_lossy().replace('\\', "/"),
-        CreateFile { path, .. } | DeleteFile { path } | ReplaceInFile { path, .. } => path.to_string_lossy().replace('\\', "/"),
+        CreateFile { path, .. } | DeleteFile { path } | ReplaceInFile { path, .. } | AddSymbol { path, .. } => {
+            path.to_string_lossy().replace('\\', "/")
+        }
     };
     (!f.is_empty()).then_some(f)
 }
@@ -1746,14 +1892,14 @@ fn tools_list() -> Value {
     let mut tools = json!([
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move. Per language, that one action already covers: TS — %TS_MOVE%; Rust — %RUST_MOVE%. Do NOT add create_file/replace_text helpers for imports or module decls alongside it — each helper you type is output spent re-doing what the move does, and researching the sites to WRITE those helpers is the real cost. When the task states the from/to paths, send the bare move with NO exploration first: the commit response shows EVERY line the move rewrote, per file (declarations, created module files, import/`use` paths) — a pre-move survey can only re-derive that diff — and the type-check gate rejects safely if anything is off. Genuinely unsure? `dryRun:true` on the bare move returns the same verdict without writing — ONE call, cheaper than any importer survey (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
+            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move. Per language, that one action already covers: TS — %TS_MOVE%; Rust — %RUST_MOVE%. Do NOT add create_file/replace_text helpers for imports or module decls alongside it — each helper you type is output spent re-doing what the move does, and researching the sites to WRITE those helpers is the real cost. When the task states the from/to paths, send the bare move with NO exploration first: the commit response shows EVERY line the move rewrote, per file (declarations, created module files, import/`use` paths) — a pre-move survey can only re-derive that diff — and the type-check gate rejects safely if anything is off. Genuinely unsure? `dryRun:true` on the bare move returns the same verdict without writing — ONE call, cheaper than any importer survey (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines — and config/manifest files with no compiler, e.g. a Cargo.toml or package.json line: those apply ungated, TOML/JSON syntax verified only, and land in the SAME atomic batch as code edits). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `add_symbol` (path, value=the complete new top-level declaration — a function, type, or test) — appends at the END of the file with spacing handled server-side; the way to ADD a symbol that doesn't exist yet (insert_before instead places code before an EXISTING symbol; if the name already exists, the reply shows its current source and points at replace_node). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
             "inputSchema": {"type":"object","properties":{
                 "actions":{"type":"array","description":"One or more edits, applied atomically and type-checked together — batch related edits here instead of separate calls.","items":{"type":"object","additionalProperties":false,"properties":{
-                    "action":{"type":"string","enum":["rename","replace_text","replace_node","set_body","insert_in_body","delete_in_body","insert_member","add_parameter","set_return_type","insert_before","move_file","create_file","delete_file"],"description":"Fields per action — rename: name, value(new name) · replace_text: name, oldText, newText · replace_node: name, value(new code), target? · set_body: name, value · insert_in_body: name, value, oldText? · delete_in_body: name, oldText · insert_member: name, value · add_parameter: name, value · set_return_type: name, value · insert_before: name, value · move_file: path, value(new path) · create_file: path, value(source) · delete_file: path. For symbol actions `query` may replace `name`, and `path` may scope a bare `name`."},
+                    "action":{"type":"string","enum":["rename","replace_text","replace_node","set_body","insert_in_body","delete_in_body","insert_member","add_parameter","set_return_type","insert_before","add_symbol","move_file","create_file","delete_file"],"description":"Fields per action — rename: name, value(new name) · replace_text: name, oldText, newText · replace_node: name, value(new code), target? · set_body: name, value · insert_in_body: name, value, oldText? · delete_in_body: name, oldText · insert_member: name, value · add_parameter: name, value · set_return_type: name, value · insert_before: name, value · add_symbol: path, value(the new top-level declaration) · move_file: path, value(new path) · create_file: path, value(source) · delete_file: path. For symbol actions `query` may replace `name`, and `path` may scope a bare `name`."},
                     "name":{"type":"string","description":"Target symbol: a node id `file#Scope.name` you were GIVEN (find_symbols/list_anchors/a reject), or a bare NAME — add `path` when you know the defining file, omit it to let the index find the file. If ambiguous, the reply lists candidate ids to re-issue with. Used by every symbol action."},
                     "query":{"type":"string","description":"Use INSTEAD of `name` when you don't know it: a free-text description of the target; the server resolves it via the index and applies if unambiguous. Pass `path` (and, for text ops, oldText) alongside — when the description alone is ambiguous, the one symbol in that file containing your oldText resolves it."},
                     "path":{"type":"string","description":"The file to resolve a bare `name` in — pass it whenever you know the defining file (avoids ambiguity; the id stays validated). Also the file path for move_file/create_file/delete_file, and optionally rename."},
-                    "value":{"type":"string","description":"The new code/text for MOST actions: rename→the new name; replace_node→new node code; set_body→new `{ … }` block; insert_in_body→a statement; insert_member→the new member (include its own `;` or `,`); add_parameter→`x: T`; set_return_type→the type; move_file→the new path; create_file→the file source. NOTE: replace_text does NOT use `value` — it uses oldText/newText."},
+                    "value":{"type":"string","description":"The new code/text for MOST actions: rename→the new name; replace_node→new node code; set_body→new `{ … }` block; insert_in_body→a statement; insert_member→the new member (include its own `;` or `,`); add_parameter→`x: T`; set_return_type→the type; add_symbol→the complete new top-level declaration; move_file→the new path; create_file→the file source. NOTE: replace_text does NOT use `value` — it uses oldText/newText."},
                     "oldText":{"type":"string","description":"replace_text: the exact substring to replace (unique within the symbol). delete_in_body: the body line to remove. insert_in_body: optional — an existing body line to insert AFTER (substring-matched, must be unique in the body); omit to append at the END of the body."},
                     "newText":{"type":"string","description":"replace_text ONLY: the replacement for `oldText`."},
                     "target":{"type":"string","pattern":"^(body|return|returnType|doc|comment|docstring|param\\.[0-9]+)$","description":"Sub-node selector for replace_node/replace_text/insert_before: `body` | `return` | `doc` | `param.N` (0-based). Anything else is rejected — never silently the whole symbol."}
@@ -1769,6 +1915,7 @@ fn tools_list() -> Value {
                     {"if":{"properties":{"action":{"const":"add_parameter"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
                     {"if":{"properties":{"action":{"const":"set_return_type"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
                     {"if":{"properties":{"action":{"const":"insert_before"}}},"then":{"required":["value"],"anyOf":[{"required":["name"]},{"required":["query"]}]}},
+                    {"if":{"properties":{"action":{"const":"add_symbol"}}},"then":{"required":["path","value"]}},
                     {"if":{"properties":{"action":{"const":"move_file"}}},"then":{"required":["path","value"]}},
                     {"if":{"properties":{"action":{"const":"create_file"}}},"then":{"required":["path","value"]}},
                     {"if":{"properties":{"action":{"const":"delete_file"}}},"then":{"required":["path"]}}
@@ -1881,6 +2028,54 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{ensure_index_matches, scan_word, tools_list};
+
+    // The narrow config/manifest surface: file-level replace_text on non-provider text files.
+    // TOML/JSON must still PARSE post-edit (the honest syntax gate — never a type-check),
+    // oldText must be unique, the receipt carries the −/+ lines, and write:false (the gate
+    // pass) stages nothing on disk.
+    #[test]
+    fn text_ops_syntax_gate_and_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname = \"corpus-old\"\nversion = \"0.1.0\"\n").unwrap();
+        let srv = super::Server::new(root.clone());
+        let op = |old: &str, new: &str| ci_core::EditOp::ReplaceInFile {
+            path: "Cargo.toml".into(),
+            old_text: old.into(),
+            new_text: new.into(),
+        };
+
+        // Gate pass (write:false): validates, reports, writes NOTHING.
+        let (files, receipt) =
+            srv.apply_text_ops(&[op("name = \"corpus-old\"", "name = \"corpus-new\"")], false).unwrap();
+        assert_eq!(files, vec!["Cargo.toml".to_string()]);
+        assert!(
+            receipt.contains("- name = \"corpus-old\"") && receipt.contains("+ name = \"corpus-new\""),
+            "receipt carries the −/+ lines: {receipt}"
+        );
+        assert!(
+            std::fs::read_to_string(root.join("Cargo.toml")).unwrap().contains("corpus-old"),
+            "the gate pass must not write"
+        );
+
+        // An edit that breaks TOML syntax rejects.
+        let err = srv.apply_text_ops(&[op("[package]", "[package")], false).unwrap_err();
+        assert!(err.contains("no longer parse as TOML"), "syntax gate holds: {err}");
+
+        // Non-unique oldText rejects with the extend-it guidance.
+        let err = srv.apply_text_ops(&[op("\"", "'")], false).unwrap_err();
+        assert!(err.contains("extend it until unique"), "{err}");
+
+        // write:true commits.
+        srv.apply_text_ops(&[op("name = \"corpus-old\"", "name = \"corpus-new\"")], true).unwrap();
+        assert!(std::fs::read_to_string(root.join("Cargo.toml")).unwrap().contains("corpus-new"));
+
+        // Re-issuing the same edit is SATISFIED (newText already present), not an error.
+        let (files, receipt) =
+            srv.apply_text_ops(&[op("name = \"corpus-old\"", "name = \"corpus-new\"")], true).unwrap();
+        assert!(files.is_empty(), "nothing changed the second time");
+        assert!(receipt.contains("already satisfied"), "{receipt}");
+    }
 
     // The post-rename scan is word-boundary and per-extension: `rollup_day` must not match
     // `daily_rollup_day2` or a `.go` file, and a comment mention IS a hit (that's the point —

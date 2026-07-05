@@ -299,6 +299,11 @@ fn op_to_pb(op: &EditOp) -> PbEditOp {
             p.from = from.to_string_lossy().into_owned();
             p.to = to.to_string_lossy().into_owned();
         }
+        EditOp::AddSymbol { path, code } => {
+            p.op = "add_symbol".into();
+            p.path = path.to_string_lossy().into_owned();
+            p.text = code.clone();
+        }
         EditOp::CreateFile { path, code } => {
             p.op = "create_file".into();
             p.path = path.to_string_lossy().into_owned();
@@ -334,6 +339,7 @@ fn pb_to_op(p: &PbEditOp) -> Result<EditOp> {
             new_text: p.new_text.clone(),
         },
         "move_file" => EditOp::MoveFile { from: PathBuf::from(&p.from), to: PathBuf::from(&p.to) },
+        "add_symbol" => EditOp::AddSymbol { path: PathBuf::from(&p.path), code: p.text.clone() },
         "create_file" => EditOp::CreateFile { path: PathBuf::from(&p.path), code: p.text.clone() },
         "delete_file" => EditOp::DeleteFile { path: PathBuf::from(&p.path) },
         other => return Err(Error::Driver(format!("unknown edit op over the wire: {other}"))),

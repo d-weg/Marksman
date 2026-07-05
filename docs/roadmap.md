@@ -197,6 +197,10 @@ alongside code.
       MCP-schema tokens paid every turn) for a niche "edit a `Cargo.toml` dep atomically with the
       code" workflow agents handle fine with plain text edits. Removed; the `set_key` machinery is
       not useful for code (code's "path" is the node id, with type-checking on top).
+      *Follow-up (2026-07): the ROUTING half of that gap was reopened narrowly — file-level
+      `replace_text` (path + unique oldText) now reaches non-provider text files, honestly
+      ungated (TOML/JSON syntax verified post-edit, never type-checked), gated-first/committed-last
+      so a mixed manifest+code batch stays atomic. Structured key-path editing stays cut.*
 
 ### Batch 8 — Breadth: more languages, via the measured rollout ladder
 **Why:** last, once the lifecycle / safety / quality floor is in. **The ladder is now
@@ -273,6 +277,23 @@ existing hub/expansion tests plus the eval are the gate.
       centrality to tag/sort each directory's top files as the repo's "core modules" — a token-budgeted
       ranked map (AGF's ~1k-token repo map), reusing 9b, no recompute. Keep it a data addition to the
       `ci-arch` output; defer if it grows the schema.
+
+### Deferred op designs (notes only — build when a transcript shows the class)
+
+- **Directory-level move.** `move_file` where `path` is a directory fans out SERVER-SIDE to
+  per-file `move_file` ops (one WorkspaceEdit-shaped batch through the same VFS + gate), so
+  the reply keeps the existing receipts: one rewrite summary covering every declaration/
+  import line changed, per file. No new action name — the op is the same intent at a coarser
+  grain, and per-file moves are already complete per language. The one design decision:
+  refuse a fan-out that mixes providers (a dir holding .rs and .ts) unless every group's gate
+  passes — same multi-group gate-all-then-commit flow apply_edits already runs.
+- **Whole-file overwrite.** Only ever as an explicit `overwrite:true` escape hatch on
+  `create_file` — never a default, never inferred. It fights the surgical thesis (an
+  overwrite erases the anchor/receipt model: no oldText, no redundancy accounting, no
+  rewrite diff), so the reply must carry a full before/after line diff as its receipt, and
+  a same-content overwrite must be SATISFIED like any redundant op. Do not build until a
+  bench transcript shows agents actually needing it — the observed cases so far were all
+  expressible as replace_node/add_symbol batches.
 
 ### Provider conformance — one contract, verified across every provider  ✅ (pre-OSS gate, shipped)
 **Why:** providers span three tiers (full/scip · tree-sitter+gate · ungated fallback) and

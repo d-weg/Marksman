@@ -226,6 +226,15 @@ pub fn action_to_op(
         // parameter / return type.
         "add_parameter" => EditOp::AddParameter { node_id: node()?, param: value()? },
         "set_return_type" => EditOp::SetReturnType { node_id: node()?, ty: value()? },
+        // `add_symbol` appends a NEW top-level declaration at the end of `path` — the intent
+        // "add a function/type/test to this file", which insert_before can't express (it
+        // needs an existing LATER anchor). Addressing is the file; the code carries the name.
+        "add_symbol" => {
+            if a.path.is_empty() {
+                return Err(Error::Other("add_symbol needs `path` (the file to append to)".into()));
+            }
+            EditOp::AddSymbol { path: a.path.clone().into(), code: value()? }
+        }
         "create_file" => EditOp::CreateFile { path: a.path.clone().into(), code: value()? },
         "move_file" => EditOp::MoveFile { from: a.path.clone().into(), to: value()?.into() },
         "delete_file" => EditOp::DeleteFile { path: a.path.clone().into() },
@@ -233,7 +242,7 @@ pub fn action_to_op(
             return Err(Error::Driver(format!(
                 "unsupported action {other:?} — valid actions: rename, replace_text, replace_node, set_body, \
                  insert_in_body, delete_in_body, insert_member, add_parameter, set_return_type, insert_before, \
-                 move_file, create_file, delete_file"
+                 add_symbol, move_file, create_file, delete_file"
             )))
         }
     })
@@ -302,7 +311,7 @@ fn file_of(node_id: &str) -> &str {
 fn op_paths(op: &EditOp) -> Vec<PathBuf> {
     match op {
         EditOp::CreateFile { path, .. } | EditOp::DeleteFile { path } => vec![path.clone()],
-        EditOp::ReplaceInFile { path, .. } => vec![path.clone()],
+        EditOp::ReplaceInFile { path, .. } | EditOp::AddSymbol { path, .. } => vec![path.clone()],
         EditOp::MoveFile { from, to } => vec![from.clone(), to.clone()],
         EditOp::ReplaceNode { node_id, .. }
         | EditOp::InsertBefore { node_id, .. }
@@ -359,6 +368,43 @@ fn ensure_within_root(root: &Path, rel: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The name declared by a snippet's LEADING declaration line — best-effort, cross-language
+/// (declaration keywords share a shape: modifiers, keyword, name). Used by `add_symbol` for
+/// the exists-check and by the MCP layer for the post-edit echo id; `None` just means "no
+/// pre-check" (the gate still judges the result), so unsure is safe.
+pub fn leading_symbol_name(snippet: &str) -> Option<String> {
+    let line = snippet.lines().find(|l| {
+        let t = l.trim();
+        !(t.is_empty()
+            || t.starts_with("//")
+            || t.starts_with("/*")
+            || t.starts_with('*')
+            || t.starts_with("#[")   // Rust attribute (#[test], #[derive(..)])
+            || t.starts_with('@'))   // TS/Java decorator, Python decorator
+    })?;
+    let mut toks = line.split_whitespace();
+    let kw = loop {
+        let t = toks.next()?;
+        match t {
+            "pub" | "export" | "default" | "async" | "unsafe" | "abstract" | "declare" | "static"
+            | "final" | "public" | "private" | "protected" => continue,
+            t if t.starts_with("pub(") => continue, // pub(crate) / pub(super)
+            t => break t,
+        }
+    };
+    match kw {
+        "fn" | "function" | "struct" | "enum" | "trait" | "interface" | "type" | "class" | "const"
+        | "let" | "var" | "def" | "mod" | "union" => {}
+        _ => return None, // impl blocks, expressions, anything we can't name — no pre-check
+    }
+    let raw = toks.next()?;
+    let name: String = raw
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Whether `op` targets `rel` (any of its paths) — used by providers to detect that a batch
@@ -597,6 +643,42 @@ pub fn apply_structural(
             vfs.replace_range(Path::new(file), &node.range, &text.replacen(old_text, new_text, 1))
         }
         EditOp::CreateFile { path, code } => vfs.create(path, code.clone()),
+        // Append a NEW top-level symbol at the end of the file. Hygiene is server-side: one
+        // blank line after the last item, trailing newline ensured, code trimmed (top-level ⇒
+        // zero indent by definition). Already-present code is SATISFIED (idempotent, counted
+        // as a redundant op); a same-named top-level symbol with DIFFERENT content refuses
+        // with that symbol's current source — mechanically important for UNGATED languages,
+        // where a silent redefinition would shadow instead of failing the gate.
+        EditOp::AddSymbol { path, code } => {
+            let rel = path.to_string_lossy().replace('\\', "/");
+            let content = vfs.read(Path::new(&rel)).ok_or_else(|| {
+                Error::Other(format!("ADD_SYMBOL: {rel} does not exist — use create_file for a new file"))
+            })?;
+            let snippet = code.trim();
+            if snippet.is_empty() {
+                return Err(Error::Other("ADD_SYMBOL: `value` is empty — send the complete new declaration".into()));
+            }
+            if content.contains(snippet) {
+                return Ok(()); // end state already present — satisfied, not an error
+            }
+            if let Some(name) = leading_symbol_name(snippet) {
+                let nodes = structure_of(&rel);
+                if let Some(n) = nodes.iter().find(|n| n.name.as_deref() == Some(name.as_str())) {
+                    let existing = vfs.read_range(Path::new(&rel), &n.range).unwrap_or_default();
+                    return Err(Error::Other(format!(
+                        "ADD_SYMBOL: `{name}` already exists in {rel} (L{}-{}) — use replace_node on `{}` to change it, or pick a different name. Its current source:\n{existing}",
+                        n.range.start_line, n.range.end_line, n.id
+                    )));
+                }
+            }
+            let new_content = if content.trim().is_empty() {
+                format!("{snippet}\n")
+            } else {
+                format!("{}\n\n{snippet}\n", content.trim_end())
+            };
+            vfs.write(Path::new(&rel), new_content);
+            Ok(())
+        }
         EditOp::SetBody { node_id, body } => {
             // Replace just the function/method `:body` anchor (the `{ … }` block), keeping the
             // signature. Requires AST granularity (the body sub-node must exist in `structure()`).
@@ -1051,6 +1133,7 @@ pub fn commit_edits(
                 | EditOp::DeleteFile { .. }
                 | EditOp::CreateFile { .. }
                 | EditOp::ReplaceInFile { .. }
+                | EditOp::AddSymbol { .. }
         )
     };
     let mut order: Vec<usize> = (0..ops.len()).collect();
@@ -2386,6 +2469,100 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    let a = 1;\n}\n");
+    }
+
+    #[test]
+    fn add_symbol_appends_with_hygiene() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // No trailing newline on the last item — hygiene must still yield one blank line + \n.
+        fs::write(root.join("a.rs"), "fn foo() {\n    1;\n}").unwrap();
+        let mut vfs = Vfs::new(root);
+        let structure_of = |_f: &str| vec![fn_node("a.rs", "foo", 1, 3)];
+        apply_structural(
+            &mut vfs,
+            &EditOp::AddSymbol { path: "a.rs".into(), code: "\nfn bar() {\n    2;\n}\n\n".into() },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    1;\n}\n\nfn bar() {\n    2;\n}\n");
+
+        // Empty file: no leading blank lines, just the symbol.
+        fs::write(root.join("b.rs"), "\n\n").unwrap();
+        apply_structural(
+            &mut vfs,
+            &EditOp::AddSymbol { path: "b.rs".into(), code: "fn solo() {}".into() },
+            &structure_of,
+        )
+        .unwrap();
+        assert_eq!(vfs.read(Path::new("b.rs")).unwrap(), "fn solo() {}\n");
+
+        // Missing file: soft error pointing at create_file.
+        let err = apply_structural(
+            &mut vfs,
+            &EditOp::AddSymbol { path: "nope.rs".into(), code: "fn x() {}".into() },
+            &structure_of,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("create_file"), "points at create_file for new files: {err}");
+    }
+
+    #[test]
+    fn add_symbol_is_satisfied_when_code_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "fn foo() {\n    1;\n}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        let structure_of = |_f: &str| vec![fn_node("a.rs", "foo", 1, 3)];
+        apply_structural(
+            &mut vfs,
+            &EditOp::AddSymbol { path: "a.rs".into(), code: "fn foo() {\n    1;\n}".into() },
+            &structure_of,
+        )
+        .unwrap();
+        // Satisfied ⇒ nothing staged (commit_edits counts this as a redundant op).
+        assert!(vfs.is_empty(), "identical code must be a no-op, not a duplicate append");
+    }
+
+    // A same-named top-level symbol with DIFFERENT content refuses with the existing source —
+    // mechanically important for UNGATED languages, where appending a redefinition is legal
+    // syntax and would silently shadow the original.
+    #[test]
+    fn add_symbol_refuses_same_name_different_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.rs"), "pub fn foo() {\n    1;\n}\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        let structure_of = |_f: &str| vec![fn_node("a.rs", "foo", 1, 3)];
+        let err = apply_structural(
+            &mut vfs,
+            &EditOp::AddSymbol { path: "a.rs".into(), code: "pub fn foo() {\n    2;\n}".into() },
+            &structure_of,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already exists") && err.contains("replace_node"), "redirects to replace_node: {err}");
+        assert!(err.contains("pub fn foo() {"), "shows the existing source: {err}");
+        assert!(vfs.is_empty(), "refusal stages nothing");
+    }
+
+    #[test]
+    fn leading_symbol_name_covers_the_declaration_shapes() {
+        // Rust: modifiers, attributes above.
+        assert_eq!(leading_symbol_name("pub fn parse(x: u8) -> u8 { x }").as_deref(), Some("parse"));
+        assert_eq!(leading_symbol_name("#[test]\nfn roundtrip_holds() {\n}").as_deref(), Some("roundtrip_holds"));
+        assert_eq!(leading_symbol_name("pub(crate) struct Widget {\n    n: i32,\n}").as_deref(), Some("Widget"));
+        // TS/JS: export chains, generics glued to the name.
+        assert_eq!(leading_symbol_name("export function slug(s: string): string { return s; }").as_deref(), Some("slug"));
+        assert_eq!(leading_symbol_name("export default class Loader<T> {\n}").as_deref(), Some("Loader"));
+        assert_eq!(leading_symbol_name("export const LIMIT = 10;").as_deref(), Some("LIMIT"));
+        // Python: decorator above, name glued to `(`.
+        assert_eq!(leading_symbol_name("@cached\ndef fetch_all(db):\n    pass").as_deref(), Some("fetch_all"));
+        // Unnameable shapes -> None (no pre-check; the gate judges the result).
+        assert_eq!(leading_symbol_name("impl Widget {\n    fn n(&self) {}\n}"), None);
+        assert_eq!(leading_symbol_name("x + 1"), None);
+        assert_eq!(leading_symbol_name(""), None);
     }
 
     #[test]

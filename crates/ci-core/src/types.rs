@@ -207,6 +207,13 @@ pub enum EditOp {
     /// statements) — same VFS + gate as every other op, no node addressing required.
     #[serde(rename = "REPLACE_IN_FILE")]
     ReplaceInFile { path: PathBuf, old_text: String, new_text: String },
+    /// Append `code` as a NEW top-level symbol at the end of `path` (one blank line after the
+    /// last item, trailing newline ensured). The append op `insert_before` can't express — it
+    /// needs an existing LATER anchor. Satisfied (no-op) when the file already contains the
+    /// code; refused with the existing block when a same-named top-level symbol exists with
+    /// DIFFERENT content (that's `replace_node`'s job).
+    #[serde(rename = "ADD_SYMBOL")]
+    AddSymbol { path: PathBuf, code: String },
     #[serde(rename = "MOVE_FILE")]
     MoveFile { from: PathBuf, to: PathBuf },
     #[serde(rename = "CREATE_FILE")]

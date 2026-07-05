@@ -1451,6 +1451,50 @@ mod tests {
         assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
     }
 
+    // add_symbol end to end behind the cargo gate: a new #[test] fn appended to an existing
+    // module commits (with server-side spacing) and compiles; a type-broken append rejects
+    // atomically. #[ignore]; `cargo test -p lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn add_symbol_commits_behind_the_gate() {
+        let dir = tiny_crate();
+        let root = dir.path();
+        fs::write(root.join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+        let p = RustProvider::new(root);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        let res = p
+            .apply_edits(
+                &[EditOp::AddSymbol {
+                    path: "src/lib.rs".into(),
+                    code: "#[test]\nfn add_works() {\n    assert_eq!(add(2, 2), 4);\n}".into(),
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "clean append must commit: {res:?}");
+        let lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(
+            lib.ends_with("}\n\n#[test]\nfn add_works() {\n    assert_eq!(add(2, 2), 4);\n}\n"),
+            "appended at EOF with one blank line + trailing newline: {lib:?}"
+        );
+        let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
+
+        let before = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        let bad = p
+            .apply_edits(
+                &[EditOp::AddSymbol {
+                    path: "src/lib.rs".into(),
+                    code: "pub fn broken() -> i32 {\n    \"nope\"\n}".into(),
+                }],
+                &opts,
+            )
+            .unwrap();
+        assert!(matches!(bad, CommitResult::Rejected { .. }), "type-broken append must reject: {bad:?}");
+        assert_eq!(fs::read_to_string(root.join("src/lib.rs")).unwrap(), before, "disk untouched on reject");
+    }
+
     // The delete refusal's OWN recipe, end to end: its `fix` lines must apply VERBATIM, and
     // the re-issued batch (fixes + delete_file LAST) must commit clean — the refusal text
     // promises exactly this flow, so it is contract, not prose. #[ignore]; `cargo test -p

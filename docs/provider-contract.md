@@ -154,4 +154,4 @@ committed-move-compiles / no-false-clean contracts the generic form must keep).
 6. Roadmap Batch 8 ladder: don't block on a SCIP indexer; don't claim more than the gate
    verifies.
 7. Port the corpus fixture + `suites.<lang>` bindings in `scripts/agent-bench/tasks.json`
-   (six task identities, checkers verified fail-pre/pass-reference — see the bench README).
+   (seven task identities, checkers verified fail-pre/pass-reference — see the bench README).

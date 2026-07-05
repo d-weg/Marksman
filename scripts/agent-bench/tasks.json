@@ -160,6 +160,26 @@
   }
  },
  {
+  "id": "add-symbol",
+  "why": "Append a NEW top-level function to an existing module — the op insert_before can't express (no later anchor exists).",
+  "suites": {
+   "ts": {
+    "fixture": "fixture-ts",
+    "prompt": "Add a new exported function isStopword(token: string): boolean to the tokenize module: it returns true when the token is one of the common English stopwords \"the\", \"a\", \"an\", \"and\", \"or\", \"of\". Don't wire it into tokenize() yet — just add the function. Keep everything compiling.",
+    "check": "grep -q 'export function isStopword' src/tokenize.ts && npm run -s typecheck"
+   },
+   "rust": {
+    "fixture": "fixture-rust",
+    "prompt": "Add a new public function is_stopword(token: &str) -> bool to the tokenize module: it returns true when the token is one of the common English stopwords \"the\", \"a\", \"an\", \"and\", \"or\", \"of\". Don't wire it into tokenize() yet — just add the function. Keep `cargo check` passing.",
+    "check": "grep -q 'pub fn is_stopword' src/tokenize.rs && cargo check -q",
+    "arms": [
+     "baseline",
+     "rust"
+    ]
+   }
+  }
+ },
+ {
   "id": "schema-field",
   "why": "The gate exercise: a REQUIRED field on a type constructed in two files — the compiler fails until every site is updated, ungameable in both languages.",
   "suites": {
