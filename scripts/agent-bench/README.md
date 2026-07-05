@@ -153,21 +153,15 @@ fixture, and a hand-applied reference solution passes.
 verify checkers both ways. (T1–T6 remain the legacy `--repo` TS tasks against the
 Node-prototype checkout — the published §1 numbers are tied to them.)
 
-## The facade-surface ablation (`CI_MCP_SURFACE=facade`)
+## Tool surfaces: facade (default) vs full (`CI_MCP_SURFACE=full`)
 
-Does a smaller tool surface change the economics? The facade exports TWO tools instead of
-six — `apply_edits` verbatim plus one mode-dispatched `inspect`
-(`search|symbol|file|node|map`) — over identical server internals, so the surface is the
-only variable. What it tests: per-session schema tax, deferred-discovery friction, and
-whether removing the read-tool *choice* removes wrong-tool detours — against the risk that
-leaner descriptions under-teach. The harness swaps in a matching preamble automatically:
-
-```bash
-CI_MCP_SURFACE=facade bash scripts/agent-bench/go.sh --suite ts,rust --runs 3 --save-transcript /tmp/facade
-```
-
-Compare against a same-day full-surface pass; read `$` and calls, and diff trajectories for
-new failure modes (unknown-mode loops, missed direct paths) before drawing conclusions.
+The server exports TWO tools by default — `apply_edits` plus one mode-dispatched `inspect`
+(`search|symbol|file|node|map`) — over the same internals as the original six-tool surface.
+The controlled same-day A/B that settled it (3 runs x 12 task-suite cells, 2026-07-05):
+identical trajectories in every cell, **−11.5% cost** on the marksman arms, cheaper in 11 of
+12 cells, zero native-tool usage in 36/36 runs, `inspect` modes driven correctly throughout.
+`CI_MCP_SURFACE=full` restores the six-tool surface (kept as the ablation arm); the harness
+swaps the matching preamble automatically either way.
 
 ## Other models (GLM, MiniMax, …) through the same harness
 

@@ -1746,7 +1746,10 @@ fn outline_for(file: &str, content: &str) -> String {
 const INSPECT_MODES: [&str; 5] = ["search", "symbol", "file", "node", "map"];
 
 fn facade_surface() -> bool {
-    std::env::var("CI_MCP_SURFACE").as_deref() == Ok("facade")
+    // Facade is the DEFAULT since the controlled same-day A/B (3 runs x 12 cells, 2026-07-05):
+    // identical trajectories everywhere, -11.5% cost, zero native-tool leakage in 36/36 runs.
+    // CI_MCP_SURFACE=full restores the six-tool surface (kept as the ablation arm).
+    std::env::var("CI_MCP_SURFACE").as_deref() != Ok("full")
 }
 
 fn tools_list_facade() -> Value {

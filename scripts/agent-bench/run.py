@@ -24,6 +24,7 @@ TS_DIR = os.environ.get("CODEINDEX_TS_DIR", os.path.expanduser("~/codeindex"))
 
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
+    "mcp__marksman__inspect",
     "mcp__marksman__retrieve_context",
     "mcp__marksman__describe_architecture",
     "mcp__marksman__find_symbols",
@@ -162,7 +163,7 @@ PREAMBLE_FACADE = (
 
 
 def run_agent(repo, prompt, mcp_config, model, transcript=None):
-    pre = PREAMBLE_FACADE if os.environ.get("CI_MCP_SURFACE") == "facade" else PREAMBLE
+    pre = PREAMBLE if os.environ.get("CI_MCP_SURFACE") == "full" else PREAMBLE_FACADE
     full = (pre + prompt) if mcp_config else prompt
     # When capturing a transcript, stream every message (tool_use / tool_result) so we can see
     # exactly which tools the agent called and how big each response was. Otherwise the compact
