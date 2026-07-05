@@ -26,6 +26,11 @@
 //!    clean edit, land a cross-file rename (`treesitter_gated_gates_and_renames` in lang-ts is
 //!    the pattern). A `marksman-provider-<lang>` sidecar bin comes with the real crate
 //!    (`lang-rust/src/sidecar.rs` is the pattern); the template ships none on purpose.
+//! 5. **Moves/deletes**: implement the reference-model hooks from `provider-contract.md` §8
+//!    (`file_to_ref` / `ref_occurrences` / `membership_edits`) — and if your language is the
+//!    SECOND consumer, do the §8 extraction: generalize `lang-rust::movefix` and
+//!    `deleted_path_references` into the ci-edit spine instead of porting them. One-call
+//!    complete moves + deletion diagnostics are what make the ungated tier trustworthy.
 //!
 //! What this skeleton already gets right, so you don't have to re-learn it:
 //! - the write path is the shared `ci_edit::commit_edits` spine (VFS → gate → commit-or-roll-back;

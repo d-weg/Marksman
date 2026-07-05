@@ -108,6 +108,40 @@ language without a usable checker stays ungated — honestly.
   engine modules as needed, a `marksman-provider-<x>` sidecar bin, tests in-crate (fast unit +
   `#[ignore]` real-tool e2e).
 
+## 8. Moves & deletes — the reference-model contract (design; extract with the next language)
+
+Two capabilities are implemented today in `lang-rust` but are language-specific only in
+their *syntax hooks*, not their shape. When the next language lands, they get extracted into
+the shared spine rather than ported:
+
+- **The move rewriter** (today: `lang-rust::movefix`, the fallback where rust-analyzer's
+  `willRenameFiles` is silent). Its three concerns are universal: (a) how code REFERENCES a
+  file (Rust `crate::` paths, TS relative specifiers, Python dotted modules, Go package
+  paths), (b) how a file is DECLARED a project member (`mod x;` + `mod.rs`, `__init__.py`,
+  barrels, implicit-by-dir), (c) rewriting (a) and maintaining (b) as one WorkspaceEdit.
+  The generic engine (file walking, span edits, CreateFile ops, WorkspaceEdit assembly)
+  belongs in `ci-edit`; a provider supplies three hooks: `file_to_ref(path)`,
+  `ref_occurrences(content)`, `membership_edits(from, to)`. Note every provider already
+  implements the inverse of (a) — the syntactic import-graph resolver — so the hooks are
+  small.
+- **Deleted-reference diagnostics** (today: `lang-rust::deleted_path_references`, the
+  gap-fill for engines whose diagnostics miss unresolved imports). Generic form: resolve
+  each surviving file's references through the provider's existing import resolver; any
+  reference resolving to a batch-deleted path is a diagnostic. Works for every language
+  that has an import graph — which is every language, because retrieval requires one.
+
+Why this matters for the ladder: the ungated tier's move story today is "best-effort within
+the edited file — verify references yourself." With these two extracted, a checker-less
+language gets complete one-call moves and deletion soundness from its three syntax hooks —
+the gate is the safety net where one exists, and the diagnostics ARE the safety net where
+one doesn't. Engine-native rewrites (tsgo/ts-morph for TS) stay preferred where they exist;
+the abstract rewriter is the fallback tier, exactly as movefix is for Rust today.
+
+Do NOT extract speculatively: the second consumer is what validates the hook boundaries.
+The rule is "extract as the next language lands," with `lang-rust`'s implementations as the
+reference semantics (regression tests in `crates/langs/lang-rust/src/lib.rs` pin the
+committed-move-compiles / no-false-clean contracts the generic form must keep).
+
 ## Adding a language (checklist)
 
 1. Grammar + `classify` rows in `lang-fallback` (or a new crate at the gated tier).
@@ -115,5 +149,9 @@ language without a usable checker stays ungated — honestly.
 3. Registry entry (`LangSpec`: extensions, ignore dirs) + `doctor` toolchain probe if any.
 4. Gated tier: a real `GateEngine` behind the same `commit_edits`; syntactic graph served
    transitively; gate e2e (reject type error / accept clean / rename lands cross-file).
-5. Roadmap Batch 8 ladder: don't block on a SCIP indexer; don't claim more than the gate
+5. Moves/deletes: implement the §8 reference-model hooks — and do the §8 extraction if this
+   is the second consumer (movefix/deleted_path_references generalize out of lang-rust then).
+6. Roadmap Batch 8 ladder: don't block on a SCIP indexer; don't claim more than the gate
    verifies.
+7. Port the corpus fixture + `suites.<lang>` bindings in `scripts/agent-bench/tasks.json`
+   (six task identities, checkers verified fail-pre/pass-reference — see the bench README).
