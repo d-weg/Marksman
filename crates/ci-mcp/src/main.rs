@@ -942,7 +942,7 @@ impl Server {
             if let Some(e) = resolution_err {
                 return Err(e);
             }
-            if matches!(act, "replace_node" | "set_body") {
+            if wants_original_extent_note(act) {
                 if let Some(id) = name.as_deref().filter(|n| n.contains('#')) {
                     if let Some(note) = replaced_extent_note(&self.root, &registry, ai, act, id) {
                         replaced_notes.push(note);
@@ -1806,13 +1806,34 @@ fn exact_extent(content: &str, r: &ci_core::Range) -> Option<String> {
     Some(out)
 }
 
-/// Reject-time context for a node-REPLACING op (`replace_node` / `set_body`): the target's
-/// original text and — when its extent is narrower than its lines — the exact extent the
-/// `value` overwrites. Captured while the disk is still pristine and appended to gate
-/// rejections, so the agent can compose the retry against the REAL boundaries instead of
-/// paying a read_node round-trip (bench locate-edit-ts: `replace_node RRF_K` with a whole
-/// statement as `value` duplicated the outer keywords — the reject showed only the broken
-/// AFTER, and the fix needed the BEFORE).
+/// Ops whose gate-reject needs the target's intact BEFORE to compose the retry in the same
+/// response — the diagnostics show only the broken AFTER. Every node-anchored CONTENT op
+/// qualifies, not just the overwriting pair: bench body-edit-rust (2026-07-05), an
+/// unanchored insert_in_body landed after Rust's tail expression, the reject showed only
+/// the broken tail, and the agent paid a read_node turn to find the `after` anchor the
+/// original body would have handed it.
+fn wants_original_extent_note(act: &str) -> bool {
+    matches!(
+        act,
+        "replace_node"
+            | "set_body"
+            | "insert_in_body"
+            | "delete_in_body"
+            | "replace_text"
+            | "insert_member"
+            | "add_parameter"
+            | "set_return_type"
+            | "insert_before"
+    )
+}
+
+/// Reject-time context for a node-anchored content op (see [`wants_original_extent_note`]):
+/// the target's original text and — for the node-REPLACING pair, when its extent is narrower
+/// than its lines — the exact extent the `value` overwrites. Captured while the disk is
+/// still pristine and appended to gate rejections, so the agent can compose the retry
+/// against the REAL boundaries instead of paying a read_node round-trip (bench
+/// locate-edit-ts: `replace_node RRF_K` with a whole statement as `value` duplicated the
+/// outer keywords — the reject showed only the broken AFTER, and the fix needed the BEFORE).
 fn replaced_extent_note(root: &Path, registry: &ProviderRegistry, ai: usize, act: &str, id: &str) -> Option<String> {
     let file = file_of(id).to_string();
     let nodes = registry.structure(Path::new(&file)).ok()?;
@@ -1837,12 +1858,16 @@ fn replaced_extent_note(root: &Path, registry: &ProviderRegistry, ai: usize, act
         "op #{ai} ({act} {id}) targeted L{}-{}:\n```\n{lines_text}\n```",
         node.range.start_line, node.range.end_line
     );
-    if let Some(ex) = exact_extent(&content, &node.range) {
-        if ex.trim() != lines_text.trim() {
-            out.push_str(&format!(
-                "\nits EXACT extent is `{}` — `value` replaces precisely that text; everything outside it on the line STAYS (don't repeat keywords like `export`/`const`/`pub`).",
-                cap(ex)
-            ));
+    // The exact-extent caveat is about what `value` OVERWRITES — only true for the
+    // node-replacing pair; for insert/delete/text ops the whole-node view above is the point.
+    if matches!(act, "replace_node" | "set_body") {
+        if let Some(ex) = exact_extent(&content, &node.range) {
+            if ex.trim() != lines_text.trim() {
+                out.push_str(&format!(
+                    "\nits EXACT extent is `{}` — `value` replaces precisely that text; everything outside it on the line STAYS (don't repeat keywords like `export`/`const`/`pub`).",
+                    cap(ex)
+                ));
+            }
         }
     }
     Some(out)
@@ -2028,6 +2053,61 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{ensure_index_matches, scan_word, tools_list};
+
+    // The BEFORE-context contract, tied to the schema so a new action can't silently opt out:
+    // every node-anchored content action gets the original-extent note on a gate reject (the
+    // diagnostics show only the broken AFTER); rename has its own scan, add_symbol's conflict
+    // reply already echoes the existing source, and file ops have no node to echo.
+    #[test]
+    fn every_content_action_gets_the_original_extent_note() {
+        let tools = tools_list();
+        let actions: Vec<String> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "apply_edits")
+            .unwrap()["inputSchema"]["properties"]["actions"]["items"]["properties"]["action"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        for act in &actions {
+            let exempt = matches!(act.as_str(), "rename" | "add_symbol" | "move_file" | "create_file" | "delete_file");
+            assert_eq!(
+                super::wants_original_extent_note(act),
+                !exempt,
+                "{act}: original-extent note coverage must match the exemption list"
+            );
+        }
+    }
+
+    // The note itself, through a real provider: a body op's reject context is the WHOLE
+    // original node (that's where the retry's `after` anchor lives — bench body-edit-rust),
+    // and the exact-extent overwrite caveat stays scoped to the node-replacing pair.
+    #[test]
+    fn original_extent_note_carries_the_whole_node_for_body_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("m.py"),
+            "def lookup(store, key):\n    rows = store.rows(key)\n    return rows[0]\n",
+        )
+        .unwrap();
+        let registry = ci_build::ProviderRegistry::single(std::sync::Arc::new(
+            lang_fallback::FallbackProvider::new(root, lang_fallback::FbLang::Python),
+        ));
+        let note = super::replaced_extent_note(root, &registry, 0, "insert_in_body", "m.py#lookup")
+            .expect("note for a resolvable node");
+        assert!(
+            note.contains("rows = store.rows(key)"),
+            "the original body (the `after` anchor source) is in the note: {note}"
+        );
+        assert!(
+            !note.contains("EXACT extent"),
+            "the overwrite caveat must not fire for insert ops: {note}"
+        );
+    }
 
     // The narrow config/manifest surface: file-level replace_text on non-provider text files.
     // TOML/JSON must still PARSE post-edit (the honest syntax gate — never a type-check),
