@@ -361,6 +361,13 @@ fn ensure_within_root(root: &Path, rel: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether `op` targets `rel` (any of its paths) — used by providers to detect that a batch
+/// already handles a file (e.g. lang-rust skips synthesizing a module declaration when the
+/// agent's own batch edits the parent decl file).
+pub fn op_touches_file(op: &EditOp, rel: &str) -> bool {
+    op_paths(op).iter().any(|p| p.to_string_lossy().replace('\\', "/") == rel)
+}
+
 fn op_node_id(op: &EditOp) -> Option<&str> {
     match op {
         EditOp::ReplaceNode { node_id, .. }
@@ -874,7 +881,9 @@ fn apply_move(vfs: &mut Vfs, from: &Path, to: &Path, root: &Path, engine: &mut d
 }
 
 /// Delete a file — refused (statically, via the SCIP reverse import graph) if
-/// anything still imports it. Matches the Node tool's safety behavior.
+/// anything still imports it. The refusal is SELF-SUFFICIENT (the §5 law): each importer's
+/// referencing line is shown with a ready-to-copy removal fix, so clearing the way is one
+/// re-issued batch (fixes first, delete LAST) instead of a read-and-hunt per importer.
 pub fn apply_delete(
     vfs: &mut Vfs,
     path: &Path,
@@ -883,9 +892,39 @@ pub fn apply_delete(
     let rel = path.to_string_lossy().replace('\\', "/");
     let importers = reverse_imports(&rel);
     if !importers.is_empty() {
+        // The referencing lines: match on the deleted file's stem as a module token — the
+        // shape import/use/mod statements share across languages. Best-effort: an importer
+        // with no matched line is still named (the agent inspects that one).
+        let stem = Path::new(&rel).file_stem().and_then(|s| s.to_str()).unwrap_or(&rel).to_string();
+        let mut lines_out: Vec<String> = Vec::new();
+        for imp in importers.iter().take(10) {
+            let mut found = false;
+            if let Some(content) = vfs.read(Path::new(imp)) {
+                for (i, line) in content.lines().enumerate() {
+                    let t = line.trim();
+                    let is_ref = (t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("import ")
+                        || t.starts_with("from ") || t.starts_with("mod ") || t.starts_with("pub mod ")
+                        || t.contains("require("))
+                        && t.contains(stem.as_str());
+                    if is_ref {
+                        found = true;
+                        lines_out.push(format!("  {imp}:{}: {t}", i + 1));
+                        lines_out.push(format!(
+                            "    fix (ready to copy): {}",
+                            serde_json::json!({"action":"replace_text","path":imp,"oldText":line.trim_end(),"newText":""})
+                        ));
+                    }
+                }
+            }
+            if !found {
+                lines_out.push(format!("  {imp}: (references it — no single import line matched; inspect this one)"));
+            }
+        }
         return Err(Error::Driver(format!(
-            "DELETE_FILE refused: {rel} is still imported by {}",
-            importers.join(", ")
+            "DELETE_FILE refused: {rel} is still imported by {} file(s). Remove the references first — \
+             re-issue ONE batch with each `fix` VERBATIM plus the delete_file LAST:\n{}",
+            importers.len(),
+            lines_out.join("\n")
         )));
     }
     vfs.delete(path);
@@ -1520,6 +1559,23 @@ impl<R: ReadIndex> LanguageProvider for Composed<R> {
 
 #[cfg(test)]
 mod tests {
+
+    // The delete refusal must be self-sufficient: each importer's referencing line + a
+    // ready-to-copy removal fix, so clearing the way is ONE re-issued batch.
+    #[test]
+    fn delete_refusal_carries_copyable_removal_fixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/gone.rs"), "pub fn g() {}\n").unwrap();
+        std::fs::write(root.join("src/user.rs"), "use crate::gone::g;\npub fn u() { g() }\n").unwrap();
+        let mut vfs = Vfs::new(root);
+        let rev = |f: &str| if f == "src/gone.rs" { vec!["src/user.rs".to_string()] } else { vec![] };
+        let err = apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).unwrap_err().to_string();
+        assert!(err.contains("src/user.rs:1: use crate::gone::g;"), "line shown: {err}");
+        assert!(err.contains("fix (ready to copy)") && err.contains("\"oldText\":\"use crate::gone::g;\""), "fix carried: {err}");
+        assert!(err.contains("delete_file LAST"), "batch guidance: {err}");
+    }
     use super::*;
     use ci_core::{NodeKind, SymbolKind};
     use std::fs;
