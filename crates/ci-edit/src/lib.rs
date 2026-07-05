@@ -880,6 +880,17 @@ fn apply_move(vfs: &mut Vfs, from: &Path, to: &Path, root: &Path, engine: &mut d
     vfs.move_file(from, to)
 }
 
+/// An import/use/mod/require line referencing module token `stem` — the shape those
+/// statements share across languages. Best-effort by design: the gate (deleted-reference
+/// diagnostics + the compiler over the radius) is the net behind this fast-path guard.
+fn is_import_line_for(line: &str, stem: &str) -> bool {
+    let t = line.trim();
+    (t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("import ")
+        || t.starts_with("from ") || t.starts_with("mod ") || t.starts_with("pub mod ")
+        || t.contains("require("))
+        && t.contains(stem)
+}
+
 /// Delete a file — refused (statically, via the SCIP reverse import graph) if
 /// anything still imports it. The refusal is SELF-SUFFICIENT (the §5 law): each importer's
 /// referencing line is shown with a ready-to-copy removal fix, so clearing the way is one
@@ -890,25 +901,34 @@ pub fn apply_delete(
     reverse_imports: &impl Fn(&str) -> Vec<String>,
 ) -> Result<()> {
     let rel = path.to_string_lossy().replace('\\', "/");
-    let importers = reverse_imports(&rel);
+    let stem = Path::new(&rel).file_stem().and_then(|s| s.to_str()).unwrap_or(&rel).to_string();
+    // The graph is PRE-BATCH truth; the refusal's own recipe is "fixes + delete LAST in one
+    // batch", so an importer this batch already edited is judged by its STAGED content: no
+    // referencing line left ⇒ cleared. Untouched importers stay blocking even when no line
+    // matches (the stem heuristic is best-effort; unmatched means "inspect", not "clean").
+    let importers: Vec<String> = reverse_imports(&rel)
+        .into_iter()
+        .filter(|imp| {
+            if !vfs.is_staged(Path::new(imp)) {
+                return true;
+            }
+            match vfs.read(Path::new(imp)) {
+                Some(content) => content.lines().any(|l| is_import_line_for(l, &stem)),
+                None => false, // importer itself deleted earlier in this batch
+            }
+        })
+        .collect();
     if !importers.is_empty() {
-        // The referencing lines: match on the deleted file's stem as a module token — the
-        // shape import/use/mod statements share across languages. Best-effort: an importer
-        // with no matched line is still named (the agent inspects that one).
-        let stem = Path::new(&rel).file_stem().and_then(|s| s.to_str()).unwrap_or(&rel).to_string();
+        // The referencing lines, each with a ready-to-copy removal fix. An importer with no
+        // matched line is still named (the agent inspects that one).
         let mut lines_out: Vec<String> = Vec::new();
         for imp in importers.iter().take(10) {
             let mut found = false;
             if let Some(content) = vfs.read(Path::new(imp)) {
                 for (i, line) in content.lines().enumerate() {
-                    let t = line.trim();
-                    let is_ref = (t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("import ")
-                        || t.starts_with("from ") || t.starts_with("mod ") || t.starts_with("pub mod ")
-                        || t.contains("require("))
-                        && t.contains(stem.as_str());
-                    if is_ref {
+                    if is_import_line_for(line, &stem) {
                         found = true;
-                        lines_out.push(format!("  {imp}:{}: {t}", i + 1));
+                        lines_out.push(format!("  {imp}:{}: {}", i + 1, line.trim()));
                         lines_out.push(format!(
                             "    fix (ready to copy): {}",
                             serde_json::json!({"action":"replace_text","path":imp,"oldText":line.trim_end(),"newText":""})
@@ -1575,6 +1595,39 @@ mod tests {
         assert!(err.contains("src/user.rs:1: use crate::gone::g;"), "line shown: {err}");
         assert!(err.contains("fix (ready to copy)") && err.contains("\"oldText\":\"use crate::gone::g;\""), "fix carried: {err}");
         assert!(err.contains("delete_file LAST"), "batch guidance: {err}");
+    }
+
+    // The refusal's recipe must actually work: an importer whose referencing line was removed
+    // by an EARLIER op in the same batch is cleared (judged by staged content, not the
+    // pre-batch graph) — while an importer the batch never touched stays blocking, even when
+    // no line matches the stem heuristic.
+    #[test]
+    fn delete_clears_when_the_batch_already_removed_the_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/gone.rs"), "pub fn g() {}\n").unwrap();
+        std::fs::write(root.join("src/user.rs"), "use crate::gone::g;\npub fn u() { g() }\n").unwrap();
+        let rev = |f: &str| if f == "src/gone.rs" { vec!["src/user.rs".to_string()] } else { vec![] };
+
+        // untouched importer -> still refused
+        let mut vfs = Vfs::new(root);
+        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_err());
+
+        // the same batch staged the fix -> delete allowed
+        let mut vfs = Vfs::new(root);
+        vfs.write(Path::new("src/user.rs"), "pub fn u() {}\n".into());
+        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_ok());
+
+        // importer deleted earlier in the batch -> delete allowed
+        let mut vfs = Vfs::new(root);
+        vfs.delete(Path::new("src/user.rs"));
+        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_ok());
+
+        // staged edit that KEEPS the reference -> still refused
+        let mut vfs = Vfs::new(root);
+        vfs.write(Path::new("src/user.rs"), "use crate::gone::g;\n".into());
+        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_err());
     }
     use super::*;
     use ci_core::{NodeKind, SymbolKind};

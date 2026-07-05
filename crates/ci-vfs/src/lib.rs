@@ -122,6 +122,13 @@ impl Vfs {
         Ok(())
     }
 
+    /// Whether this batch has already staged a change to `rel` (write, create, or delete).
+    /// Lets later ops in the batch trust staged state over pre-batch truth — e.g. a
+    /// delete_file whose importers were cleaned up by earlier ops in the SAME batch.
+    pub fn is_staged(&self, rel: &Path) -> bool {
+        self.overlay.contains_key(rel)
+    }
+
     /// Paths touched by the transaction (for the diagnostics scope + reindex).
     pub fn changed(&self) -> Vec<PathBuf> {
         let mut v: Vec<PathBuf> = self.overlay.keys().cloned().collect();

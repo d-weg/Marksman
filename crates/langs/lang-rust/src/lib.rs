@@ -1417,4 +1417,85 @@ mod tests {
             }
         }
     }
+
+    // A BARE create_file of an undeclared module must commit with the synthesized
+    // `pub mod x;` present in the parent decl file — cargo would happily compile the orphan
+    // (it just never builds it), so the declaration IS the correctness claim here; the
+    // cargo check proves the synthesized decl resolves. #[ignore]; `cargo test -p lang-rust
+    // -- --ignored`.
+    #[test]
+    #[ignore]
+    fn bare_create_of_undeclared_module_commits_and_compiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"cr\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod store;\n").unwrap();
+        fs::write(root.join("src/store.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let res = p
+            .apply_edits(
+                &[EditOp::CreateFile {
+                    path: "src/util.rs".into(),
+                    code: "pub fn one() -> i32 {\n    1\n}\n".into(),
+                }],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "bare create of an undeclared module must commit: {res:?}");
+        let lib = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("pub mod util;"), "declaration synthesized in the parent: {lib}");
+        assert!(fs::read_to_string(root.join("src/util.rs")).unwrap().contains("pub fn one"));
+        let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // The delete refusal's OWN recipe, end to end: its `fix` lines must apply VERBATIM, and
+    // the re-issued batch (fixes + delete_file LAST) must commit clean — the refusal text
+    // promises exactly this flow, so it is contract, not prose. #[ignore]; `cargo test -p
+    // lang-rust -- --ignored`.
+    #[test]
+    #[ignore]
+    fn delete_refusal_fixes_reissued_batch_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"del\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n").unwrap();
+        fs::write(root.join("src/lib.rs"), "pub mod gone;\npub mod user;\n").unwrap();
+        fs::write(root.join("src/gone.rs"), "pub fn g() -> i32 {\n    1\n}\n").unwrap();
+        fs::write(root.join("src/user.rs"), "pub use crate::gone::g;\n\npub fn u() -> i32 {\n    2\n}\n").unwrap();
+
+        let p = RustProvider::new(root);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        let res = p.apply_edits(&[EditOp::DeleteFile { path: "src/gone.rs".into() }], &opts).unwrap();
+        let feedback = match res {
+            CommitResult::Rejected { feedback, .. } => feedback,
+            other => panic!("delete of a still-imported file must be refused: {other:?}"),
+        };
+        assert!(root.join("src/gone.rs").is_file(), "refusal leaves disk untouched");
+
+        // Apply each `fix` VERBATIM — parsed straight out of the refusal text, nothing edited.
+        let mut ops: Vec<EditOp> = Vec::new();
+        for line in feedback.lines() {
+            if let Some(json) = line.trim().strip_prefix("fix (ready to copy): ") {
+                let v: serde_json::Value = serde_json::from_str(json).expect("fix must be valid JSON");
+                assert_eq!(v["action"], "replace_text", "fix action shape: {v}");
+                ops.push(EditOp::ReplaceInFile {
+                    path: v["path"].as_str().unwrap().into(),
+                    old_text: v["oldText"].as_str().unwrap().into(),
+                    new_text: v["newText"].as_str().unwrap().into(),
+                });
+            }
+        }
+        assert!(ops.len() >= 2, "one fix per referencing line (mod decl + re-export), got {} in:\n{feedback}", ops.len());
+        ops.push(EditOp::DeleteFile { path: "src/gone.rs".into() });
+
+        let res = p.apply_edits(&ops, &opts).unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "the refusal's own recipe must commit: {res:?}");
+        assert!(!root.join("src/gone.rs").exists(), "file deleted");
+        let out = std::process::Command::new("cargo").args(["check", "-q"]).current_dir(root).output().unwrap();
+        assert!(out.status.success(), "must compile:\n{}", String::from_utf8_lossy(&out.stderr));
+    }
 }
