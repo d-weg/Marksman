@@ -65,21 +65,26 @@ follow the rename, which Marksman's rename now does in the same call.
 
 | suite | arm | input tok | output tok | $ | vs baseline (in/out/$) |
 |---|---|--:|--:|--:|---|
-| ts | baseline | 1,316,082 | 9,524 | 0.6382 | — |
-| ts | **Marksman** | **550,307** | **2,979** | **0.3168** | **−58% / −69% / −50%** |
-| rust | baseline | 1,098,891 | 8,415 | 0.5224 | — |
-| rust | **Marksman** | **605,910** | **4,400** | **0.3478** | **−45% / −48% / −33%** |
+| ts | baseline | 1,321,353 | 10,258 | 0.6356 | — |
+| ts | **Marksman** | **550,418** | **2,986** | **0.3004** | **−58% / −71% / −53%** |
+| rust | baseline | 1,049,615 | 9,247 | 0.5227 | — |
+| rust | **Marksman** | **578,405** | **4,069** | **0.3348** | **−45% / −56% / −36%** |
 
 Per task (median API calls / median $, Marksman **bold** where it wins on $):
 
 | task | ts baseline | ts Marksman | rust baseline | rust Marksman |
 |---|--:|--:|--:|--:|
-| rename | 9 / 0.1132 | **3 / 0.0414** | 7 / 0.0804 | **3 / 0.0411** |
-| move | 11 / 0.1161 | **3 / 0.0415** | 11 / 0.1343 | **5 / 0.0862** |
-| locate-edit | 8 / 0.0773 | **4 / 0.0526** | 6 / 0.0582 | **4 / 0.0527** |
-| body-edit | 8 / 0.0740 | 5 / 0.0749 | 5 / 0.0470 | 5 / 0.0674 |
-| schema-field | 12 / 0.1383 | **4 / 0.0569** | 8 / 0.0915 | **4 / 0.0582** |
-| type-rename | 8 / 0.1193 | **3 / 0.0495** | 10 / 0.1110 | **3 / 0.0422** |
+| rename | 9 / 0.1025 | **3 / 0.0402** | 7 / 0.0760 | **3 / 0.0409** |
+| move | 11 / 0.1331 | **3 / 0.0416** | 10 / 0.1194 | **4 / 0.0712** |
+| locate-edit | 7 / 0.0711 | **4 / 0.0539** | 6 / 0.0597 | **4 / 0.0531** |
+| body-edit | 8 / 0.0705 | **5 / 0.0667** | 5 / 0.0471 | 5 / 0.0674 |
+| schema-field | 11 / 0.1262 | **4 / 0.0570** | 8 / 0.0921 | **4 / 0.0599** |
+| type-rename | 10 / 0.1322 | **3 / 0.0410** | 9 / 0.1284 | **3 / 0.0423** |
+
+Reproducibility: an independent 3-run pass earlier the same day (before a `move_file`
+description refinement) landed within a few points on every cell — same winners, same
+losers, same shapes; the largest movement was move-rust itself (−36% → −40% $ after the
+description spelled out the move's per-language completeness).
 
 ### Direction still pays — but wide prompts win anyway
 
@@ -88,10 +93,10 @@ type-rename), the agent goes straight to one `apply_edits` — 3 calls, −49…
 directness the legacy benchmark measured. When the prompt withholds the target
 (locate-edit's "find it"), the agent spends a retrieval call first and the margin narrows.
 So: **the tool benefits from precise prompt direction, and still saves tokens when it
-doesn't get any** — the wide-prompt totals above are −33/−50% on cost with the agent doing
+doesn't get any** — the wide-prompt totals above are −36/−53% on cost with the agent doing
 its own finding. The one honest exception is body-edit: a task so small (one inserted line)
 that the marksman arm's tool schemas cost more than the baseline's whole grep-and-edit
-trajectory; on the rust suite that's a real +43% loss, on ts a tie. Below roughly a
+trajectory; on the rust suite that's a real +43% loss, on ts a −5% squeak. Below roughly a
 $0.05-baseline task there is nothing left to save.
 
 ### Why it wins — three mechanisms
@@ -115,13 +120,13 @@ $0.05-baseline task there is nothing left to save.
 
 - One machine, one model (sonnet 4.6), 3 runs per cell; single-run trajectory variance is
   real (move especially swings between a direct 3-call run and a survey-first 5–6).
-- **move-rust is the open gap** (5 calls / $0.086 vs move-ts's 3 / $0.041): agents trust the
+- **move-rust is the open gap** (4 calls / $0.071 vs move-ts's 3 / $0.042): agents trust the
   engine to rewrite TS imports but hedge on Rust's module system — they type insurance
-  helper edits (harmless: the server no-ops redundant ones) and research first. The tool
-  answer so far: per-language completeness spelled out in the description, `dryRun` as a
-  one-call survey substitute, and self-sufficient anchor listings. The residual is agent
-  prior, not tool capability — a bare `move_file` has been the complete Rust move since the
-  movefix engine landed.
+  helper edits (harmless: the server no-ops redundant ones) and survey first. Spelling out
+  the move's per-language completeness in the description measurably shrank it (5→4 calls,
+  −17% $ between consecutive passes); `dryRun` is offered as a one-call survey substitute.
+  The residual is agent prior, not tool capability — a bare `move_file` has been the
+  complete Rust move since the movefix engine landed.
 - The tool descriptions the agent sees are audited to contain **zero** benchmark-specific
   content; suite prompts and fixtures were built after that audit and keep to it.
 - Every run passed its checker, so the gate's *insurance* value — catching a broken edit —
