@@ -585,8 +585,48 @@ fn collect_items(node: TsNode, bytes: &[u8], prefix: &str, fn_kind: SymbolKind, 
                     out.push(n);
                 }
             }
-            "struct_item" | "union_item" => push(&child, bytes, prefix, SymbolKind::Struct, out),
-            "enum_item" => push(&child, bytes, prefix, SymbolKind::Enum, out),
+            // Structs and enums expose their members the way lang-ts exposes class/interface
+            // fields: the container gets a `:body` sub-node (the member-list insertion anchor)
+            // and each field/variant is a TOP-LEVEL dotted symbol (`Type.field`) — that is
+            // what feeds field-level addressing (replace_text name=Type.field), the index
+            // (fields are searchable symbols), and retrieval's inline one-line pointers.
+            // Without them a Rust struct was an opaque block the agent had to read whole.
+            "struct_item" | "union_item" => {
+                if let Some(n) = named_node(&child, bytes, prefix, SymbolKind::Struct) {
+                    let type_prefix = format!("{}.", n.id);
+                    out.push(n);
+                    let parent_idx = out.len() - 1;
+                    if let Some(body) = child.child_by_field_name("body") {
+                        if body.kind() == "field_declaration_list" {
+                            let body_id = format!("{}:body", out[parent_idx].id);
+                            out[parent_idx].children.push(syntax_node(&body_id, None, "body", &body));
+                            let mut c2 = body.walk();
+                            for f in body.named_children(&mut c2) {
+                                if f.kind() == "field_declaration" {
+                                    push_member(&f, bytes, &type_prefix, out);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "enum_item" => {
+                if let Some(n) = named_node(&child, bytes, prefix, SymbolKind::Enum) {
+                    let type_prefix = format!("{}.", n.id);
+                    out.push(n);
+                    let parent_idx = out.len() - 1;
+                    if let Some(body) = child.child_by_field_name("body") {
+                        let body_id = format!("{}:body", out[parent_idx].id);
+                        out[parent_idx].children.push(syntax_node(&body_id, None, "body", &body));
+                        let mut c2 = body.walk();
+                        for v in body.named_children(&mut c2) {
+                            if v.kind() == "enum_variant" {
+                                push_member(&v, bytes, &type_prefix, out);
+                            }
+                        }
+                    }
+                }
+            }
             "trait_item" => push(&child, bytes, prefix, SymbolKind::Interface, out),
             "type_item" => push(&child, bytes, prefix, SymbolKind::TypeAlias, out),
             "const_item" | "static_item" => push(&child, bytes, prefix, SymbolKind::Variable, out),
@@ -613,6 +653,16 @@ fn collect_items(node: TsNode, bytes: &[u8], prefix: &str, fn_kind: SymbolKind, 
 
 fn push(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind, out: &mut Vec<Node>) {
     if let Some(n) = named_node(item, bytes, prefix, kind) {
+        out.push(n);
+    }
+}
+
+/// One struct field / enum variant as a top-level dotted symbol (`Type.member`), mirroring
+/// lang-ts's class-field shape (kind `var`, single line — which is what lets retrieval inline
+/// its source). Fields with doc comments get a `:doc` sub-node like any other declaration.
+fn push_member(item: &TsNode, bytes: &[u8], type_prefix: &str, out: &mut Vec<Node>) {
+    // named_node's doc_range skips attributes, so #[serde(...)]-decorated fields keep docs.
+    if let Some(n) = named_node(item, bytes, type_prefix, SymbolKind::Variable) {
         out.push(n);
     }
 }
@@ -644,11 +694,21 @@ fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Op
     })
 }
 
-/// Range spanning the contiguous leading comment lines directly above `item` (Rust doc comments
-/// `///` / `//!` are `line_comment`s; `/** */` is a `block_comment`). v0 stops at a non-comment
-/// sibling, so a doc comment separated from the item by an attribute isn't captured yet.
+/// Range spanning the contiguous leading comment lines above `item` (Rust doc comments
+/// `///` / `//!` are `line_comment`s; `/** */` is a `block_comment`). Attributes between the
+/// docs and the item are SKIPPED, not counted: `/// docs` + `#[derive(Clone)]` + `struct X`
+/// is the dominant real-world shape, and treating the attribute as a doc-breaker silently
+/// dropped the `:doc` anchor from nearly every derive-decorated type.
 fn doc_range(item: &TsNode) -> Option<Range> {
-    ci_treesitter::leading_comment_range(item, |n| {
+    let mut anchor = *item;
+    while let Some(prev) = anchor.prev_sibling() {
+        if prev.kind() == "attribute_item" {
+            anchor = prev;
+        } else {
+            break;
+        }
+    }
+    ci_treesitter::leading_comment_range(&anchor, |n| {
         matches!(n.kind(), "line_comment" | "block_comment")
     })
 }
@@ -793,6 +853,41 @@ mod tests {
         let doc = add.children.iter().find(|c| c.id == "a.rs#add:doc").expect("doc anchor");
         assert_eq!(doc.range.start_line, 1, "doc starts at the first /// line: {:?}", doc.range);
         assert!(doc.range.end_line >= 2, "doc spans both /// lines: {:?}", doc.range);
+    }
+
+    // TS-parity contract for type members (bench body-edit/schema-field gap analysis): struct
+    // fields and enum variants are TOP-LEVEL dotted symbols (they feed the index and
+    // retrieval's inline one-line pointers), the container carries :body, and a #[derive]
+    // between the doc comment and the item must NOT cost the :doc anchor.
+    #[test]
+    fn struct_fields_enum_variants_and_docs_through_derives() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("a.rs"),
+            "/// One indexed doc.\n#[derive(Clone, Debug)]\npub struct Entry {\n    pub name: String,\n    pub score: f32,\n}\n\n/// What kind.\n#[derive(Clone)]\npub enum Kind {\n    Source,\n    Config,\n}\n",
+        )
+        .unwrap();
+        let p = RustProvider::new(root);
+        let nodes = p.structure(Path::new("a.rs")).unwrap();
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        for want in ["a.rs#Entry", "a.rs#Entry.name", "a.rs#Entry.score", "a.rs#Kind", "a.rs#Kind.Source", "a.rs#Kind.Config"] {
+            assert!(ids.contains(&want), "missing {want}: {ids:?}");
+        }
+        let entry = nodes.iter().find(|n| n.id == "a.rs#Entry").unwrap();
+        let child_ids: Vec<&str> = entry.children.iter().map(|c| c.id.as_str()).collect();
+        assert!(child_ids.contains(&"a.rs#Entry:body"), "struct :body anchor: {child_ids:?}");
+        assert!(
+            child_ids.contains(&"a.rs#Entry:doc"),
+            "doc survives the #[derive] between it and the struct: {child_ids:?}"
+        );
+        let score = nodes.iter().find(|n| n.id == "a.rs#Entry.score").unwrap();
+        assert_eq!(
+            (score.range.start_line, score.range.end_line),
+            (5, 5),
+            "field is a single-line node (inline-pointer eligible): {:?}",
+            score.range
+        );
     }
 
     fn tiny_crate() -> tempfile::TempDir {
