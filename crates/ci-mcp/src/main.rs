@@ -1152,7 +1152,12 @@ impl Server {
             // verification IT can do — a repo-wide rename scan — and hands the evidence over,
             // instead of telling the agent to go verify (which measurably costs 2-4 turns of
             // grep/read per task: the T8 bench arm lost to baseline on exactly that).
-            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } => {
+            ci_core::CommitResult::Ok { applied_ops, changed_files, ref rewrite_summary, .. } => {
+                let rewrites = if rewrite_summary.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nwhat the rename/move rewrote (from the staged changes, as committed):\n{rewrite_summary}")
+                };
                 let scan = if !dry_run {
                     let applied = self.auto_update_comment_mentions(&registry, &renames);
                     let auto = if applied.is_empty() {
@@ -1175,7 +1180,7 @@ impl Server {
                 Ok(format!(
                     "✓ Applied {applied_ops} structural edit(s){}; {} file(s) changed. gated: false — syntax-checked \
                      (the result parses; edits introducing syntax errors are rejected) but NOT type-verified: no \
-                     type-checker is wired for the edited language(s).{scan}Files changed:\n{}",
+                     type-checker is wired for the edited language(s).{rewrites}{scan}Files changed:\n{}",
                     if dry_run { " (dry run — nothing written yet)" } else { "" },
                     changed_files.len(),
                     changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),

@@ -140,9 +140,10 @@ PREAMBLE = (
     "a ONE-LINE change (change a default, fix a value) — use apply_edits replace_text by name; do NOT "
     "reach for Grep/Bash/Read+Edit for a small edit. It's verified server-side and needs no separate search.\n"
     "File moves/renames: send the BARE move_file/rename as your FIRST action — no find/grep/read survey "
-    "first, no helper edits alongside (imports, module declarations, and needed module files are all part "
-    "of the one action). The reply shows every line it rewrote, which is exactly what a survey would have "
-    "found; the type-check gate rejects safely if anything is off.\n\n"
+    "first, no helper edits alongside (in type-checked languages, imports, module declarations, and needed "
+    "module files are all part of the one action; ungated replies say exactly what remains). The reply "
+    "shows every line it rewrote — exactly what a survey would have found — and the gate rejects safely "
+    "if anything is off.\n\n"
     "Task: "
 )
 
