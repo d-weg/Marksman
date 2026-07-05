@@ -255,6 +255,12 @@ pub struct RustProvider {
     fresh_edges: Arc<Mutex<HashMap<String, Option<Vec<PathBuf>>>>>,
 }
 
+/// What ONE bare `move_file` covers for Rust — composed into the MCP `apply_edits`
+/// description by ci-mcp, so the completeness claim the agent reads lives NEXT TO the code
+/// that makes it true (movefix + the gate) and a new language's claim appears with its
+/// provider instead of drifting in hand-written prose. Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "the `mod` declaration (moved/repurposed), a parent `mod.rs` CREATED when the target directory needs one, and every `crate::…` path rewritten";
+
 /// The rust-analyzer binary: `$CI_RUST_ANALYZER`, else `~/.cargo/bin/rust-analyzer`, else PATH.
 fn rust_analyzer_command() -> Command {
     let bin = std::env::var("CI_RUST_ANALYZER").map(std::ffi::OsString::from).unwrap_or_else(|_| {

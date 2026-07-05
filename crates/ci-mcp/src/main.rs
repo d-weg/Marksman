@@ -1018,12 +1018,14 @@ impl Server {
                     let mut applied = 0usize;
                     let mut changed: Vec<PathBuf> = Vec::new();
                     let mut preexisting: Vec<ci_core::Diag> = Vec::new();
+                    let mut redundant = 0usize;
                     for (gi, (slot, gops)) in groups.iter().enumerate() {
                         match provider_of(*slot).apply_edits(gops, &opts).map_err(|e| e.to_string())? {
-                            ci_core::CommitResult::Ok { applied_ops, changed_files, preexisting_in_radius, .. } => {
+                            ci_core::CommitResult::Ok { applied_ops, changed_files, preexisting_in_radius, redundant_ops, .. } => {
                                 applied += applied_ops;
                                 changed.extend(changed_files);
                                 preexisting.extend(preexisting_in_radius);
+                                redundant += redundant_ops;
                             }
                             ci_core::CommitResult::Rejected { feedback, .. } => {
                                 // Gate passed but the write-run rejected (nondeterministic
@@ -1038,7 +1040,7 @@ impl Server {
                     }
                     changed.sort();
                     changed.dedup();
-                    ci_core::CommitResult::Ok { applied_ops: applied, changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting }
+                    ci_core::CommitResult::Ok { applied_ops: applied, changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting, redundant_ops: redundant }
                 }
             }
         };
@@ -1086,7 +1088,7 @@ impl Server {
                     changed_files.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n"),
                 ))
             }
-            ci_core::CommitResult::Ok { applied_ops, changed_files, .. } if all_gated => {
+            ci_core::CommitResult::Ok { applied_ops, changed_files, redundant_ops, .. } if all_gated => {
                 // "COMPLETE — do not grep" is true for CODE references (the compiler renamed
                 // them) and false for comments/strings/docs, which no semantic rename touches.
                 // Same §5 law as the ungated tier: run the scan server-side and hand over the
@@ -1109,10 +1111,23 @@ impl Server {
                 } else {
                     (String::new(), None, None)
                 };
+                // The redundancy receipt: the agent's insurance helpers were accepted as
+                // no-ops because the structural op's own automation got there first. Saying
+                // so — with the count — is what converts the hedge into trust for the NEXT
+                // batch; the description's completeness claim is assertion, this is evidence.
+                let receipt = if redundant_ops > 0 {
+                    format!(
+                        "\nNote: {redundant_ops} of your {applied_ops} action(s) were REDUNDANT — the batch's rename/move \
+                         automation had already produced their exact end state (accepted as no-ops, nothing double-applied). \
+                         The bare rename/move_file alone was sufficient; the helper actions only cost output tokens."
+                    )
+                } else {
+                    String::new()
+                };
                 Ok(format!(
                     "✓ Applied {applied_ops} edit(s){}; {} file(s) changed; type-checked clean — no new type errors anywhere, \
                      including files that import what changed. rename/move already updated every reference/import across the \
-                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{auto}{}{}\nFiles changed:\n{}",
+                     whole codebase, so this change is COMPLETE — do not grep, re-read, or hand-edit call sites to verify.{receipt}{auto}{}{}\nFiles changed:\n{}",
                     if dry_run { " (dry run — nothing written yet)" } else { "" },
                     changed_files.len(),
                     scan.unwrap_or_default(),
@@ -1665,10 +1680,10 @@ fn tools_list() -> Value {
     // every tools listing and deferred-tools reminder — primacy is a prior, and an
     // editing-centered tool whose list led with retrieval primed a locate-first workflow the
     // descriptions then had to argue against. Workhorse first, locate ladder after, the map last.
-    json!([
+    let mut tools = json!([
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move. Per language, that one action already covers: TS — every import specifier (incl. type-only imports) repo-wide; Rust — the `mod` declaration (moved/repurposed), a parent `mod.rs` CREATED when the target directory needs one, and every `crate::…` path rewritten. Do NOT add create_file/replace_text helpers for imports or module decls alongside it — each helper you type is output spent re-doing what the move does, and researching the sites to WRITE those helpers is the real cost. When the task states the from/to paths, send the bare move with NO exploration first: the commit response lists every file it rewrote, and the type-check gate rejects safely if anything is off. Genuinely unsure? `dryRun:true` on the bare move returns the same verdict without writing — ONE call, cheaper than any importer survey (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
+            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move. Per language, that one action already covers: TS — %TS_MOVE%; Rust — %RUST_MOVE%. Do NOT add create_file/replace_text helpers for imports or module decls alongside it — each helper you type is output spent re-doing what the move does, and researching the sites to WRITE those helpers is the real cost. When the task states the from/to paths, send the bare move with NO exploration first: the commit response lists every file it rewrote, and the type-check gate rejects safely if anything is off. Genuinely unsure? `dryRun:true` on the bare move returns the same verdict without writing — ONE call, cheaper than any importer survey (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
             "inputSchema": {"type":"object","properties":{
                 "actions":{"type":"array","description":"One or more edits, applied atomically and type-checked together — batch related edits here instead of separate calls.","items":{"type":"object","additionalProperties":false,"properties":{
                     "action":{"type":"string","enum":["rename","replace_text","replace_node","set_body","insert_in_body","delete_in_body","insert_member","add_parameter","set_return_type","insert_before","move_file","create_file","delete_file"],"description":"Fields per action — rename: name, value(new name) · replace_text: name, oldText, newText · replace_node: name, value(new code), target? · set_body: name, value · insert_in_body: name, value, oldText? · delete_in_body: name, oldText · insert_member: name, value · add_parameter: name, value · set_return_type: name, value · insert_before: name, value · move_file: path, value(new path) · create_file: path, value(source) · delete_file: path. For symbol actions `query` may replace `name`, and `path` may scope a bare `name`."},
@@ -1730,7 +1745,18 @@ fn tools_list() -> Value {
             "description": "Folder/architecture map (zero-API): per-directory file-kind patterns and detected module templates. Optional `path` scopes to a subtree.",
             "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}
         }
-    ])
+    ]);
+    // Per-language move-coverage claims come FROM the provider crates (single source of
+    // truth): the sentence the agent reads about what a bare move covers lives next to the
+    // code that makes it true. A future language adds its MOVE_COVERAGE constant and one
+    // placeholder here — the description can never lag the capability.
+    if let Some(desc) = tools[0]["description"].as_str() {
+        let d = desc
+            .replace("%TS_MOVE%", lang_ts::MOVE_COVERAGE)
+            .replace("%RUST_MOVE%", lang_rust::MOVE_COVERAGE);
+        tools[0]["description"] = json!(d);
+    }
+    tools
 }
 
 /// The loaded index must have been built with the model + dims the server now embeds with; a
@@ -1882,6 +1908,19 @@ mod tests {
         // out-of-bounds never panics.
         let r = Range { start_line: 9, end_line: 9, start_char: 1, end_char: 2 };
         assert_eq!(super::exact_extent(content, &r), None);
+    }
+
+    // The move-coverage sentences the agent reads are provider-owned constants; this pins the
+    // placeholder wiring so a refactor can't silently ship "%TS_MOVE%" as literal prose (or
+    // sever the claim from the crate that implements it).
+    #[test]
+    fn move_coverage_claims_come_from_the_provider_crates() {
+        let tools = tools_list();
+        let desc = tools[0]["description"].as_str().unwrap();
+        assert_eq!(tools[0]["name"], "apply_edits", "apply_edits leads the listing");
+        assert!(desc.contains(lang_ts::MOVE_COVERAGE), "ts claim wired in");
+        assert!(desc.contains(lang_rust::MOVE_COVERAGE), "rust claim wired in");
+        assert!(!desc.contains("%TS_MOVE%") && !desc.contains("%RUST_MOVE%"), "no unexpanded placeholders");
     }
 
     #[test]

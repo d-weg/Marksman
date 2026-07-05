@@ -31,6 +31,11 @@ pub(crate) const SCIP_TS_VERSION: &str = "0.4.0";
 const TS_LSP_VERSION: &str = "5.3.0";
 const TYPESCRIPT_VERSION: &str = "6.0.3";
 
+/// What ONE bare `move_file` covers for TypeScript — composed into the MCP `apply_edits`
+/// description by ci-mcp, so the completeness claim the agent reads lives NEXT TO the code
+/// that makes it true (the engine's rename/move rewrites) instead of drifting in prose.
+pub const MOVE_COVERAGE: &str = "every import specifier (incl. type-only imports) rewritten repo-wide";
+
 /// Everything the TypeScript provider needs from the machine, checked WITHOUT running any of
 /// it — the registry builders call this before constructing the provider, so a missing Node
 /// yields one actionable message instead of a cryptic npx spawn error mid-index. (A repo with

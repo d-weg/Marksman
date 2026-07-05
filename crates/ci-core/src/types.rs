@@ -275,6 +275,13 @@ pub enum CommitResult {
         /// (bench move-rust round 4: a mid-flight repo stayed broken behind a COMPLETE claim).
         #[serde(default)]
         preexisting_in_radius: Vec<Diag>,
+        /// Ops that returned Ok while changing NOTHING in the VFS — their end state was
+        /// already produced by an earlier op in the batch (typically a rename/move's own
+        /// automation absorbing the agent's insurance helpers). Responses surface the count
+        /// so the agent learns the hedge was a free rider — evidence, not prose, is what
+        /// builds trust in the structural ops' completeness.
+        #[serde(default)]
+        redundant_ops: usize,
     },
     Rejected {
         #[serde(default)]

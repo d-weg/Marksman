@@ -955,6 +955,7 @@ pub fn commit_edits(
         lo = hi;
     }
 
+    let mut redundant_ops = 0usize;
     for i in order {
         let op = &ops[i];
         // Trust boundary: reject before any VFS mutation if the op targets a path outside the repo.
@@ -963,6 +964,15 @@ pub fn commit_edits(
                 return Ok(CommitResult::Rejected { failed_op_index: i as i64, feedback: e.to_string() });
             }
         }
+        // Redundancy detection, GENERIC across every satisfied-op semantics (present and
+        // future): a content op that returns Ok while changing nothing in the VFS had its end
+        // state produced by an earlier op in the batch (typically a rename/move's automation).
+        // The count reaches the response so the agent LEARNS the helpers were free riders —
+        // the hedge is priced by evidence, not argued against in prose.
+        let before: Option<(PathBuf, String)> = match op {
+            EditOp::Rename { .. } | EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } => None,
+            other => op_paths(other).first().and_then(|p| vfs.read(p).map(|c| (p.clone(), c))),
+        };
         let res = match op {
             EditOp::Rename { node_id, new_name } => {
                 apply_rename(&mut vfs, node_id, new_name, root, structure_of, engine)
@@ -974,10 +984,15 @@ pub fn commit_edits(
         if let Err(e) = res {
             return Ok(CommitResult::Rejected { failed_op_index: i as i64, feedback: e.to_string() });
         }
+        if let Some((p, b)) = before {
+            if vfs.read(&p).as_deref() == Some(b.as_str()) {
+                redundant_ops += 1;
+            }
+        }
     }
 
     if vfs.is_empty() {
-        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: vec![], repair_rounds: 0, preexisting_in_radius: vec![] });
+        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: vec![], repair_rounds: 0, preexisting_in_radius: vec![], redundant_ops });
     }
 
     let changed = vfs.changed();
@@ -1256,7 +1271,7 @@ pub fn commit_edits(
         // REAL deletion (an empty module resolves; an absent one errors) for every later gate.
         let _ = engine.fs_events(&[], &deleted_rels);
     }
-    Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting })
+    Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting, redundant_ops })
 }
 
 // ── Composed: ReadIndex × GateEngine = LanguageProvider ─────────────────────────────────────
