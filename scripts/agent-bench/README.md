@@ -153,4 +153,42 @@ fixture, and a hand-applied reference solution passes.
 verify checkers both ways. (T1–T6 remain the legacy `--repo` TS tasks against the
 Node-prototype checkout — the published §1 numbers are tied to them.)
 
+## Other models (GLM, MiniMax, …) through the same harness
+
+Several providers ship **Anthropic-compatible endpoints built to drive Claude Code** — which
+means the whole bench runs unchanged against their models: same tasks, same objective checks,
+same `.calls.jsonl` accounting; the only variable is the model. The mechanism is the same
+`CLAUDE_BIN` shim the middleware experiment used (docs/benchmarks.md §4.2):
+
+```bash
+cat > /tmp/claude-glm <<'SH'
+#!/bin/sh
+export ANTHROPIC_BASE_URL="https://api.z.ai/api/anthropic"   # GLM (per z.ai docs)
+export ANTHROPIC_AUTH_TOKEN="$GLM_API_KEY"
+exec "${CLAUDE_REAL:-claude}" "$@"
+SH
+chmod +x /tmp/claude-glm
+
+CLAUDE_BIN=/tmp/claude-glm CLAUDE_MODEL=glm-4.6 \
+CI_BENCH_PRICE="in=0.6,out=2.2" \
+bash scripts/agent-bench/go.sh --suite ts,rust --runs 3 --save-transcript /tmp/glm-suites
+```
+
+(MiniMax is the same shape with `https://api.minimax.io/anthropic` and its model id — check
+each provider's current endpoint/model/pricing before a run.)
+
+Two accounting rules for cross-provider tables:
+
+- **`$` needs `CI_BENCH_PRICE`.** The CLI prices runs against Anthropic's own table, so its
+  `total_cost_usd` is wrong or zero behind a third-party base URL. Set
+  `CI_BENCH_PRICE="in=<$/MTok>,out=<$/MTok>[,cache_read=…][,cache_write=…]"` to recompute
+  from the run's token counts — or ignore `$` and read tokens/turns, which are always true.
+- **Compare arms within a model, never $ across models.** The claim worth testing is "does
+  Marksman's delta hold on model X", not "is model X cheaper" — each model gets its own
+  baseline.
+
+Different *harnesses* (OpenCode, …) are a separate axis: different tool loop, upfront MCP
+registration (no ToolSearch discovery turn), own transcript format — that needs a runner
+backend, not a shim.
+
 Latest results and analysis live in [docs/benchmarks.md](../../docs/benchmarks.md).

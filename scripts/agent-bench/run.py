@@ -180,8 +180,22 @@ def run_agent(repo, prompt, mcp_config, model, transcript=None):
         u = out.get("usage", {})
         intok = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
                  + u.get("cache_creation_input_tokens", 0))
+        cost = out.get("total_cost_usd", 0.0)
+        # Third-party Anthropic-compatible endpoints (GLM, MiniMax, … via ANTHROPIC_BASE_URL):
+        # the CLI prices against Anthropic's table, so its cost is wrong or zero there.
+        # CI_BENCH_PRICE="in=<$/MTok>,out=<$/MTok>[,cache_read=..][,cache_write=..]" recomputes
+        # from the run's own token counts; without it, read tokens/turns and ignore $.
+        price = os.environ.get("CI_BENCH_PRICE")
+        if price:
+            p = dict(kv.split("=") for kv in price.split(","))
+            cost = (
+                u.get("input_tokens", 0) * float(p.get("in", 0))
+                + u.get("output_tokens", 0) * float(p.get("out", 0))
+                + u.get("cache_read_input_tokens", 0) * float(p.get("cache_read", p.get("in", 0)))
+                + u.get("cache_creation_input_tokens", 0) * float(p.get("cache_write", p.get("in", 0)))
+            ) / 1e6
         return {"in": intok, "out": u.get("output_tokens", 0),
-                "turns": out.get("num_turns", 0), "cost": out.get("total_cost_usd", 0.0), "dur": dur}
+                "turns": out.get("num_turns", 0), "cost": cost, "dur": dur}
     except Exception:
         return {"in": 0, "out": 0, "turns": 0, "cost": 0.0, "dur": dur, "err": (r.stderr or r.stdout)[:200]}
 
