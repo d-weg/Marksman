@@ -153,15 +153,14 @@ fixture, and a hand-applied reference solution passes.
 verify checkers both ways. (T1–T6 remain the legacy `--repo` TS tasks against the
 Node-prototype checkout — the published §1 numbers are tied to them.)
 
-## Tool surfaces: facade (default) vs full (`CI_MCP_SURFACE=full`)
+## The tool surface: two tools
 
-The server exports TWO tools by default — `apply_edits` plus one mode-dispatched `inspect`
-(`search|symbol|file|node|map`) — over the same internals as the original six-tool surface.
-The controlled same-day A/B that settled it (3 runs x 12 task-suite cells, 2026-07-05):
-identical trajectories in every cell, **−11.5% cost** on the marksman arms, cheaper in 11 of
-12 cells, zero native-tool usage in 36/36 runs, `inspect` modes driven correctly throughout.
-`CI_MCP_SURFACE=full` restores the six-tool surface (kept as the ablation arm); the harness
-swaps the matching preamble automatically either way.
+The server exports TWO tools — `apply_edits` plus one mode-dispatched `inspect`
+(`search|symbol|file|node|map`). Settled by a controlled same-day A/B against the original
+six-tool surface (3 runs x 12 task-suite cells, 2026-07-05): identical trajectories in every
+cell, **−11.5% cost**, cheaper in 11 of 12 cells, zero native-tool usage in 36/36 runs.
+The six-tool surface was removed rather than kept as a knob — settled experiments live on
+the `research/full-surface` branch, not in the product.
 
 ## Other models (GLM, MiniMax, …) through the same harness
 

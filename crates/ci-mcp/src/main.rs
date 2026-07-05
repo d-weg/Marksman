@@ -1735,50 +1735,14 @@ fn outline_for(file: &str, content: &str) -> String {
 }
 
 // ── tool schemas ───────────────────────────────────────────────────────────
-/// The facade ablation surface (`CI_MCP_SURFACE=facade`): TWO tools instead of six —
-/// `apply_edits` unchanged (it is already the consolidated write surface) plus ONE
-/// mode-dispatched read tool. Experiment design (bench-comparable, single variable): the
-/// server internals are identical, only the exported surface differs. What it tests:
-/// smaller schema tax per session, trivial deferred-tool discovery, and whether removing
-/// the read-tool CHOICE (four names → one mode enum) removes wrong-tool detours — against
-/// the risk that leaner descriptions under-teach. Teaching lives in responses either way
-/// (receipts/rejects/echo make act-first free).
+/// The exported surface: TWO tools — the consolidated write tool plus one mode-dispatched
+/// read tool. Settled by the controlled same-day A/B (3 runs x 12 cells, 2026-07-05):
+/// identical trajectories, -11.5% cost, zero native-tool leakage in 36/36 runs. The
+/// six-tool surface it replaced lives on the `research/full-surface` branch (git is the
+/// archive for settled experiments; the product carries no dead knobs).
 const INSPECT_MODES: [&str; 5] = ["search", "symbol", "file", "node", "map"];
 
-fn facade_surface() -> bool {
-    // Facade is the DEFAULT since the controlled same-day A/B (3 runs x 12 cells, 2026-07-05):
-    // identical trajectories everywhere, -11.5% cost, zero native-tool leakage in 36/36 runs.
-    // CI_MCP_SURFACE=full restores the six-tool surface (kept as the ablation arm).
-    std::env::var("CI_MCP_SURFACE").as_deref() != Ok("full")
-}
-
-fn tools_list_facade() -> Value {
-    let full = tools_list();
-    let apply = full[0].clone(); // apply_edits, verbatim — the write surface is not the variable
-    json!([
-        apply,
-        {
-            "name": "inspect",
-            "description": "Read/locate code — ONE tool, `mode`-dispatched. `search`: find code by concept/task text (query=what you need; detailLevel pointers|outline|full, pointers default). `symbol`: exact/substring NAME -> self-locating node-id handles (query=name; substring?). `file`: a file's anchors + its import/module lines (file=path). `node`: one anchor's full source (id=node id, or name [+file]). `map`: folder/architecture overview (path? scopes). Handles/ids feed apply_edits directly. To EDIT a symbol the task already NAMES, skip inspect entirely — call apply_edits by name.",
-            "inputSchema": {"type":"object","properties":{
-                "mode":{"type":"string","enum":["search","symbol","file","node","map"]},
-                "query":{"type":"string","description":"search: the task/concept text · symbol: the name"},
-                "detailLevel":{"type":"string","enum":["pointers","outline","full"],"description":"search only"},
-                "substring":{"type":"boolean","description":"symbol only: match anywhere in the name"},
-                "file":{"type":"string","description":"file: the path to list · node: disambiguates a name"},
-                "id":{"type":"string","description":"node: a node id you were given"},
-                "name":{"type":"string","description":"node: a bare symbol name"},
-                "path":{"type":"string","description":"map: subtree scope"}
-            },"required":["mode"]}
-        }
-    ])
-}
-
 fn tools_list() -> Value {
-    // Listing order is deliberate: apply_edits FIRST. This order is what the client shows in
-    // every tools listing and deferred-tools reminder — primacy is a prior, and an
-    // editing-centered tool whose list led with retrieval primed a locate-first workflow the
-    // descriptions then had to argue against. Workhorse first, locate ladder after, the map last.
     let mut tools = json!([
         {
             "name": "apply_edits",
@@ -1813,36 +1777,18 @@ fn tools_list() -> Value {
             },"required":["actions"]}
         },
         {
-            "name": "retrieve_context",
-            "description": "Find files + line-ranges relevant to a task (hybrid BM25 + Model2Vec + symbol match, RRF-fused, expanded along the import graph; no API calls). `detailLevel`: `pointers` (default — file+line pointers only, by far the cheapest; use it to LOCATE code you'll then edit or read_node), `outline` (files inlined with function/method BODIES elided — exact signatures/args/return types, not bodies; a 200-line file → ~15 lines), `full` (whole files; import-graph neighbors stay outline). Use outline/full only when you must read several files' code at once, not merely find them. To EDIT a named symbol you don't need this at all — call apply_edits by name directly.",
-            "inputSchema": {"type":"object","properties":{"task":{"type":"string"},"topN":{"type":"integer"},"hops":{"type":"integer"},"detailLevel":{"type":"string","enum":["pointers","outline","full"]}},"required":["task"]}
-        },
-        {
-            "name": "find_symbols",
-            "description": "Exact/substring search over indexed symbol NAMES → self-locating node-id handles (with kind + line range), NOT file:line. The cheap bridge from a known name to an editable handle: results feed straight into read_node (id=…, incl. …:body/:doc) or apply_edits (name=… / the id). Prefer over retrieve_context when you know the name, and over grep when you'll act on the symbol next. Exhaustive (good for audits — every symbol named/containing X), not top-k. `substring:true` matches anywhere in the name; omit for whole-name.",
+            "name": "inspect",
+            "description": "Read/locate code — ONE tool, `mode`-dispatched. `search`: find code by concept/task text (query=what you need; detailLevel pointers|outline|full, pointers default). `symbol`: exact/substring NAME -> self-locating node-id handles (query=name; substring?). `file`: a file's anchors + its import/module lines (file=path). `node`: one anchor's full source (id=node id, or name [+file]). `map`: folder/architecture overview (path? scopes). Handles/ids feed apply_edits directly. To EDIT a symbol the task already NAMES, skip inspect entirely — call apply_edits by name.",
             "inputSchema": {"type":"object","properties":{
-                "query":{"type":"string","description":"The symbol name to search for."},
-                "substring":{"type":"boolean","description":"Match anywhere in the name (default false = whole-name match)."}
-            },"required":["query"]}
-        },
-        {
-            "name": "list_anchors",
-            "description": "List AST anchors (node ids + line ranges) in a file — symbols and their sub-nodes (params/return/body) — to target with apply_edits or read_node.",
-            "inputSchema": {"type":"object","properties":{"file":{"type":"string"}},"required":["file"]}
-        },
-        {
-            "name": "read_node",
-            "description": "Full source + metadata of ONE anchor (a symbol, or its :body / :param.N / :return / :doc sub-node) — the drill-down after an `outline` elided a body. Address by `id` (a node id, e.g. 'src/http/retry.ts#RetryPolicy.execute' or '…#execute:body' — self-locating, no `file`) or by `name` (file found via the index; pass `file` only to disambiguate).",
-            "inputSchema": {"type":"object","properties":{
-                "id":{"type":"string","description":"A node id, e.g. 'src/bm25.ts#BM25.search' or a sub-node '…#search:body' — self-locating, needs no `file`. Use ids you were GIVEN; a constructed one may miss a nested symbol's scope (the error lists the file's real ids)."},
-                "name":{"type":"string","description":"A bare symbol name; its file is found via the index. Pass `file` only to disambiguate."},
-                "file":{"type":"string","description":"Optional: repo-relative file to disambiguate a `name` defined in more than one file."}
-            },"anyOf":[{"required":["id"]},{"required":["name"]}]}
-        },
-        {
-            "name": "describe_architecture",
-            "description": "Folder/architecture map (zero-API): per-directory file-kind patterns and detected module templates. Optional `path` scopes to a subtree.",
-            "inputSchema": {"type":"object","properties":{"path":{"type":"string"}}}
+                "mode":{"type":"string","enum":["search","symbol","file","node","map"]},
+                "query":{"type":"string","description":"search: the task/concept text · symbol: the name"},
+                "detailLevel":{"type":"string","enum":["pointers","outline","full"],"description":"search only"},
+                "substring":{"type":"boolean","description":"symbol only: match anywhere in the name"},
+                "file":{"type":"string","description":"file: the path to list · node: disambiguates a name"},
+                "id":{"type":"string","description":"node: a node id you were given"},
+                "name":{"type":"string","description":"node: a bare symbol name"},
+                "path":{"type":"string","description":"map: subtree scope"}
+            },"required":["mode"]}
         }
     ]);
     // Per-language move-coverage claims come FROM the provider crates (single source of
@@ -1902,10 +1848,7 @@ fn main() {
             }),
             "notifications/initialized" => None,
             "ping" => id.map(|id| resp(id, json!({}))),
-            "tools/list" => id.map(|id| {
-                let tools = if facade_surface() { tools_list_facade() } else { tools_list() };
-                resp(id, json!({"tools": tools}))
-            }),
+            "tools/list" => id.map(|id| resp(id, json!({"tools": tools_list()}))),
             "tools/call" => id.map(|id| {
                 let params = &msg["params"];
                 let name = params["name"].as_str().unwrap_or("");
@@ -2013,17 +1956,14 @@ mod tests {
         assert_eq!(super::exact_extent(content, &r), None);
     }
 
-    // The facade surface must stay a pure re-plumbing of the full surface: two tools, the
-    // write tool VERBATIM (it is not the experiment's variable), and an inspect whose schema
-    // modes exactly match the dispatcher's arms — a schema mode the dispatcher rejects would
-    // send agents into unknown-mode loops.
+    // The surface is TWO tools whose inspect schema modes exactly match the dispatcher's
+    // arms — a schema mode the dispatcher rejects would send agents into unknown-mode loops.
     #[test]
-    fn facade_surface_is_two_tools_with_matching_modes() {
-        let facade = super::tools_list_facade();
-        let names: Vec<&str> = facade.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    fn surface_is_two_tools_with_matching_modes() {
+        let tools = super::tools_list();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, vec!["apply_edits", "inspect"]);
-        assert_eq!(facade[0], super::tools_list()[0], "apply_edits verbatim from the full surface");
-        let schema_modes: Vec<&str> = facade[1]["inputSchema"]["properties"]["mode"]["enum"]
+        let schema_modes: Vec<&str> = tools[1]["inputSchema"]["properties"]["mode"]["enum"]
             .as_array().unwrap().iter().map(|m| m.as_str().unwrap()).collect();
         assert_eq!(schema_modes, super::INSPECT_MODES.to_vec(), "schema enum == dispatcher modes");
     }

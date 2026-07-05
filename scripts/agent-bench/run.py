@@ -24,13 +24,8 @@ TS_DIR = os.environ.get("CODEINDEX_TS_DIR", os.path.expanduser("~/codeindex"))
 
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
-    "mcp__marksman__inspect",
-    "mcp__marksman__retrieve_context",
-    "mcp__marksman__describe_architecture",
-    "mcp__marksman__find_symbols",
-    "mcp__marksman__list_anchors",
-    "mcp__marksman__read_node",
     "mcp__marksman__apply_edits",
+    "mcp__marksman__inspect",
 ])
 
 # The three arms; "baseline" runs with no marksman MCP. Configs are GENERATED at runtime
@@ -124,16 +119,11 @@ def materialize_fixture(name):
 # tool. The baseline gets no such nudge; it uses its standard tools.
 PREAMBLE = (
     "You have marksman MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
-    "names (a bare name like `select:apply_edits` FAILS — it must be `mcp__marksman__apply_edits`):\n"
-    "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__find_symbols,"
-    "mcp__marksman__retrieve_context,mcp__marksman__read_node,mcp__marksman__list_anchors\"\n"
-    "What they do: apply_edits (structural + surgical edits — rename / move_file / replace_text / "
-    "set_body / replace_node target:body|return|param.N / insert_member — type-checked before landing "
-    "when the language has a checker; otherwise applied structurally and the reply carries a "
-    "server-side verification scan. TRUST the reply either way — never re-verify by hand), "
-    "find_symbols (name -> node-id handles; to disambiguate a name apply_edits called ambiguous), "
-    "retrieve_context (find code by concept), read_node (one symbol's full source), list_anchors (a "
-    "file's anchors).\n"
+    "names:\n"
+    "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__inspect\"\n"
+    "What they do: apply_edits (ALL code edits — structural + surgical, type-checked before landing "
+    "when the language has a checker; TRUST the reply — never re-verify by hand), inspect (ALL "
+    "reads/locating — mode: search|symbol|file|node|map).\n"
     "Then EDIT WITH THE TOOL, not grep+Edit: if the task NAMES the symbol, call apply_edits by name "
     "DIRECTLY — don't locate it first; if the task also gives the FILE, address as `file#name` (e.g. "
     "`src/http/retry.ts#parseResponse`) so it resolves in ONE call; else a bare name works and an ambiguous one "
@@ -148,23 +138,9 @@ PREAMBLE = (
     "Task: "
 )
 
-# The facade-surface arm (CI_MCP_SURFACE=facade — see ci-mcp): TWO tools, so the load line and
-# the tool roster differ; the behavioral rules (direct-path, bare moves) are surface-independent
-# and shared verbatim. The suite run under this env is the consolidation ablation.
-PREAMBLE_FACADE = (
-    "You have marksman MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
-    "names:\n"
-    "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__inspect\"\n"
-    "What they do: apply_edits (ALL code edits — structural + surgical, type-checked before landing "
-    "when the language has a checker; TRUST the reply — never re-verify by hand), inspect (ALL "
-    "reads/locating — mode: search|symbol|file|node|map).\n"
-    + PREAMBLE.split("What they do:")[1].split("\n", 1)[1]  # the shared behavioral rules, verbatim
-)
-
 
 def run_agent(repo, prompt, mcp_config, model, transcript=None):
-    pre = PREAMBLE if os.environ.get("CI_MCP_SURFACE") == "full" else PREAMBLE_FACADE
-    full = (pre + prompt) if mcp_config else prompt
+    full = (PREAMBLE + prompt) if mcp_config else prompt
     # When capturing a transcript, stream every message (tool_use / tool_result) so we can see
     # exactly which tools the agent called and how big each response was. Otherwise the compact
     # `json` result is all we need for the token table.
