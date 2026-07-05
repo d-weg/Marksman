@@ -200,9 +200,82 @@ pub(crate) fn move_workspace_edit(root: &Path, from: &str, to: &str) -> Option<V
     Some(json!({"documentChanges": doc_changes}))
 }
 
+/// The (parent_file, old_text, new_text) ReplaceInFile that DECLARES module `rel` in its
+/// parent — for `create_file` of an undeclared module file: without the declaration the new
+/// file is an orphan the crate never compiles, so the create op synthesizes this alongside
+/// itself (bench-shaped agents always hand-write it; server-side it is one deterministic
+/// edit). Insertion point: after the parent's LAST `mod` declaration, else after a leading
+/// `//!` doc block, else before the first line. `None` when out of scope (not a module file,
+/// parent missing, or already declared) — the caller simply doesn't synthesize.
+pub(crate) fn declare_module_edit(root: &Path, rel: &str) -> Option<(String, String, String)> {
+    let segs = mod_segs(rel)?;
+    let name = segs.last()?.clone();
+    let (parent, parent_missing) = parent_decl_file(root, &segs);
+    if parent_missing {
+        return None;
+    }
+    let content = std::fs::read_to_string(root.join(&parent)).ok()?;
+    if find_mod_decl(&content, &name).is_some() {
+        return None;
+    }
+    let decl = format!("pub mod {name};");
+    let lines: Vec<&str> = content.lines().collect();
+    // after the last existing mod decl…
+    if let Some(last) = lines.iter().rposition(|l| {
+        let t = l.trim_start();
+        t.starts_with("mod ") && t.ends_with(';') || t.starts_with("pub mod ") && t.ends_with(';')
+    }) {
+        let anchor = lines[last];
+        if content.matches(anchor).count() == 1 {
+            return Some((parent, anchor.to_string(), format!("{anchor}
+{decl}")));
+        }
+    }
+    // …else after a leading //! block…
+    if let Some(last_doc) = lines.iter().rposition(|l| l.trim_start().starts_with("//!")) {
+        let anchor = lines[last_doc];
+        if lines[..=last_doc].iter().all(|l| l.trim_start().starts_with("//!") || l.trim().is_empty())
+            && content.matches(anchor).count() == 1
+        {
+            return Some((parent, anchor.to_string(), format!("{anchor}
+{decl}")));
+        }
+    }
+    // …else before the first line (unique by construction only if the file is non-empty).
+    let first = lines.first()?;
+    if content.matches(first).count() == 1 {
+        return Some((parent, first.to_string(), format!("{decl}
+{first}")));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declare_module_edit_covers_the_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // after the LAST mod decl
+        std::fs::write(root.join("src/lib.rs"), "//! docs\npub mod a;\npub mod b;\n").unwrap();
+        let (parent, old, new) = declare_module_edit(root, "src/zed.rs").expect("edit");
+        assert_eq!(parent, "src/lib.rs");
+        assert_eq!(old, "pub mod b;");
+        assert_eq!(new, "pub mod b;\npub mod zed;");
+        // already declared -> None
+        assert!(declare_module_edit(root, "src/a.rs").is_none());
+        // no decls: after the leading //! block
+        std::fs::write(root.join("src/lib.rs"), "//! only docs\n\nfn main_ish() {}\n").unwrap();
+        let (_, old, new) = declare_module_edit(root, "src/zed.rs").expect("edit");
+        assert_eq!(old, "//! only docs");
+        assert!(new.ends_with("pub mod zed;"));
+        // non-module paths -> None
+        assert!(declare_module_edit(root, "src/lib.rs").is_none());
+        assert!(declare_module_edit(root, "README.md").is_none());
+    }
 
     #[test]
     fn segs_and_parents() {

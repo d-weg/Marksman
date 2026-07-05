@@ -554,7 +554,29 @@ impl LanguageProvider for RustProvider {
             }
         };
 
-        let r = ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
+        // create_file of an UNDECLARED module file synthesizes its `pub mod x;` declaration
+        // right after the create (movefix::declare_module_edit) — an orphan .rs file never
+        // compiles, so every agent hand-writes this edit; server-side it is deterministic.
+        // Skipped when any batch op already touches the parent decl file (the agent is
+        // handling membership itself — synthesizing too would DUPLICATE the declaration).
+        let mut expanded: Vec<ci_core::EditOp> = Vec::with_capacity(ops.len() + 1);
+        for op in ops {
+            let synth = if let ci_core::EditOp::CreateFile { path, .. } = op {
+                let rel = path.to_string_lossy().replace('\\', "/");
+                movefix::declare_module_edit(&self.root, &rel).filter(|(parent, _, _)| {
+                    !ops.iter().any(|o| {
+                        ci_edit::op_touches_file(o, parent) && !matches!(o, ci_core::EditOp::CreateFile { .. })
+                    })
+                })
+            } else {
+                None
+            };
+            expanded.push(op.clone());
+            if let Some((parent, old_text, new_text)) = synth {
+                expanded.push(ci_core::EditOp::ReplaceInFile { path: parent.into(), old_text, new_text });
+            }
+        }
+        let r = ci_edit::commit_edits(&self.root, &expanded, &structure_of, engine, opts, &reverse_imports);
         // Keep the scip-backed graph true in-session: re-describe each committed file's edges
         // from its new content (tree-sitter, in-process — cheap and can't fail the edit). The
         // live mod graph and structure() read disk directly, so they need no help.

@@ -354,12 +354,31 @@ impl Server {
 
     fn list_anchors(&mut self, args: &Value) -> Result<String, String> {
         let file = args["file"].as_str().ok_or("`file` is required")?.to_string();
-        let nodes = self.registry()?.structure(Path::new(&file)).map_err(|e| e.to_string())?;
+        let registry = self.registry()?;
+        let nodes = registry.structure(Path::new(&file)).map_err(|e| e.to_string())?;
+        // Reverse edges up top: "who imports this file" is the other half of every pre-edit
+        // survey (the forward half — this file's own imports — is already shown below). One
+        // graph lookup here displaces a repo grep per risky edit.
+        let imported_by = registry
+            .entry_for(Path::new(&file))
+            .and_then(|slot| registry.entry_at(slot))
+            .and_then(|p| p.import_graph().ok())
+            .map(|g| {
+                let rev = ci_core::reverse_import_map(&g);
+                rev.get(&file).cloned().unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let header = if imported_by.is_empty() {
+            "imported by: (nothing in this repo)\n".to_string()
+        } else {
+            format!("imported by: {}\n", imported_by.join(", "))
+        };
         let mut out = String::new();
         for n in &nodes {
             write_anchors(n, &mut out, 0);
         }
         if !out.is_empty() {
+            out = format!("{header}{out}");
             // Imports/module decls live OUTSIDE symbol anchors, and they're half of what an
             // agent asks this tool for (bench move-ts: list_anchors on each importer, then a
             // whole-file Read anyway — just to see two import lines). Surface them up top,
@@ -402,7 +421,7 @@ impl Server {
         let lines = content.lines().count();
         Ok(if lines <= 50 {
             format!(
-                "(no symbol anchors — {file} is declaration-only; its {lines} line(s) inline:)\n```\n{}\n```\nEdit these via replace_text with `path` + unique `oldText` (file-level statements sit outside symbol anchors).",
+                "{header}(no symbol anchors — {file} is declaration-only; its {lines} line(s) inline:)\n```\n{}\n```\nEdit these via replace_text with `path` + unique `oldText` (file-level statements sit outside symbol anchors).",
                 content.trim_end()
             )
         } else {
