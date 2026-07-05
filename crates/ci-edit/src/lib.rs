@@ -453,6 +453,69 @@ fn diag_key(d: &Diag) -> String {
     format!("{}:{}:{}", d.file, d.code, d.message)
 }
 
+/// Compact per-file line diff between DISK (before) and the VFS overlay (after) for the
+/// changed set — the rewrite receipt a rename/move/delete commit carries. Multiset line diff
+/// (order-preserving, `-`/`+` per excess occurrence), capped hard: it must stay a receipt,
+/// not a dump. Files the batch created transiently read as `created` (their disk content is
+/// already the after-state); files the overlay deletes read as `deleted`.
+fn rewrite_receipt(root: &Path, changed: &[String], vfs: &Vfs, created: &HashSet<String>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for rel in changed.iter().take(8) {
+        let after = vfs.read(Path::new(rel));
+        let before = if created.contains(rel) { None } else { std::fs::read_to_string(root.join(rel)).ok() };
+        match (before, after) {
+            (None, Some(_)) => out.push(format!("  {rel}: created")),
+            (Some(_), None) | (None, None) => out.push(format!("  {rel}: deleted")),
+            (Some(b), Some(a)) => {
+                let mut bcount: HashMap<&str, i64> = HashMap::new();
+                for l in b.lines() {
+                    *bcount.entry(l).or_default() += 1;
+                }
+                let mut acount: HashMap<&str, i64> = HashMap::new();
+                for l in a.lines() {
+                    *acount.entry(l).or_default() += 1;
+                }
+                let clip = |l: &str| -> String {
+                    let t = l.trim_end();
+                    if t.len() > 120 { format!("{}…", &t[..120]) } else { t.to_string() }
+                };
+                let mut lines: Vec<String> = Vec::new();
+                let mut seen_minus: HashMap<&str, i64> = HashMap::new();
+                for l in b.lines() {
+                    let excess = bcount.get(l).unwrap_or(&0) - acount.get(l).unwrap_or(&0);
+                    let s = seen_minus.entry(l).or_default();
+                    if *s < excess {
+                        *s += 1;
+                        lines.push(format!("    - {}", clip(l)));
+                    }
+                }
+                let mut seen_plus: HashMap<&str, i64> = HashMap::new();
+                for l in a.lines() {
+                    let excess = acount.get(l).unwrap_or(&0) - bcount.get(l).unwrap_or(&0);
+                    let s = seen_plus.entry(l).or_default();
+                    if *s < excess {
+                        *s += 1;
+                        lines.push(format!("    + {}", clip(l)));
+                    }
+                }
+                if lines.is_empty() {
+                    continue;
+                }
+                let extra = lines.len().saturating_sub(6);
+                lines.truncate(6);
+                if extra > 0 {
+                    lines.push(format!("    … and {extra} more changed line(s)"));
+                }
+                out.push(format!("  {rel}:\n{}", lines.join("\n")));
+            }
+        }
+    }
+    if changed.len() > 8 {
+        out.push(format!("  … and {} more file(s)", changed.len() - 8));
+    }
+    out.join("\n")
+}
+
 /// Apply a structural (non-rename) op to the VFS using the node's range.
 pub fn apply_structural(
     vfs: &mut Vfs,
@@ -992,7 +1055,7 @@ pub fn commit_edits(
     }
 
     if vfs.is_empty() {
-        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: vec![], repair_rounds: 0, preexisting_in_radius: vec![], redundant_ops });
+        return Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: vec![], repair_rounds: 0, preexisting_in_radius: vec![], redundant_ops, rewrite_summary: String::new() });
     }
 
     let changed = vfs.changed();
@@ -1260,6 +1323,19 @@ pub fn commit_edits(
         return Ok(CommitResult::Rejected { failed_op_index: anchored_op, feedback });
     }
 
+    // Rewrite receipt for structural file ops (rename/move/delete): the exact lines the
+    // automation changed, computed while BOTH states exist (disk = before, overlay = after).
+    // This is what the agent's pre-move survey was trying to learn — shown after the fact,
+    // it proves the bare op's completeness with evidence (bench move-rust: the insurance
+    // hedge survives description prose; a visible diff is the counterfactual it can't argue
+    // with). Symbol-anchored content edits are excluded — the MCP layer already echoes those
+    // blocks — so this stays scoped to the ops whose rewrites are otherwise invisible.
+    let rewrite_summary = if ops.iter().any(|o| matches!(o, EditOp::Rename { .. } | EditOp::MoveFile { .. } | EditOp::DeleteFile { .. })) {
+        rewrite_receipt(root, &changed_rel, &vfs, &transient_rels)
+    } else {
+        String::new()
+    };
+
     if opts.write && !opts.dry_run {
         vfs.commit()?;
         // The transaction landed — the materialized creations are now REAL files (vfs.commit
@@ -1271,7 +1347,7 @@ pub fn commit_edits(
         // REAL deletion (an empty module resolves; an absent one errors) for every later gate.
         let _ = engine.fs_events(&[], &deleted_rels);
     }
-    Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting, redundant_ops })
+    Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting, redundant_ops, rewrite_summary })
 }
 
 // ── Composed: ReadIndex × GateEngine = LanguageProvider ─────────────────────────────────────

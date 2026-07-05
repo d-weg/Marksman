@@ -124,6 +124,8 @@ pub struct PbCommitResult {
     pub preexisting_json: String,
     #[prost(uint64, tag = "8")]
     pub redundant_ops: u64,
+    #[prost(string, tag = "9")]
+    pub rewrite_summary: String,
 }
 
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -351,7 +353,7 @@ fn pb_to_opts(p: &PbEditOpts) -> EditOpts {
 
 fn commit_to_pb(c: &CommitResult) -> PbCommitResult {
     match c {
-        CommitResult::Ok { applied_ops, changed_files, repair_rounds, preexisting_in_radius, redundant_ops } => PbCommitResult {
+        CommitResult::Ok { applied_ops, changed_files, repair_rounds, preexisting_in_radius, redundant_ops, rewrite_summary } => PbCommitResult {
             ok: true,
             applied_ops: *applied_ops as u64,
             changed_files: changed_files.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
@@ -364,6 +366,7 @@ fn commit_to_pb(c: &CommitResult) -> PbCommitResult {
                 serde_json::to_string(preexisting_in_radius).unwrap_or_default()
             },
             redundant_ops: *redundant_ops as u64,
+            rewrite_summary: rewrite_summary.clone(),
         },
         CommitResult::Rejected { failed_op_index, feedback } => PbCommitResult {
             ok: false,
@@ -374,6 +377,7 @@ fn commit_to_pb(c: &CommitResult) -> PbCommitResult {
             feedback: feedback.clone(),
             preexisting_json: String::new(),
             redundant_ops: 0,
+            rewrite_summary: String::new(),
         },
     }
 }
@@ -385,6 +389,7 @@ fn pb_to_commit(p: &PbCommitResult) -> CommitResult {
             repair_rounds: p.repair_rounds,
             preexisting_in_radius: serde_json::from_str(&p.preexisting_json).unwrap_or_default(),
             redundant_ops: p.redundant_ops as usize,
+            rewrite_summary: p.rewrite_summary.clone(),
         }
     } else {
         CommitResult::Rejected { failed_op_index: p.failed_op_index, feedback: p.feedback.clone() }

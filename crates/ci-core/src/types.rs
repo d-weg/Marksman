@@ -282,6 +282,10 @@ pub enum CommitResult {
         /// builds trust in the structural ops' completeness.
         #[serde(default)]
         redundant_ops: usize,
+        /// Compact per-file line diff of what a rename/move/delete rewrote (empty otherwise):
+        /// the receipt that makes the bare op's completeness visible in the response itself.
+        #[serde(default)]
+        rewrite_summary: String,
     },
     Rejected {
         #[serde(default)]
