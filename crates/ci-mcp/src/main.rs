@@ -784,6 +784,30 @@ impl Server {
         ))
     }
 
+    /// The facade surface's single read tool: `mode` picks the underlying handler, args are
+    /// mapped onto the handler's own names. Pure dispatch — behavior identical to the six-tool
+    /// surface, which is what makes the facade a single-variable ablation.
+    fn inspect(&mut self, args: &Value) -> Result<String, String> {
+        let mode = args["mode"].as_str().unwrap_or("");
+        match mode {
+            "search" => {
+                let mut a = json!({"task": args["query"]});
+                if !args["detailLevel"].is_null() {
+                    a["detailLevel"] = args["detailLevel"].clone();
+                }
+                self.retrieve_context(&a)
+            }
+            "symbol" => self.find_symbols(&json!({"query": args["query"], "substring": args["substring"]})),
+            "file" => self.list_anchors(&json!({"file": args["file"]})),
+            "node" => self.read_node(&json!({"id": args["id"], "name": args["name"], "file": args["file"]})),
+            "map" => self.describe_architecture(&json!({"path": args["path"]})),
+            other => Err(format!(
+                "unknown inspect mode {other:?} — one of: {}",
+                INSPECT_MODES.join(", ")
+            )),
+        }
+    }
+
     fn apply_edits(&mut self, args: &Value) -> Result<String, String> {
         let dry_run = args["dryRun"].as_bool().unwrap_or(false);
         let actions = args["actions"].as_array().ok_or("`actions` array is required")?.clone();
@@ -1692,6 +1716,42 @@ fn outline_for(file: &str, content: &str) -> String {
 }
 
 // ── tool schemas ───────────────────────────────────────────────────────────
+/// The facade ablation surface (`CI_MCP_SURFACE=facade`): TWO tools instead of six —
+/// `apply_edits` unchanged (it is already the consolidated write surface) plus ONE
+/// mode-dispatched read tool. Experiment design (bench-comparable, single variable): the
+/// server internals are identical, only the exported surface differs. What it tests:
+/// smaller schema tax per session, trivial deferred-tool discovery, and whether removing
+/// the read-tool CHOICE (four names → one mode enum) removes wrong-tool detours — against
+/// the risk that leaner descriptions under-teach. Teaching lives in responses either way
+/// (receipts/rejects/echo make act-first free).
+const INSPECT_MODES: [&str; 5] = ["search", "symbol", "file", "node", "map"];
+
+fn facade_surface() -> bool {
+    std::env::var("CI_MCP_SURFACE").as_deref() == Ok("facade")
+}
+
+fn tools_list_facade() -> Value {
+    let full = tools_list();
+    let apply = full[0].clone(); // apply_edits, verbatim — the write surface is not the variable
+    json!([
+        apply,
+        {
+            "name": "inspect",
+            "description": "Read/locate code — ONE tool, `mode`-dispatched. `search`: find code by concept/task text (query=what you need; detailLevel pointers|outline|full, pointers default). `symbol`: exact/substring NAME -> self-locating node-id handles (query=name; substring?). `file`: a file's anchors + its import/module lines (file=path). `node`: one anchor's full source (id=node id, or name [+file]). `map`: folder/architecture overview (path? scopes). Handles/ids feed apply_edits directly. To EDIT a symbol the task already NAMES, skip inspect entirely — call apply_edits by name.",
+            "inputSchema": {"type":"object","properties":{
+                "mode":{"type":"string","enum":["search","symbol","file","node","map"]},
+                "query":{"type":"string","description":"search: the task/concept text · symbol: the name"},
+                "detailLevel":{"type":"string","enum":["pointers","outline","full"],"description":"search only"},
+                "substring":{"type":"boolean","description":"symbol only: match anywhere in the name"},
+                "file":{"type":"string","description":"file: the path to list · node: disambiguates a name"},
+                "id":{"type":"string","description":"node: a node id you were given"},
+                "name":{"type":"string","description":"node: a bare symbol name"},
+                "path":{"type":"string","description":"map: subtree scope"}
+            },"required":["mode"]}
+        }
+    ])
+}
+
 fn tools_list() -> Value {
     // Listing order is deliberate: apply_edits FIRST. This order is what the client shows in
     // every tools listing and deferred-tools reminder — primacy is a prior, and an
@@ -1820,7 +1880,10 @@ fn main() {
             }),
             "notifications/initialized" => None,
             "ping" => id.map(|id| resp(id, json!({}))),
-            "tools/list" => id.map(|id| resp(id, json!({"tools": tools_list()}))),
+            "tools/list" => id.map(|id| {
+                let tools = if facade_surface() { tools_list_facade() } else { tools_list() };
+                resp(id, json!({"tools": tools}))
+            }),
             "tools/call" => id.map(|id| {
                 let params = &msg["params"];
                 let name = params["name"].as_str().unwrap_or("");
@@ -1832,6 +1895,7 @@ fn main() {
                     "list_anchors" => server.list_anchors(args),
                     "read_node" => server.read_node(args),
                     "apply_edits" => server.apply_edits(args),
+                    "inspect" => server.inspect(args),
                     other => Err(format!("unknown tool: {other}")),
                 };
                 match result {
@@ -1925,6 +1989,21 @@ mod tests {
         // out-of-bounds never panics.
         let r = Range { start_line: 9, end_line: 9, start_char: 1, end_char: 2 };
         assert_eq!(super::exact_extent(content, &r), None);
+    }
+
+    // The facade surface must stay a pure re-plumbing of the full surface: two tools, the
+    // write tool VERBATIM (it is not the experiment's variable), and an inspect whose schema
+    // modes exactly match the dispatcher's arms — a schema mode the dispatcher rejects would
+    // send agents into unknown-mode loops.
+    #[test]
+    fn facade_surface_is_two_tools_with_matching_modes() {
+        let facade = super::tools_list_facade();
+        let names: Vec<&str> = facade.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["apply_edits", "inspect"]);
+        assert_eq!(facade[0], super::tools_list()[0], "apply_edits verbatim from the full surface");
+        let schema_modes: Vec<&str> = facade[1]["inputSchema"]["properties"]["mode"]["enum"]
+            .as_array().unwrap().iter().map(|m| m.as_str().unwrap()).collect();
+        assert_eq!(schema_modes, super::INSPECT_MODES.to_vec(), "schema enum == dispatcher modes");
     }
 
     // The move-coverage sentences the agent reads are provider-owned constants; this pins the

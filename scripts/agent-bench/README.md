@@ -153,6 +153,22 @@ fixture, and a hand-applied reference solution passes.
 verify checkers both ways. (T1–T6 remain the legacy `--repo` TS tasks against the
 Node-prototype checkout — the published §1 numbers are tied to them.)
 
+## The facade-surface ablation (`CI_MCP_SURFACE=facade`)
+
+Does a smaller tool surface change the economics? The facade exports TWO tools instead of
+six — `apply_edits` verbatim plus one mode-dispatched `inspect`
+(`search|symbol|file|node|map`) — over identical server internals, so the surface is the
+only variable. What it tests: per-session schema tax, deferred-discovery friction, and
+whether removing the read-tool *choice* removes wrong-tool detours — against the risk that
+leaner descriptions under-teach. The harness swaps in a matching preamble automatically:
+
+```bash
+CI_MCP_SURFACE=facade bash scripts/agent-bench/go.sh --suite ts,rust --runs 3 --save-transcript /tmp/facade
+```
+
+Compare against a same-day full-surface pass; read `$` and calls, and diff trajectories for
+new failure modes (unknown-mode loops, missed direct paths) before drawing conclusions.
+
 ## Other models (GLM, MiniMax, …) through the same harness
 
 Several providers ship **Anthropic-compatible endpoints built to drive Claude Code** — which

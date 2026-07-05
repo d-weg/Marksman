@@ -147,9 +147,23 @@ PREAMBLE = (
     "Task: "
 )
 
+# The facade-surface arm (CI_MCP_SURFACE=facade — see ci-mcp): TWO tools, so the load line and
+# the tool roster differ; the behavioral rules (direct-path, bare moves) are surface-independent
+# and shared verbatim. The suite run under this env is the consolidation ablation.
+PREAMBLE_FACADE = (
+    "You have marksman MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
+    "names:\n"
+    "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__inspect\"\n"
+    "What they do: apply_edits (ALL code edits — structural + surgical, type-checked before landing "
+    "when the language has a checker; TRUST the reply — never re-verify by hand), inspect (ALL "
+    "reads/locating — mode: search|symbol|file|node|map).\n"
+    + PREAMBLE.split("What they do:")[1].split("\n", 1)[1]  # the shared behavioral rules, verbatim
+)
+
 
 def run_agent(repo, prompt, mcp_config, model, transcript=None):
-    full = (PREAMBLE + prompt) if mcp_config else prompt
+    pre = PREAMBLE_FACADE if os.environ.get("CI_MCP_SURFACE") == "facade" else PREAMBLE
+    full = (pre + prompt) if mcp_config else prompt
     # When capturing a transcript, stream every message (tool_use / tool_result) so we can see
     # exactly which tools the agent called and how big each response was. Otherwise the compact
     # `json` result is all we need for the token table.
