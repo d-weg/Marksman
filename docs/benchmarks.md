@@ -145,6 +145,21 @@ multilang/ungated/barrel/monorepo fixtures — *lives in*
 [legacy-benchmark.md](legacy-benchmark.md); its T7–T10 fixture tasks remain live and its
 results are still the reference for §2's ablations.
 
+### 1.6 New-language suites (Java · PHP · Swift) — **WIP**
+
+The suite above (TS · Rust) is ported to three new **gated** languages. Each has a per-language
+page with its provider status, required/optional toolchains, and a **preliminary** benchmark
+(the first run is not yet clean — a PHP gate bug was fixed and a Swift prompt tightened *after*
+it; the numbers there are flagged "do not cite" with the exact re-run to do):
+
+| language | gate | rename engine | provider status & preliminary benchmark |
+|---|---|---|---|
+| Java | `javac` | jdtls (rename) · movefix (move) | [languages/java.md](languages/java.md) |
+| PHP | PHPStan | phpactor (rename) · movefix (move) | [languages/php.md](languages/php.md) |
+| Swift | `swift build` | sourcekit-lsp (bundled) | [languages/swift.md](languages/swift.md) |
+
+These are **experimental** and not part of the headline result until a clean re-run lands.
+
 ---
 
 ## 2. Which parts of the design earn their keep? — the read-path ablation
