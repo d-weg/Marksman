@@ -10,12 +10,13 @@
 //! text — compiler errors land on STDOUT, SwiftPM manifest/toolchain failures on stderr (no JSON
 //! — the JSON-diagnostics issue is still open upstream); both streams are regex-parsed to
 //! file:line:col.
-use ci_core::{Diag, Error, Result};
+use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use crate::sourcekit;
 
@@ -27,6 +28,7 @@ use crate::sourcekit;
 /// deleted symbol is the introduced break we WANT to catch.
 fn swift_build_diagnostics(
     root: &Path,
+    sandbox: &dyn Sandbox,
     files: &[(String, String)],
     target_dirs: Option<&[String]>,
 ) -> Result<Vec<Diag>> {
@@ -51,7 +53,8 @@ fn swift_build_diagnostics(
     cmd.arg("build").current_dir(mirror.path());
     // Capped + time-bounded: a chatty build can't OOM us, and a hung one can't hang the edit
     // forever (the timeout is generous so a legitimately slow cold build is never killed).
-    let out = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
+    let out = sandbox
+        .run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
         .map_err(|e| Error::Driver(format!("swift build spawn: {e}")))?;
     if out.timed_out {
         return Err(Error::Driver(format!(
@@ -233,12 +236,15 @@ pub(crate) struct SwiftEngine {
     /// `None` = not probed yet; inner `None` = describe unavailable (the G4 target check is then
     /// skipped — fail open). Populated lazily on the first `diagnostics` call.
     pub(crate) target_dirs: Option<Option<Vec<String>>>,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
+    /// container backend swaps in — see `docs/container-gate-spec.md`.
+    pub(crate) sandbox: Arc<dyn Sandbox>,
 }
 
 impl SwiftEngine {
     fn sourcekit(&mut self) -> Result<&mut LspClient> {
         if self.lsp.is_none() {
-            self.lsp = Some(sourcekit::start(&self.root)?);
+            self.lsp = Some(sourcekit::start(&self.root, &*self.sandbox)?);
         }
         Ok(self.lsp.as_mut().expect("just set"))
     }
@@ -317,7 +323,7 @@ impl GateEngine for SwiftEngine {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
         self.reject_untargeted(files)?; // also populates self.target_dirs (cached describe)
         let dirs = self.target_dirs.as_ref().and_then(|o| o.as_deref());
-        let mut out = swift_build_diagnostics(&self.root, files, dirs)?;
+        let mut out = swift_build_diagnostics(&self.root, &*self.sandbox, files, dirs)?;
         out.extend(deleted_path_references(&self.root, files));
         Ok(out)
     }

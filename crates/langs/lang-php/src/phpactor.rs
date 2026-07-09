@@ -44,7 +44,7 @@ pub(crate) fn phpactor_phar() -> Option<PathBuf> {
 
 /// Start phpactor's language server for `root`. A bare `phpactor` binary is launched directly;
 /// a `.phar` is run through the `php` runtime (`php phpactor.phar language-server`).
-pub(crate) fn start(root: &Path) -> Result<LspClient> {
+pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
     let Some(phar) = phpactor_phar() else {
         return Err(ci_core::Error::Driver(format!(
             "php rename/move needs phpactor to rewrite references safely — Install: {INSTALL_HINT}. \
@@ -63,5 +63,5 @@ pub(crate) fn start(root: &Path) -> Result<LspClient> {
         c
     };
     cmd.current_dir(root);
-    LspClient::start(root, cmd)
+    LspClient::start_in(root, cmd, sandbox)
 }

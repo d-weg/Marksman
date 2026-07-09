@@ -2,8 +2,9 @@
 //! verdict) plus the deleted-reference gap-fill diagnostics rust-analyzer never reports.
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
-use ci_core::Result;
+use ci_core::{Result, Sandbox};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::movefix;
 
@@ -16,6 +17,9 @@ use crate::movefix;
 pub(crate) struct RustEngine {
     pub(crate) root: PathBuf,
     pub(crate) lsp: LspClient,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
+    /// container backend swaps in — see `docs/container-gate-spec.md`.
+    pub(crate) sandbox: Arc<dyn Sandbox>,
 }
 
 /// Diagnostics for references to files the CURRENT BATCH deletes (empty-content buffers, the
@@ -33,7 +37,7 @@ fn deleted_path_references(root: &Path, files: &[(String, String)]) -> Vec<ci_co
 /// the radius; the baseline diff still excuses pre-existing ones). Buffer conventions from
 /// ci-edit hold: an EMPTY buffer for a path already off disk is a staged deletion's stand-in
 /// and must NOT be recreated (that would resurrect the module for the check).
-fn cargo_check_diags(root: &Path, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
+fn cargo_check_diags(root: &Path, sandbox: &dyn Sandbox, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
     struct Restore(Vec<(std::path::PathBuf, Option<String>)>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -67,11 +71,12 @@ fn cargo_check_diags(root: &Path, files: &[(String, String)]) -> Result<Vec<ci_c
             .map_err(|e| ci_core::Error::Driver(format!("stage {rel} for cargo check: {e}")))?;
         guard.0.push((abs, on_disk));
     }
-    let out = std::process::Command::new("cargo")
-        .args(["check", "--message-format=json", "-q"])
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args(["check", "--message-format=json", "-q"])
         .current_dir(root)
-        .env("CARGO_TERM_COLOR", "never")
-        .output()
+        .env("CARGO_TERM_COLOR", "never");
+    let out = sandbox
+        .output(&mut cmd)
         .map_err(|e| ci_core::Error::Driver(format!("spawn cargo check: {e}")))?;
     let mut diags = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
@@ -131,7 +136,7 @@ impl GateEngine for RustEngine {
             out.extend(deleted_path_references(&self.root, files));
             return Ok(out);
         }
-        match cargo_check_diags(&self.root, files) {
+        match cargo_check_diags(&self.root, &*self.sandbox, files) {
             Ok(diags) => Ok(diags),
             Err(e) => {
                 // cargo unavailable (unusual: ra requires a toolchain) — degrade to ra +

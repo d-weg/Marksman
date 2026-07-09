@@ -83,8 +83,12 @@ fn engine_factory(root: &Path) -> EngineFactory {
             let hint = gate_missing(&root).unwrap_or_else(|| "php/phpstan required for the gate".into());
             return Err(ci_core::Error::Driver(format!("php edit engine unavailable.\n{hint}")));
         };
-        Ok(Box::new(gate::PhpEngine { root: engine_root.to_path_buf(), phpstan, lsp: None })
-            as Box<dyn GateEngine + Send>)
+        Ok(Box::new(gate::PhpEngine {
+            root: engine_root.to_path_buf(),
+            phpstan,
+            lsp: None,
+            sandbox: ci_core::resolve_sandbox(engine_root),
+        }) as Box<dyn GateEngine + Send>)
     })
 }
 

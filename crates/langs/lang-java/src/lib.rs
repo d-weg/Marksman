@@ -80,13 +80,14 @@ impl LanguageProvider for JavaProvider {
 /// a dependency.
 fn engine_factory() -> EngineFactory {
     Arc::new(|root: &Path| {
-        let sidecar = gate::JavacSidecar::start(root).map_err(|e| match gate_missing() {
+        let sandbox = ci_core::resolve_sandbox(root);
+        let sidecar = gate::JavacSidecar::start(root, &*sandbox).map_err(|e| match gate_missing() {
             Some(missing) => {
                 ci_core::Error::Driver(format!("java edit engine failed to start ({e}).\n{missing}"))
             }
             None => e,
         })?;
-        Ok(Box::new(gate::JavaEngine { root: root.to_path_buf(), sidecar, lsp: None })
+        Ok(Box::new(gate::JavaEngine { root: root.to_path_buf(), sidecar, lsp: None, sandbox })
             as Box<dyn GateEngine + Send>)
     })
 }

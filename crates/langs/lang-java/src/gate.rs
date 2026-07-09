@@ -2,13 +2,14 @@
 //! (started lazily) for rename/willRename. The two never trade jobs: jdtls is push-diagnostics
 //! only through v1.60 — waiting on its publish silence could mistake a slow server for a clean
 //! file — while javax.tools IS javac, answering request/response with structured diagnostics.
-use ci_core::{Diag, Error, Result};
+use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::Arc;
 
 use crate::jdtls;
 
@@ -37,19 +38,20 @@ impl Drop for JavacSidecar {
 }
 
 impl JavacSidecar {
-    pub(crate) fn start(root: &Path) -> Result<Self> {
+    pub(crate) fn start(root: &Path, sandbox: &dyn Sandbox) -> Result<Self> {
         let src_dir = tempfile::tempdir()
             .map_err(|e| Error::Driver(format!("materialize java gate sidecar: {e}")))?;
         let src = src_dir.path().join("GateSidecar.java");
         std::fs::write(&src, GATE_SIDECAR_SRC)
             .map_err(|e| Error::Driver(format!("materialize java gate sidecar: {e}")))?;
-        let mut child = Command::new("java")
-            .arg(&src)
+        let mut cmd = Command::new("java");
+        cmd.arg(&src)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = sandbox
+            .spawn(&mut cmd)
             .map_err(|e| Error::Driver(format!("spawn java gate sidecar: {e}")))?;
         let stdin = child.stdin.take().ok_or_else(|| Error::Driver("no sidecar stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Driver("no sidecar stdout".into()))?;
@@ -235,12 +237,15 @@ pub(crate) struct JavaEngine {
     /// jdtls, started on the FIRST rename/move only — diagnostics never wait on it, and a
     /// missing jdtls costs nothing until an op actually needs cross-file rewrites.
     pub(crate) lsp: Option<LspClient>,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
+    /// container backend swaps in — see `docs/container-gate-spec.md`.
+    pub(crate) sandbox: Arc<dyn Sandbox>,
 }
 
 impl JavaEngine {
     fn jdtls(&mut self) -> Result<&mut LspClient> {
         if self.lsp.is_none() {
-            self.lsp = Some(jdtls::start(&self.root)?);
+            self.lsp = Some(jdtls::start(&self.root, &*self.sandbox)?);
         }
         Ok(self.lsp.as_mut().expect("just set"))
     }

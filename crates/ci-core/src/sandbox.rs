@@ -9,7 +9,9 @@
 //! an OCI rootfs, so a device needs a container runtime instead of every language's toolchain.
 use crate::CappedOutput;
 use std::io;
-use std::process::{Child, Command};
+use std::path::Path;
+use std::process::{Child, Command, Output};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Where a toolchain process runs. Implementations must be cheap to share across the engines that
@@ -24,6 +26,11 @@ pub trait Sandbox: Send + Sync {
     /// already configured on `cmd`, returning the [`Child`]. The host impl is `Command::spawn`; a
     /// container impl execs the argv inside the running container with the same pipes.
     fn spawn(&self, cmd: &mut Command) -> io::Result<Child>;
+
+    /// Run a one-shot command to completion, returning its full output UNCAPPED and UNTIMED — for a
+    /// gate whose output must not be truncated (`cargo check --message-format=json` emits one JSON
+    /// object per diagnostic and can legitimately be large). The host impl is `Command::output`.
+    fn output(&self, cmd: &mut Command) -> io::Result<Output>;
 }
 
 /// The default backend: no isolation. Runs every toolchain on the host exactly as the code did
@@ -40,6 +47,18 @@ impl Sandbox for HostSandbox {
     fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
         cmd.spawn()
     }
+
+    fn output(&self, cmd: &mut Command) -> io::Result<Output> {
+        cmd.output()
+    }
+}
+
+/// The sandbox a provider should run its toolchain in, for `root`. **This is the single switch
+/// for container mode:** every gate engine resolves its sandbox here, so turning on an OCI backend
+/// (M2) changes only this function — no engine is edited. M1 always returns the host, so the whole
+/// codebase is behavior-identical to before the trait existed.
+pub fn resolve_sandbox(_root: &Path) -> Arc<dyn Sandbox> {
+    Arc::new(HostSandbox)
 }
 
 #[cfg(test)]
@@ -60,5 +79,14 @@ mod tests {
         let mut cmd = Command::new("true");
         let mut child = HostSandbox.spawn(&mut cmd).unwrap();
         assert!(child.wait().unwrap().success());
+    }
+
+    #[test]
+    fn host_sandbox_output_returns_full_uncapped_output() {
+        let mut cmd = Command::new("printf");
+        cmd.arg("diag");
+        let out = HostSandbox.output(&mut cmd).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"diag");
     }
 }

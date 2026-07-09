@@ -76,7 +76,7 @@ fn java_major(home: &Path) -> Option<u32> {
 /// Start jdtls for `root`. The eclipse workspace persists per repo
 /// (`.marksman/jdtls-workspace`): first import of a real Maven/Gradle repo can take minutes,
 /// warm restarts don't — persisting it is load-bearing, not an optimization.
-pub(crate) fn start(root: &Path) -> Result<LspClient> {
+pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
     let Some(bin) = jdtls_binary() else {
         return Err(ci_core::Error::Driver(format!(
             "java rename/move needs jdtls to rewrite references safely — Install: {INSTALL_HINT}. \
@@ -91,7 +91,7 @@ pub(crate) fn start(root: &Path) -> Result<LspClient> {
         // The brew launcher resolves its runtime through JAVA_HOME first — pin the 21+ one.
         cmd.env("JAVA_HOME", &home);
     }
-    LspClient::start(root, cmd)
+    LspClient::start_in(root, cmd, sandbox)
 }
 
 #[cfg(test)]

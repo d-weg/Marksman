@@ -2,12 +2,13 @@
 //! for rename/willRename. The two never trade jobs: phpactor serves the cross-file rewrites
 //! (its `willRenameFiles` is real LSP fileOperations), while PHPStan — a batch analyser, not a
 //! server — answers the type-check verdict from a materialized overlay.
-use ci_core::{Diag, Error, Result};
+use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
 use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::phpactor;
 
@@ -63,7 +64,7 @@ fn write_overlay(base: &Path, rel: &str, content: &str) -> Result<PathBuf> {
 /// reject on a perfectly good edit (the schema-field bench blew a rust arm to 1M tokens because
 /// the touched file was analysed alone and every reference to an unmaterialized sibling read as a
 /// new error). Reported paths are relativized back to the repo-relative keys the spine speaks.
-fn phpstan_diagnostics(bin: &Path, root: &Path, files: &[(String, String)]) -> Result<Vec<Diag>> {
+fn phpstan_diagnostics(bin: &Path, root: &Path, sandbox: &dyn Sandbox, files: &[(String, String)]) -> Result<Vec<Diag>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -124,7 +125,8 @@ fn phpstan_diagnostics(bin: &Path, root: &Path, files: &[(String, String)]) -> R
         .current_dir(dir.path());
     // Capped + time-bounded like the swift gate: a chatty analyser can't OOM us, and a wedged one
     // can't hang the edit forever (generous timeout — a legit slow analysis is never killed).
-    let out = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
+    let out = sandbox
+        .run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
         .map_err(|e| Error::Driver(format!("phpstan spawn: {e}")))?;
     if out.timed_out {
         return Err(Error::Driver(format!(
@@ -212,12 +214,15 @@ pub(crate) struct PhpEngine {
     /// phpactor, started on the FIRST rename/move only — diagnostics never wait on it, and a
     /// missing phpactor costs nothing until an op actually needs cross-file rewrites.
     pub(crate) lsp: Option<LspClient>,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
+    /// container backend swaps in — see `docs/container-gate-spec.md`.
+    pub(crate) sandbox: Arc<dyn Sandbox>,
 }
 
 impl PhpEngine {
     fn phpactor(&mut self) -> Result<&mut LspClient> {
         if self.lsp.is_none() {
-            self.lsp = Some(phpactor::start(&self.root)?);
+            self.lsp = Some(phpactor::start(&self.root, &*self.sandbox)?);
         }
         Ok(self.lsp.as_mut().expect("just set"))
     }
@@ -234,7 +239,7 @@ fn deleted_path_references(root: &Path, files: &[(String, String)]) -> Vec<Diag>
 
 impl GateEngine for PhpEngine {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
-        let mut out = phpstan_diagnostics(&self.phpstan, &self.root, files)?;
+        let mut out = phpstan_diagnostics(&self.phpstan, &self.root, &*self.sandbox, files)?;
         out.extend(deleted_path_references(&self.root, files));
         Ok(out)
     }

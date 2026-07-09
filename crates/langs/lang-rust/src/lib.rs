@@ -143,13 +143,14 @@ impl RustProvider {
 /// missing dependency.
 fn engine_factory() -> ci_edit::EngineFactory {
     Arc::new(|root: &Path| {
-        let lsp = LspClient::start(root, rust_analyzer_command()).map_err(|e| {
+        let sandbox = ci_core::resolve_sandbox(root);
+        let lsp = LspClient::start_in(root, rust_analyzer_command(), &*sandbox).map_err(|e| {
             match toolchain().describe_missing() {
                 Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
                 None => e,
             }
         })?;
-        Ok(Box::new(RustEngine { root: root.to_path_buf(), lsp }) as Box<dyn GateEngine + Send>)
+        Ok(Box::new(RustEngine { root: root.to_path_buf(), lsp, sandbox }) as Box<dyn GateEngine + Send>)
     })
 }
 
@@ -162,11 +163,12 @@ fn prewarm_engine(root: &Path) -> Option<Box<dyn GateEngine + Send>> {
     let warm = graph::rust_files(root)
         .into_iter()
         .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
-    let mut client = LspClient::start(root, rust_analyzer_command()).ok()?;
+    let sandbox = ci_core::resolve_sandbox(root);
+    let mut client = LspClient::start_in(root, rust_analyzer_command(), &*sandbox).ok()?;
     if let Some((f, content)) = warm {
         let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
     }
-    Some(Box::new(RustEngine { root: root.to_path_buf(), lsp: client }))
+    Some(Box::new(RustEngine { root: root.to_path_buf(), lsp: client, sandbox }))
 }
 
 /// Re-describe one committed file for the glue's post-commit graph overlay (tree-sitter,

@@ -88,8 +88,12 @@ fn engine_factory() -> EngineFactory {
         if let Some(missing) = gate_missing() {
             return Err(ci_core::Error::Driver(format!("swift edit engine unavailable.\n{missing}")));
         }
-        Ok(Box::new(gate::SwiftEngine { root: root.to_path_buf(), lsp: None, target_dirs: None })
-            as Box<dyn GateEngine + Send>)
+        Ok(Box::new(gate::SwiftEngine {
+            root: root.to_path_buf(),
+            lsp: None,
+            target_dirs: None,
+            sandbox: ci_core::resolve_sandbox(root),
+        }) as Box<dyn GateEngine + Send>)
     })
 }
 

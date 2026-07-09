@@ -198,6 +198,43 @@ runs.
 - **M4 — image build + `doctor` integration + docs.** Per-language pinned images, lazy pull,
   `marksman doctor` container tier, a one-line opt-in (`CI_SANDBOX=oci`).
 
+## 9a. M1 threading pattern (the exact per-engine change)
+
+M1 is behavior-preserving plumbing. It is specified once here so every engine — Java, PHP, Swift,
+Rust — follows it **identically** (readability = the four diffs look the same).
+
+**Shared pieces (done):** `ci_core::Sandbox` (`run_capped` + `spawn`) · `HostSandbox` ·
+`LspClient::start_in(root, cmd, &dyn Sandbox)` · **`ci_core::resolve_sandbox(root) -> Arc<dyn
+Sandbox>`** — the one switch M2 edits; M1 returns `HostSandbox`.
+
+**Per gate engine (`lang-{php,swift,java,rust}`), four mechanical edits:**
+
+1. **Field.** Add `sandbox: Arc<dyn ci_core::Sandbox>` to the engine struct (`PhpEngine`,
+   `SwiftEngine`, `JavaEngine`, `RustEngine`). For Java, `JavacSidecar` also carries it (its
+   spawn is the gate).
+2. **Gate spawn → the sandbox.** The free gate fn takes a `sandbox: &dyn Sandbox` param; the
+   `diagnostics()` method passes `&*self.sandbox`. The trait has three exec shapes because the
+   codebase already uses three — match the one the engine uses today (behavior-preserving):
+   - PHP / Swift use `ci_core::run_capped(&mut cmd, …)` → `sandbox.run_capped(&mut cmd, …)`.
+   - Rust uses `cmd.output()` (its `cargo check` JSON must stay UNCAPPED) → `sandbox.output(&mut
+     cmd)`. Do NOT switch it to `run_capped` — the 32 MB cap could truncate a large diagnostic set.
+   - Java's gate is a resident sidecar: `JavacSidecar::start(root, sandbox)` calls
+     `sandbox.spawn(&mut cmd)` instead of `cmd.spawn()` (and `JavacSidecar` holds the sandbox).
+3. **LSP start → the sandbox.** The `<lsp>::start(root)` helper (`phpactor`/`sourcekit`/`jdtls`,
+   and rust-analyzer inline) gains a `sandbox: &dyn Sandbox` and calls
+   `LspClient::start_in(root, cmd, sandbox)` instead of `LspClient::start(root, cmd)`. The engine's
+   lazy `self.lsp()` (and the rust factory's eager start) passes `&*self.sandbox`.
+4. **Construct with the resolver.** Each `engine_factory` builds the struct with
+   `sandbox: ci_core::resolve_sandbox(root)`. Nothing else in the factory changes.
+
+**Type choice:** `Arc<dyn Sandbox>` (not `Box`) so the one instance is shared cheaply between the
+engine, its sidecar, and the free fns it calls; `Sandbox: Send + Sync` makes the `Arc` `Send`, which
+the `Box<dyn GateEngine + Send>` providers require.
+
+**Acceptance per engine:** the crate builds 0-warning; its `#[ignore]` gate/rename e2e (where the
+toolchain is present) produce byte-identical verdicts; `git diff` shows only the four edits above.
+**Global acceptance:** `cargo test --workspace` unchanged (253 passed), 0-warning.
+
 ## 10. Relationship to prior findings
 
 - **Supersedes the install burden.** The README simplification made the *core* install trivial,
