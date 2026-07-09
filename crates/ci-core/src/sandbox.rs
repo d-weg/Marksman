@@ -17,6 +17,13 @@ use std::time::Duration;
 /// Where a toolchain process runs. Implementations must be cheap to share across the engines that
 /// hold one (`Send + Sync`); a resident backend keeps its own warm state internally.
 pub trait Sandbox: Send + Sync {
+    /// Whether the toolchain runs in a container rather than on the host. Engines use this to
+    /// resolve tools FROM THE IMAGE — a bare command name looked up on the container's PATH, with
+    /// no host probe and no host-specific env — instead of a host absolute path. Default: host.
+    fn containerized(&self) -> bool {
+        false
+    }
+
     /// Run a one-shot command to completion, capturing stdout/stderr capped at `cap` bytes and
     /// killing it after `timeout` — the gate-verdict path. The host impl is [`crate::run_capped`];
     /// a container impl runs the same argv inside its rootfs and maps the output back.
@@ -174,6 +181,10 @@ fn same_path_mount(p: &Path) -> String {
 }
 
 impl Sandbox for OciSandbox {
+    fn containerized(&self) -> bool {
+        true
+    }
+
     fn run_capped(&self, cmd: &mut Command, timeout: Duration, cap: usize) -> io::Result<CappedOutput> {
         let container = self.container()?;
         crate::run_capped(&mut self.exec(&container, cmd, false), timeout, cap)

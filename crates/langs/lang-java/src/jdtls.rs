@@ -77,20 +77,28 @@ fn java_major(home: &Path) -> Option<u32> {
 /// (`.marksman/jdtls-workspace`): first import of a real Maven/Gradle repo can take minutes,
 /// warm restarts don't — persisting it is load-bearing, not an optimization.
 pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
-    let Some(bin) = jdtls_binary() else {
-        return Err(ci_core::Error::Driver(format!(
-            "java rename/move needs jdtls to rewrite references safely — Install: {INSTALL_HINT}. \
-             Without it, reissue a SYMBOL rename as `replace_text` edits over the definition and \
-             each reference in one batch — the javac gate type-checks the result, so a missed or \
-             wrong site rejects rather than lands."
-        )));
+    // Containerized: the image ships jdtls (Java 21 + the server on PATH), so resolve it by bare
+    // name in the container and let the image's JAVA_HOME stand — a host probe/path would be
+    // meaningless there, and its absence is exactly what the container is here to fix.
+    let mut cmd = if sandbox.containerized() {
+        Command::new("jdtls")
+    } else {
+        let Some(bin) = jdtls_binary() else {
+            return Err(ci_core::Error::Driver(format!(
+                "java rename/move needs jdtls to rewrite references safely — Install: {INSTALL_HINT}. \
+                 Without it, reissue a SYMBOL rename as `replace_text` edits over the definition and \
+                 each reference in one batch — the javac gate type-checks the result, so a missed or \
+                 wrong site rejects rather than lands."
+            )));
+        };
+        let mut c = Command::new(bin);
+        if let Some(home) = java21_home() {
+            // The brew launcher resolves its runtime through JAVA_HOME first — pin the 21+ one.
+            c.env("JAVA_HOME", &home);
+        }
+        c
     };
-    let mut cmd = Command::new(bin);
     cmd.arg("-data").arg(root.join(".marksman").join("jdtls-workspace"));
-    if let Some(home) = java21_home() {
-        // The brew launcher resolves its runtime through JAVA_HOME first — pin the 21+ one.
-        cmd.env("JAVA_HOME", &home);
-    }
     LspClient::start_in(root, cmd, sandbox)
 }
 
