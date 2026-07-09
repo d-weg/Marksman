@@ -41,7 +41,8 @@ consolidated: `inspect`'s modes subsume `retrieve_context`/`find_symbols`/`list_
 
 ## Install
 
-Three steps — **build, index, register** — and no environment variables to set. Everything
+Three steps to set up — **build, index, register** — and no environment variables to set, plus a
+one-time **agent preamble** (step 4) so your coding agent actually reaches for the tools. Everything
 below the build is **per language and lazy**: a toolchain is fetched or reported only for the
 languages your repo actually contains.
 
@@ -92,6 +93,23 @@ claude mcp add marksman -- /absolute/path/to/Marksman/target/release/marksman-mc
 ```
 The server indexes the repo it's launched in (its working directory); or pass `--root /path/to/repo`
 or set `MARKSMAN_ROOT`. Run `marksman index` (step 2) once before first use.
+
+### 4. Point your agent at the tools
+
+Registering the server makes the tools *available* — it doesn't make an agent *use* them. Left to
+its own devices a coding agent falls back on grep + manual edits, and you never see Marksman's
+type-checked, single-call editing. Add the preamble below to your repo's `CLAUDE.md` (or `AGENTS.md`,
+or your client's system prompt) so the agent reaches for the tools by default. This is the **exact
+nudge our benchmark suites use** ([`scripts/agent-bench/run.py`](scripts/agent-bench/run.py)) — the
+one the published numbers were measured with:
+
+```text
+You have marksman MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL names:
+  ToolSearch  query="select:mcp__marksman__apply_edits,mcp__marksman__inspect"
+What they do: apply_edits (ALL code edits — structural + surgical, type-checked before landing when the language has a checker; TRUST the reply — never re-verify by hand), inspect (ALL reads/locating — mode: search|symbol|file|node|map).
+Then EDIT WITH THE TOOL, not grep+Edit: if the task NAMES the symbol, call apply_edits by name DIRECTLY — don't locate it first; if the task also gives the FILE, address as `file#name` (e.g. `src/http/retry.ts#parseResponse`) so it resolves in ONE call; else a bare name works and an ambiguous one just returns candidate ids to re-issue with. This holds even for a ONE-LINE change (change a default, fix a value) — use apply_edits replace_text by name; do NOT reach for Grep/Bash/Read+Edit for a small edit. It's verified server-side and needs no separate search.
+File moves/renames: send the BARE move_file/rename as your FIRST action — no find/grep/read survey first, no helper edits alongside (in type-checked languages, imports, module declarations, and needed module files are all part of the one action; ungated replies say exactly what remains). The reply shows every line it rewrote — exactly what a survey would have found — and the gate rejects safely if anything is off.
+```
 
 <details>
 <summary>Offline / air-gapped, or a custom model location</summary>
