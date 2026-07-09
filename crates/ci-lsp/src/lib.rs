@@ -71,6 +71,12 @@ pub struct LspClient {
     fresh_demand: Option<Instant>,
     /// Whether any `experimental/serverStatus` arrived AFTER the current fresh demand.
     status_since_demand: bool,
+    /// jdtls readiness (it speaks `language/status`, not rust-analyzer's `experimental/serverStatus`).
+    /// `saw_jdtls_status` = it's a `language/status` server at all; `jdtls_ready` flips once it
+    /// reports `ServiceReady` — its project import is done. Before that a `textDocument/rename` sees
+    /// only the open file and returns a definition-only edit (cross-file references unrewritten).
+    saw_jdtls_status: bool,
+    jdtls_ready: bool,
 }
 
 impl LspClient {
@@ -114,6 +120,8 @@ impl LspClient {
             status_grace_done: false,
             fresh_demand: None,
             status_since_demand: false,
+            saw_jdtls_status: false,
+            jdtls_ready: false,
         };
 
         let init = json!({
@@ -402,11 +410,52 @@ impl LspClient {
     /// once initial analysis is done. Must be called on every message every receive loop sees,
     /// or a status update read by one loop is lost to the others.
     fn observe(&mut self, msg: &Value) {
-        if msg.get("method").and_then(|m| m.as_str()) == Some("experimental/serverStatus") {
-            self.saw_server_status = true;
-            self.status_since_demand = true;
-            self.quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
+        match msg.get("method").and_then(|m| m.as_str()) {
+            Some("experimental/serverStatus") => {
+                self.saw_server_status = true;
+                self.status_since_demand = true;
+                self.quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
+            }
+            // jdtls: Starting → ProjectStatus → Started → ServiceReady (import complete).
+            Some("language/status") => {
+                self.saw_jdtls_status = true;
+                if msg.pointer("/params/type").and_then(|t| t.as_str()) == Some("ServiceReady") {
+                    self.jdtls_ready = true;
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// Receive at most one message within `wait`, tracking status and answering any server→client
+    /// request so the server never blocks. Ok on a message or a timeout; errors only on disconnect.
+    fn pump_one(&mut self, wait: Duration) -> Result<()> {
+        match self.rx.recv_timeout(wait) {
+            Ok(msg) => {
+                self.observe(&msg);
+                if msg.get("id").is_some() && msg.get("method").is_some() {
+                    self.reply_server_request(&msg)?;
+                }
+                Ok(())
+            }
+            Err(RecvTimeoutError::Timeout) => Ok(()),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::Driver("lsp server disconnected".into())),
+        }
+    }
+
+    /// Block until jdtls finishes importing the project — it signals with a `language/status`
+    /// `ServiceReady`, distinct from the `experimental/serverStatus` [`wait_quiescent`] tracks.
+    /// Before it, a `textDocument/rename` sees only the open file and returns a definition-only edit
+    /// (cross-file references unrewritten). No-op — and zero added latency — for a server that never
+    /// speaks `language/status`: by the time a rename runs, the warm-up diagnostics have already
+    /// pumped jdtls's early "Starting", so `saw_jdtls_status` distinguishes it from rust-analyzer /
+    /// tsls (which never send it). Best-effort: on the deadline it proceeds rather than failing.
+    pub fn ensure_ready(&mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while self.saw_jdtls_status && !self.jdtls_ready && Instant::now() < deadline {
+            self.pump_one(Duration::from_millis(200))?;
+        }
+        Ok(())
     }
 
     /// Block until a status-reporting server (rust-analyzer) is quiescent. No-op for servers

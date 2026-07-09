@@ -593,16 +593,15 @@ mod tests {
         // apply_edits returning (not erroring) proves the whole container path ran end to end: the
         // javac sidecar AND jdtls both launched inside the image, no host jdtls/javac consulted, and
         // the rename executed — jdtls renamed the definition in Util.java.
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename commits through the CONTAINER gate: {res:?}");
         assert!(
             fs::read_to_string(root.join("Util.java")).unwrap().contains("fetchBase"),
-            "jdtls ran INSIDE the container and renamed the definition: {res:?}"
+            "definition renamed inside the container"
         );
-        // TODO(jdtls-readiness): App.java's `Util.base()` reference is NOT yet rewritten — jdtls
-        // returns a definition-only rename because marksman has no readiness wait for it. The
-        // `wait_quiescent` gate keys on rust-analyzer's `experimental/serverStatus`; jdtls instead
-        // emits `language/status`, so the rename fires before the project import completes. Fixing
-        // that (the next task) will let this assert the cross-file rewrite:
-        //   assert!(fs::read_to_string(root.join("App.java")).unwrap().contains("Util.fetchBase()"));
+        assert!(
+            fs::read_to_string(root.join("App.java")).unwrap().contains("Util.fetchBase()"),
+            "cross-file reference rewritten by the CONTAINER's jdtls — no host jdtls consulted"
+        );
     }
 
     // Requires mvn (`brew install maven`). NOT installed on this machine — SKIPS loudly.

@@ -120,6 +120,9 @@ impl GateEngine for LspClient {
         if let Ok(content) = std::fs::read_to_string(self.root().join(file)) {
             let _ = LspClient::diagnostics(self, &[(file.to_string(), content)]);
         }
+        // jdtls signals import-done with `language/status` ServiceReady, not the serverStatus the
+        // warm-up waits on — without this a rename fires mid-import and rewrites only the definition.
+        let _ = self.ensure_ready();
         let uri = format!("file://{}", self.root().join(file).to_string_lossy());
         let params = json!({
             "textDocument": {"uri": uri},
@@ -151,6 +154,7 @@ impl GateEngine for LspClient {
         if let Ok(content) = std::fs::read_to_string(self.root().join(from)) {
             let _ = LspClient::diagnostics(self, &[(from.to_string(), content)]);
         }
+        let _ = self.ensure_ready();
         let old_uri = format!("file://{}", self.root().join(from).to_string_lossy());
         let new_uri = format!("file://{}", self.root().join(to).to_string_lossy());
         let params = json!({ "files": [{ "oldUri": old_uri, "newUri": new_uri }] });

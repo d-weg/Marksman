@@ -8,8 +8,22 @@
 //!   (that's the javax.tools sidecar's job); this client exists for rename/willRename alone.
 use ci_core::Result;
 use ci_lsp::LspClient;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// jdtls's `-data` eclipse workspace, kept OUTSIDE the repo (under the system temp dir, keyed by
+/// `root` so it still persists per repo). jdtls's "invisible project" for a build-config-less repo
+/// LINKS the repo directory into this workspace, and eclipse refuses to link a folder that CONTAINS
+/// its own workspace — a `-data` under `root` yields "Failed to create the invisible project" and a
+/// definition-only rename (no cross-file view). The temp dir is also what the OCI sandbox mounts,
+/// so this path is writable inside the container too.
+fn workspace_dir(root: &Path) -> PathBuf {
+    let mut h = DefaultHasher::new();
+    root.hash(&mut h);
+    std::env::temp_dir().join("marksman-jdtls").join(format!("{:016x}", h.finish()))
+}
 
 pub(crate) const INSTALL_HINT: &str =
     "`brew install jdtls` (jdtls itself runs on Java 21+ — e.g. `brew install openjdk@21`)";
@@ -98,7 +112,7 @@ pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspCl
         }
         c
     };
-    cmd.arg("-data").arg(root.join(".marksman").join("jdtls-workspace"));
+    cmd.arg("-data").arg(workspace_dir(root));
     LspClient::start_in(root, cmd, sandbox)
 }
 
