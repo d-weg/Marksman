@@ -162,17 +162,24 @@ This is the one place the idea is genuinely constrained: it does **not** make Ma
 install-free on a Mac. It makes it install-free on Linux, and version-reproducible everywhere it
 runs.
 
-## 7. Risks to measure before committing past M2
+## 7. Risks — MEASURED (2026-07-09, macOS 15.7 · Docker Desktop · arm64 · php gate on the 33-file
+corpus fixture, the mount-heavy tree gate = the worst case)
 
-- **Overlay I/O across the boundary — the make-or-break number.** Bind mounts on the macOS VM are
-  notoriously slow, and the php gate re-mirrors the whole project per call. Measure copy-in vs
-  mount vs named-volume for the tree gates on a large repo; if it erases the gate's speed
-  advantage, keep tree gates on the host and containerize only the buffer/stdio engines (still
-  solves the jdtls/phpactor-absent problem, which was the actual pain).
-- **Cold start** of the resident container on first gated op (amortized by warm reuse, but the
-  first edit pays it).
-- **Image size / pull time** on first use.
-- **Path-mapping correctness** across the boundary (a regression here = wrong-file diagnostics).
+- **Overlay I/O across the boundary — the make-or-break number: NOT a problem.** Pure bind-mount
+  overhead (same container phpstan, mounted project vs a copy on the container's own fs) is
+  **+26ms / +7%** — a rounding error, not the "notoriously slow" cost feared. Docker Desktop's file
+  sharing is fine for the whole-project mirror. So tree gates DO containerize (php already does),
+  and the M2.4 "defer tree gates to M3" caveat is lifted — it was a perf worry that didn't
+  materialize. (The container phpstan even ran *faster* than the host's — 401 vs 819ms — a newer
+  phpstan/php build, not the point, but confirms no regression.)
+- **`docker exec` overhead — the real per-op container cost:** ~129ms fixed per one-shot gate call
+  (php's `run_capped`/`output` path). Java pays this **once** (its javac sidecar is a resident
+  `docker exec -i`, so gates are stdio round-trips) — one reason the stdio engines were the right
+  first target.
+- **Cold start** of the container: ~181ms, one-time per session, amortized across every edit.
+- **Image size**: java 905MB, php ~half that. Lazy-pull per language.
+- **Path-mapping correctness**: the identical-path mount makes this a non-issue (host paths ARE
+  container paths); verified by the java + php cross-file rename e2e.
 
 ## 8. Testing plan
 
