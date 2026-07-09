@@ -22,7 +22,7 @@ pub use driver::{LanguageProvider, ReadIndex};
 pub use error::{Error, Result};
 pub use outline::{elide_bodies, elide_bodies_with};
 pub use paths::rel_path;
-pub use sandbox::{resolve_sandbox, HostSandbox, Sandbox};
+pub use sandbox::{oci_runtime, resolve_sandbox, HostSandbox, OciSandbox, Sandbox};
 pub use text::byte_offset;
 pub use toolchain::{gate_timeout, probe_tool, run_capped, CappedOutput, ToolStatus, ToolchainReport};
 pub use types::*;

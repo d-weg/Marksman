@@ -235,6 +235,61 @@ the `Box<dyn GateEngine + Send>` providers require.
 toolchain is present) produce byte-identical verdicts; `git diff` shows only the four edits above.
 **Global acceptance:** `cargo test --workspace` unchanged (253 passed), 0-warning.
 
+## 9b. M2 execution plan (the OCI backend, testable on this Mac)
+
+**Enabling fact:** Docker Desktop is installed here, and on macOS it runs a Linux VM — so we can
+build and run Linux OCI containers locally, no separate VM to provision. M2 is therefore
+testable on this machine, not deferred to remote Linux.
+
+**Backend choice — a CLI-runtime `OciSandbox`, not (yet) in-process libcontainer.** The `Sandbox`
+trait is backend-agnostic, so M2 ships the backend that is testable now: one that shells out to an
+**OCI runtime CLI**, chosen by `$CI_SANDBOX_RUNTIME` else the first found on PATH of
+`container`/`docker`/`podman`/`nerdctl`. The **chosen local runtime is Apple's native `container`**
+(macOS 15+; this machine is 15.7) — a per-container lightweight VM on Virtualization.framework, **no
+daemon**, closer to the user's "open/generic, not Docker" preference than Docker Desktop. It
+installs from a signed `.pkg` at github.com/apple/container/releases (not a brew cask). The IMAGE is
+plain OCI, so the runtime choice never changes the verdict. The pure-Rust, daemonless **youki
+`libcontainer`** backend from §2 stays the target for Linux hosts with no CLI at all — a *second*
+`Sandbox` impl added later (M5), swapped in behind the same trait with zero engine changes.
+
+**The trick that makes `spawn(cmd)` wrap an arbitrary host `Command`: identical-path mounts.**
+Mount the repo AND the system temp dir into the container at their **same absolute host paths**
+(`-v /Users/…/repo:/Users/…/repo`, `-v $TMPDIR:$TMPDIR`). Then `current_dir`, java's
+`-sourcepath`, the sidecar's materialized `GateSidecar.java` tempdir, phpstan's overlay tree — all
+host paths — are valid *inside* the container unchanged. No path translation; `OciSandbox` just
+re-launches the same argv via `<runtime> exec`. (This subsumes §3's "path mapping" for the common
+case.)
+
+**Warm container lifecycle (§4), concretely:** on first gated op for a repo, `OciSandbox` starts
+one detached container — `<runtime> run -d --rm -v repo:repo:ro -v $TMPDIR:$TMPDIR <image> sleep
+infinity` — keyed by repo so a session reuses it; torn down at drop. The repo is **read-only**;
+the overlay rides the engine's existing channel (java sidecar buffers over stdin, an LSP over
+didOpen), so no per-edit filesystem materialization for the stdio engines — the cheap case.
+
+### Substeps
+
+- **M2.1 — `resolve_sandbox` switch + `OciSandbox` skeleton (testable here, no container yet).**
+  `resolve_sandbox(root)` returns `OciSandbox` only when `$CI_SANDBOX=oci` AND a runtime is present,
+  else `HostSandbox` (unchanged default). Skeleton `OciSandbox` implementing `Sandbox`; runtime
+  discovery. Acceptance: default path unchanged (workspace 254 green, 0-warning); `CI_SANDBOX=oci`
+  with no runtime falls back to host with a logged note (never a hard failure).
+- **M2.2 — the java image + warm-container plumbing.** A `docker/marksman-java.Dockerfile` (a JDK
+  base + jdtls) built to a local tag. `OciSandbox` start/exec/teardown with the identical-path
+  mounts. Acceptance: `<runtime> exec` runs `java -version` inside the warm container against a
+  bind-mounted repo.
+- **M2.3 — java gate + rename end-to-end, NO host jdtls (the payoff).** Drive `JavaProvider` with
+  `CI_SANDBOX=oci`; the javac sidecar and jdtls come from the image. Acceptance: on a repo with
+  jdtls REMOVED from the host PATH, the java gate rejects/commits with byte-identical verdicts to
+  the host path, and `jdtls_rename_lands_cross_file` passes — the bench's worst finding, closed.
+  Run as an `#[ignore]` e2e gated on `$CI_SANDBOX=oci` + a runtime.
+- **M2.4 — the other stdio engines** (php phpactor, swift sourcekit, rust rust-analyzer in their
+  images) — same shape as java, LSP over stdio. Tree gates (phpstan/swift build/cargo) stay on the
+  host until M3 measures overlay-mount I/O.
+- **M2.5 (later) — `LibcontainerSandbox`** for daemonless Linux, behind the same trait.
+
+**The one open decision:** M2 uses `docker` as the *local test* runtime (it's what's installed),
+while staying runtime-generic in code. Confirm that's acceptable, or name the runtime to target.
+
 ## 10. Relationship to prior findings
 
 - **Supersedes the install burden.** The README simplification made the *core* install trivial,
