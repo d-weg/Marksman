@@ -41,76 +41,73 @@ On a 10-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), a
 
 ## Install
 
+Three steps — **build, index, register** — and no environment variables to set. Everything
+below the build is **per language and lazy**: a toolchain is fetched or reported only for the
+languages your repo actually contains.
+
 ### Prerequisites
-
-Dependencies are **per language, checked only for languages your repo actually contains** — a
-Rust-only repo never needs (or touches) Node, and a TS-only repo never needs rust-analyzer.
-Run `marksman doctor <repo>` any time to see exactly what your repo needs, what's
-installed, and how to install what's missing.
-
-- **Rust** (stable) — to build Marksman itself. <https://rustup.rs>
-- The **embedding model** (~65 MB), `minishlab/potion-code-16M` — downloaded once (below).
-- *Only if your repo has TypeScript:* **Node 18+** with `npm`/`npx` — `scip-typescript` and
-  `ts-morph` are then fetched automatically on first use.
+- **Rust** (stable), to build Marksman — <https://rustup.rs>. Nothing else is needed to start.
+- The **embedding model** (~65 MB, `minishlab/potion-code-16M`) **downloads itself** from
+  Hugging Face on your first `index` — no manual step. (Offline? See the note below.)
+- *Only if your repo has TypeScript:* **Node 18+** (`npx` fetches `scip-typescript`/`ts-morph`
+  on first use).
 - *Only if your repo has Rust and you want type-checked edits:* **rust-analyzer**
-  (`rustup component add rust-analyzer`) — reads/indexing work without it.
+  (`rustup component add rust-analyzer`) — reads work without it.
 
-If a needed toolchain is missing, Marksman says so **actionably** — the language is disabled
-with an install instruction (at startup, in `doctor`, and on any tool call touching that
-language's files) — it never half-works or silently degrades.
+`marksman doctor <repo>` reports exactly what your repo needs, what's installed, and the command
+to install anything missing. A missing toolchain disables just that language, actionably — never
+a silent half-degrade.
 
 ### 1. Build
 ```bash
 git clone https://github.com/d-weg/Marksman.git
 cd Marksman
-cargo build --release
-# produces: target/release/marksman (CLI) and target/release/marksman-mcp (MCP server)
+cargo build --release   # → target/release/marksman (CLI) and marksman-mcp (MCP server)
 ```
 
-### 2. Get the embedding model
-Marksman uses a small static Model2Vec embedder. Download the model and point `CI_MODEL_DIR` at the directory:
+### 2. Index your repo
 ```bash
-# Option A — git-lfs
-git lfs install
-git clone https://huggingface.co/minishlab/potion-code-16M ~/.marksman/models/potion-code-16M
-
-# Option B — Hugging Face CLI
-# huggingface-cli download minishlab/potion-code-16M --local-dir ~/.marksman/models/potion-code-16M
-
-export CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M"
+target/release/marksman index /path/to/your/repo   # writes .marksman/; fetches the model on first run
+# optional sanity check:
+target/release/marksman retrieve /path/to/your/repo "where is the rate limiter"
 ```
-The directory must contain `model.safetensors`, `tokenizer.json`, and `config.json`.
 
-### 3. Index a repo
+### 3. Register the MCP server
+No environment variables needed — the model path, npm cache, and repo root all default.
+
+**Claude Code:**
 ```bash
-export CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M"
-target/release/marksman index /path/to/your/ts-repo               # writes .marksman/ into the repo
-target/release/marksman retrieve /path/to/your/ts-repo "where is the rate limiter"   # sanity check
+claude mcp add marksman -- /absolute/path/to/Marksman/target/release/marksman-mcp
 ```
 
-### 4. Register the MCP server with your agent
-Add Marksman to your MCP client's config (Claude Code, Cursor, or any MCP client). Generic form:
+**Any MCP client** (generic form):
 ```json
 {
   "mcpServers": {
     "marksman": {
-      "command": "/absolute/path/to/Marksman/target/release/marksman-mcp",
-      "env": {
-        "CI_MODEL_DIR": "/home/you/.marksman/models/potion-code-16M",
-        "CI_NPM_CACHE": "/tmp/ci-npm-cache"
-      }
+      "command": "/absolute/path/to/Marksman/target/release/marksman-mcp"
     }
   }
 }
 ```
-The server indexes the repo it is launched in (its working directory); or pass `--root /path/to/repo`, or set `MARKSMAN_ROOT`. Build the index once with `marksman index` (step 3) before first use.
+The server indexes the repo it's launched in (its working directory); or pass `--root /path/to/repo`
+or set `MARKSMAN_ROOT`. Run `marksman index` (step 2) once before first use.
 
-For **Claude Code**:
+<details>
+<summary>Offline / air-gapped, or a custom model location</summary>
+
+The model auto-fetches over the network. To place it by hand, drop it at the default path and
+Marksman finds it with no config:
 ```bash
-claude mcp add marksman \
-  --env CI_MODEL_DIR="$HOME/.marksman/models/potion-code-16M" \
-  -- /absolute/path/to/Marksman/target/release/marksman-mcp
+mkdir -p ~/.marksman/models/potion-code-16M
+curl -fL --output-dir ~/.marksman/models/potion-code-16M \
+  -O https://huggingface.co/minishlab/potion-code-16M/resolve/main/model.safetensors \
+  -O https://huggingface.co/minishlab/potion-code-16M/resolve/main/tokenizer.json \
+  -O https://huggingface.co/minishlab/potion-code-16M/resolve/main/config.json
 ```
+To keep it elsewhere, point `CI_MODEL_DIR` at that directory (in the shell for `index`, and in
+the MCP server's `env` block). `CI_NO_MODEL_FETCH=1` disables the auto-download.
+</details>
 
 ## CLI
 
@@ -128,7 +125,8 @@ Environment variables:
 
 | var | meaning | default |
 |---|---|---|
-| `CI_MODEL_DIR` | Model2Vec model directory | **required** (set it) |
+| `CI_MODEL_DIR` | Model2Vec model directory | `~/.marksman/models/potion-code-16M` (auto-downloaded on first use) |
+| `CI_NO_MODEL_FETCH` | set to disable the first-use model download (offline/air-gapped) | unset (fetch enabled) |
 | `CI_NPM_CACHE` | npm cache dir for `npx` (scip / tsserver) | system temp |
 | `CI_TSMORPH_DIR` | where the ts-morph sidecar is installed | `<tmp>/ci-tsmorph` |
 | `CI_EDIT_ENGINE` | force a TS write-engine tier: `tsgo` · `tsmorph` · `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names) | auto: tsgo if local, else ts-morph, else tsls |
