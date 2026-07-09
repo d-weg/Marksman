@@ -77,13 +77,23 @@ impl LspClient {
     /// Spawn a language server (`cmd`, supplied by the language provider — this crate
     /// is language-agnostic and Rust-only) and run the LSP handshake. `root` is the
     /// workspace root used for `rootUri` and document URIs.
-    pub fn start(root: &Path, mut cmd: Command) -> Result<Self> {
-        let mut child = cmd
-            .current_dir(root)
+    /// Start the server on the host. Convenience for `start_in(root, cmd, &HostSandbox)` — the
+    /// path every current caller takes.
+    pub fn start(root: &Path, cmd: Command) -> Result<Self> {
+        Self::start_in(root, cmd, &ci_core::HostSandbox)
+    }
+
+    /// Start the server inside `sandbox`. The server is a resident process the client talks to
+    /// over stdio, so a container backend just execs it in the running container with the same
+    /// pipes — no filesystem crosses the boundary (the reason stdio-protocol engines containerize
+    /// first; see `docs/container-gate-spec.md`).
+    pub fn start_in(root: &Path, mut cmd: Command, sandbox: &dyn ci_core::Sandbox) -> Result<Self> {
+        cmd.current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = sandbox
+            .spawn(&mut cmd)
             .map_err(|e| Error::Driver(format!("spawn language server: {e}")))?;
 
         let stdin = child.stdin.take().ok_or_else(|| Error::Driver("no lsp stdin".into()))?;
