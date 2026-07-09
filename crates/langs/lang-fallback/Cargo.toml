@@ -20,6 +20,12 @@ tree-sitter-java = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-c = "0.24"
 tree-sitter-cpp = "0.23"
+# PHP FULL grammar (LANGUAGE_PHP — handles HTML-interleaved `.php`); links via the shim, no
+# core-pin conflict. 0.24.2 predates PHP 8.5's pipe operator, so its parse failures stay SOFT.
+tree-sitter-php = "0.24.2"
+# Swift grammar (links via the `tree-sitter-language` shim — no core-pin conflict). ABI-14 at
+# core 0.26 is inference, not a doc, so `swift_grammar_loads_at_pinned_abi` is a REQUIRED load test.
+tree-sitter-swift = "0.7.3"
 ignore = "0.4"
 
 [dev-dependencies]

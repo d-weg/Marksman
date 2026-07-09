@@ -4,12 +4,24 @@
 //! the VFS. Rename goes through LSP (all references); structural edits use the
 //! node's `enclosing_range`. No AST: `set_body` and the fine verbs are refused at
 //! Symbol granularity (use `replace_node`).
-use ci_core::{CommitResult, Diag, EditOp, EditOpts, Error, FileSummary, Node, Range, Result};
+use ci_core::{CommitResult, Diag, EditOp, EditOpts, Error, FileSummary, Node, Result};
 use ci_lsp::LspClient;
 use ci_vfs::Vfs;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+mod actions;
+mod apply;
+mod composed;
+pub mod moves;
+
+pub use actions::{action_to_op, Action};
+pub use apply::{apply_delete, apply_structural, leading_symbol_name, workspace_edit_is_empty};
+pub use composed::{Composed, EngineFactory, FreshDeepener, LiveSummarizer, Prewarmer};
+
+use apply::{apply_move, apply_rename};
 
 /// The type-check engine behind the gate. Abstracts over *how* a language computes
 /// diagnostics and cross-file rename/move edits, so the provider can pick the lightest
@@ -47,6 +59,26 @@ pub trait GateEngine {
     fn sync_disk(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// The one prewarm discipline for every provider's warm-engine slot: spawn a background
+/// thread that holds the slot lock for the WHOLE construction + warming call, then parks the
+/// engine in the slot. Holding the lock is the contract — an `apply_edits` arriving mid-warm
+/// blocks on the slot and reuses the warmed engine instead of racing in a second cold one.
+/// No-op if the slot is already warm. `make` constructs the engine and issues its warming
+/// call, returning `None` when the engine can't start (the slot stays empty and the provider
+/// starts one lazily on first use, surfacing the error there).
+pub fn spawn_prewarm<E: Send + 'static>(
+    slot: Arc<Mutex<Option<E>>>,
+    make: impl FnOnce() -> Option<E> + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Ok(mut guard) = slot.lock() else { return };
+        if guard.is_some() {
+            return; // already warm
+        }
+        *guard = make();
+    })
 }
 
 /// LSP request errors that mean "the server is still loading the project" rather than a real
@@ -144,110 +176,6 @@ impl GateEngine for LspClient {
     }
 }
 
-/// Structured rich action payload (the MCP/wrapper input shape):
-/// `{action, target, name, value, old_text?, new_text?}`.
-#[derive(Debug, Clone, Default)]
-pub struct Action {
-    pub path: String,
-    pub action: String,
-    pub target: Option<String>,
-    pub name: Option<String>,
-    pub value: Option<String>,
-    /// For `replace_text`: the exact substring to replace (must be unique within the target node).
-    pub old_text: Option<String>,
-    /// For `replace_text`: its replacement.
-    pub new_text: Option<String>,
-}
-
-/// Map a structured action to an [`EditOp`]. `resolve(path, target, name) -> node_id`
-/// turns target-kind + name addressing into a node id (via the structure tree).
-pub fn action_to_op(
-    a: &Action,
-    resolve: impl Fn(&str, Option<&str>, Option<&str>) -> Option<String>,
-) -> Result<EditOp> {
-    let node = || {
-        resolve(&a.path, a.target.as_deref(), a.name.as_deref())
-            .ok_or_else(|| Error::Anchor(format!("{}#{}", a.path, a.name.clone().unwrap_or_default())))
-    };
-    // The resolved symbol id, optionally NARROWED to a sub-node anchor when `target` names one
-    // (`body` / `return` / `param.N`). For a surgical edit the agent targets a sub-symbol range
-    // — its body or return type or one parameter — instead of re-emitting the whole definition.
-    // An UNRECOGNIZED target is an error, never a silent fallthrough: falling back to the whole
-    // symbol would apply sub-node code (a body, a type) over the entire declaration — a
-    // silently-wrong edit is worse than one clear retry. The narrowed id (`f.ts#foo:body`) is
-    // validated against the structure tree in `apply_structural`.
-    let targeted = || -> Result<String> {
-        let base = node()?;
-        Ok(match a.target.as_deref() {
-            None | Some("") => base,
-            Some("body") => format!("{base}:body"),
-            Some("return") | Some("returnType") => format!("{base}:return"),
-            Some("doc") | Some("comment") | Some("docstring") => format!("{base}:doc"),
-            Some(t) if t.starts_with("param.") && t["param.".len()..].parse::<u32>().is_ok() => {
-                format!("{base}:{t}")
-            }
-            Some(t) => {
-                return Err(Error::Other(format!(
-                    "unknown target {t:?} — use `body`, `return`, `doc`, or `param.N` (0-based), or omit \
-                     `target` to address the whole symbol"
-                )))
-            }
-        })
-    };
-    let value = || a.value.clone().ok_or_else(|| Error::Other(format!("{} needs a value", a.action)));
-    Ok(match a.action.as_str() {
-        "rename" => EditOp::Rename { node_id: node()?, new_name: value()? },
-        "replace_node" => EditOp::ReplaceNode { node_id: targeted()?, code: value()? },
-        // `replace_text` swaps an exact substring INSIDE a node (optionally a sub-node via
-        // `target`) — the cheapest precise edit: the agent sends only old→new, not the whole
-        // body. `old_text` must be unique within the node. Gated like any structural edit.
-        "replace_text" => EditOp::ReplaceText {
-            node_id: targeted()?,
-            old_text: a.old_text.clone().ok_or_else(|| Error::Other("replace_text needs oldText".into()))?,
-            new_text: a.new_text.clone().ok_or_else(|| Error::Other("replace_text needs newText".into()))?,
-        },
-        // `set_body` is sugar for replacing the `:body` anchor — re-draft a function/method body
-        // without retyping its signature. Gated like any other structural edit.
-        "set_body" => EditOp::SetBody { node_id: node()?, body: value()? },
-        "insert_before" => EditOp::InsertBefore { node_id: targeted()?, code: value()? },
-        // Statement-level body edits. `value` is the statement; `oldText` locates a line inside the
-        // body (the `after` anchor for insert; the statement to remove for delete).
-        "insert_in_body" => {
-            EditOp::InsertInBody { node_id: node()?, code: value()?, after: a.old_text.clone() }
-        }
-        "insert_member" => EditOp::InsertMember { node_id: node()?, code: value()? },
-        "delete_in_body" => EditOp::DeleteInBody {
-            node_id: node()?,
-            text: a.old_text.clone().or_else(|| a.value.clone()).ok_or_else(|| {
-                Error::Other("delete_in_body needs oldText (the statement fragment to remove)".into())
-            })?,
-        },
-        // Signature edits at an insertion point (no existing sub-node anchor). `value` is the new
-        // parameter / return type.
-        "add_parameter" => EditOp::AddParameter { node_id: node()?, param: value()? },
-        "set_return_type" => EditOp::SetReturnType { node_id: node()?, ty: value()? },
-        // `add_symbol` appends a NEW top-level declaration at the end of `path` — the intent
-        // "add a function/type/test to this file", which insert_before can't express (it
-        // needs an existing LATER anchor). Addressing is the file; the code carries the name.
-        "add_symbol" => {
-            if a.path.is_empty() {
-                return Err(Error::Other("add_symbol needs `path` (the file to append to)".into()));
-            }
-            EditOp::AddSymbol { path: a.path.clone().into(), code: value()? }
-        }
-        "create_file" => EditOp::CreateFile { path: a.path.clone().into(), code: value()? },
-        "move_file" => EditOp::MoveFile { from: a.path.clone().into(), to: value()?.into() },
-        "delete_file" => EditOp::DeleteFile { path: a.path.clone().into() },
-        other => {
-            return Err(Error::Driver(format!(
-                "unsupported action {other:?} — valid actions: rename, replace_text, replace_node, set_body, \
-                 insert_in_body, delete_in_body, insert_member, add_parameter, set_return_type, insert_before, \
-                 add_symbol, move_file, create_file, delete_file"
-            )))
-        }
-    })
-}
-
 /// Find a node id by name within a file's structure (first match).
 pub fn resolve_in(nodes: &[Node], name: &str) -> Option<String> {
     fn rec<'a>(nodes: &'a [Node], name: &str) -> Option<&'a Node> {
@@ -284,7 +212,7 @@ pub fn resolve_all_in(nodes: &[Node], name: &str) -> Vec<String> {
     out
 }
 
-fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
+pub(crate) fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
     for n in nodes {
         if n.id == id {
             return Some(n);
@@ -296,14 +224,7 @@ fn find<'a>(nodes: &'a [Node], id: &str) -> Option<&'a Node> {
     None
 }
 
-/// Resolve a node id to its structure node (owned), or an `Anchor` error naming the id. The
-/// structure tree is rebuilt per call (`structure_of`), so the returned `Node` is cloned out.
-fn node_by_id(node_id: &str, structure_of: &impl Fn(&str) -> Vec<Node>) -> Result<Node> {
-    let nodes = structure_of(file_of(node_id));
-    find(&nodes, node_id).cloned().ok_or_else(|| Error::Anchor(node_id.to_string()))
-}
-
-fn file_of(node_id: &str) -> &str {
+pub(crate) fn file_of(node_id: &str) -> &str {
     node_id.split('#').next().unwrap_or(node_id)
 }
 
@@ -368,43 +289,6 @@ fn ensure_within_root(root: &Path, rel: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// The name declared by a snippet's LEADING declaration line — best-effort, cross-language
-/// (declaration keywords share a shape: modifiers, keyword, name). Used by `add_symbol` for
-/// the exists-check and by the MCP layer for the post-edit echo id; `None` just means "no
-/// pre-check" (the gate still judges the result), so unsure is safe.
-pub fn leading_symbol_name(snippet: &str) -> Option<String> {
-    let line = snippet.lines().find(|l| {
-        let t = l.trim();
-        !(t.is_empty()
-            || t.starts_with("//")
-            || t.starts_with("/*")
-            || t.starts_with('*')
-            || t.starts_with("#[")   // Rust attribute (#[test], #[derive(..)])
-            || t.starts_with('@'))   // TS/Java decorator, Python decorator
-    })?;
-    let mut toks = line.split_whitespace();
-    let kw = loop {
-        let t = toks.next()?;
-        match t {
-            "pub" | "export" | "default" | "async" | "unsafe" | "abstract" | "declare" | "static"
-            | "final" | "public" | "private" | "protected" => continue,
-            t if t.starts_with("pub(") => continue, // pub(crate) / pub(super)
-            t => break t,
-        }
-    };
-    match kw {
-        "fn" | "function" | "struct" | "enum" | "trait" | "interface" | "type" | "class" | "const"
-        | "let" | "var" | "def" | "mod" | "union" => {}
-        _ => return None, // impl blocks, expressions, anything we can't name — no pre-check
-    }
-    let raw = toks.next()?;
-    let name: String = raw
-        .chars()
-        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
-        .collect();
-    (!name.is_empty()).then_some(name)
 }
 
 /// Whether `op` targets `rel` (any of its paths) — used by providers to detect that a batch
@@ -567,536 +451,6 @@ fn rewrite_receipt(root: &Path, changed: &[String], vfs: &Vfs, created: &HashSet
         out.push(format!("  … and {} more file(s)", changed.len() - 8));
     }
     out.join("\n")
-}
-
-/// Apply a structural (non-rename) op to the VFS using the node's range.
-pub fn apply_structural(
-    vfs: &mut Vfs,
-    op: &EditOp,
-    structure_of: &impl Fn(&str) -> Vec<Node>,
-) -> Result<()> {
-    match op {
-        EditOp::ReplaceNode { node_id, code } => {
-            let node = node_by_id(node_id, structure_of)?;
-            vfs.replace_range(Path::new(file_of(node_id)), &node.range, code)
-        }
-        EditOp::InsertBefore { node_id, code } => {
-            let node = node_by_id(node_id, structure_of)?;
-            vfs.insert_before(Path::new(file_of(node_id)), &node.range, &format!("{code}\n\n"))
-        }
-        EditOp::ReplaceInFile { path, old_text, new_text } => {
-            // File-scoped: the escape hatch for text OUTSIDE every symbol anchor (imports,
-            // `mod` declarations). Uniqueness in the whole file is the addressing; the gate
-            // still verifies the result like any other op.
-            let rel = path.to_string_lossy().replace('\\', "/");
-            let content = vfs
-                .read(Path::new(&rel))
-                .ok_or_else(|| Error::Other(format!("replace_in_file: {rel} does not exist")))?;
-            match content.matches(old_text.as_str()).count() {
-                1 => {
-                    vfs.write(Path::new(&rel), content.replacen(old_text.as_str(), new_text, 1));
-                    Ok(())
-                }
-                0 if !new_text.is_empty() && content.contains(new_text.as_str()) => {
-                    // The batch already produced this op's end state (a move's own rewrite
-                    // covered it). Same-intent redundancy is SATISFIED, not an error — agents
-                    // pair moves with helper edits, and rejecting the pair over our own
-                    // automation cost whole bench runs (move-rust rounds 3 and 4).
-                    Ok(())
-                }
-                0 => Err(Error::Other(format!(
-                    "replace_in_file: oldText not found in {rel} — it must match the file's current text exactly"
-                ))),
-                n => Err(Error::Other(format!(
-                    "replace_in_file: oldText occurs {n} times in {rel} — extend it until it is unique"
-                ))),
-            }
-        }
-        EditOp::ReplaceText { node_id, old_text, new_text } => {
-            let file = file_of(node_id);
-            let node = node_by_id(node_id, structure_of)?;
-            let text = vfs.read_range(Path::new(file), &node.range).ok_or_else(|| {
-                Error::Other(format!(
-                    "cannot read the text of '{node_id}' (its file is missing or was deleted/moved                      earlier in this batch) — re-target the op at the file's NEW path, or drop it                      if a rename/move already covers this edit"
-                ))
-            })?;
-            match text.matches(old_text.as_str()).count() {
-                0 if !new_text.is_empty() && text.contains(new_text.as_str()) => {
-                    // End state already present (a rename/move's own rewrite got here first) —
-                    // satisfied, not a miss.
-                    return Ok(());
-                }
-                // Echo the node's ACTUAL text so the agent can fix oldText in one retry instead
-                // of spiraling into read_node/Read calls to discover what it should have been.
-                0 => {
-                    return Err(Error::Other(format!(
-                        "REPLACE_TEXT: oldText {old_text:?} not found in node '{node_id}'. Its current text is:\n{text}"
-                    )))
-                }
-                1 => {}
-                _ => {
-                    return Err(Error::Other(format!(
-                        "REPLACE_TEXT: oldText {old_text:?} is not unique in node '{node_id}' — include more surrounding text to disambiguate."
-                    )))
-                }
-            }
-            vfs.replace_range(Path::new(file), &node.range, &text.replacen(old_text, new_text, 1))
-        }
-        EditOp::CreateFile { path, code } => vfs.create(path, code.clone()),
-        // Append a NEW top-level symbol at the end of the file. Hygiene is server-side: one
-        // blank line after the last item, trailing newline ensured, code trimmed (top-level ⇒
-        // zero indent by definition). Already-present code is SATISFIED (idempotent, counted
-        // as a redundant op); a same-named top-level symbol with DIFFERENT content refuses
-        // with that symbol's current source — mechanically important for UNGATED languages,
-        // where a silent redefinition would shadow instead of failing the gate.
-        EditOp::AddSymbol { path, code } => {
-            let rel = path.to_string_lossy().replace('\\', "/");
-            let content = vfs.read(Path::new(&rel)).ok_or_else(|| {
-                Error::Other(format!("ADD_SYMBOL: {rel} does not exist — use create_file for a new file"))
-            })?;
-            let snippet = code.trim();
-            if snippet.is_empty() {
-                return Err(Error::Other("ADD_SYMBOL: `value` is empty — send the complete new declaration".into()));
-            }
-            if content.contains(snippet) {
-                return Ok(()); // end state already present — satisfied, not an error
-            }
-            if let Some(name) = leading_symbol_name(snippet) {
-                let nodes = structure_of(&rel);
-                if let Some(n) = nodes.iter().find(|n| n.name.as_deref() == Some(name.as_str())) {
-                    let existing = vfs.read_range(Path::new(&rel), &n.range).unwrap_or_default();
-                    return Err(Error::Other(format!(
-                        "ADD_SYMBOL: `{name}` already exists in {rel} (L{}-{}) — use replace_node on `{}` to change it, or pick a different name. Its current source:\n{existing}",
-                        n.range.start_line, n.range.end_line, n.id
-                    )));
-                }
-            }
-            let new_content = if content.trim().is_empty() {
-                format!("{snippet}\n")
-            } else {
-                format!("{}\n\n{snippet}\n", content.trim_end())
-            };
-            vfs.write(Path::new(&rel), new_content);
-            Ok(())
-        }
-        EditOp::SetBody { node_id, body } => {
-            // Replace just the function/method `:body` anchor (the `{ … }` block), keeping the
-            // signature. Requires AST granularity (the body sub-node must exist in `structure()`).
-            let file = file_of(node_id);
-            let nodes = structure_of(file);
-            let body_id = format!("{node_id}:body");
-            let node = find(&nodes, &body_id).ok_or_else(|| {
-                Error::Anchor(format!(
-                    "{body_id} — no body anchor (symbol has no editable body, or this provider lacks AST granularity; use replace_node)"
-                ))
-            })?;
-            vfs.replace_range(Path::new(file), &node.range, body)
-        }
-        // Statement-level body edits: transform the `:body` sub-node's text and write it back. Pure
-        // string surgery on the block, so it's language-generic (braces or a Python suite alike).
-        EditOp::InsertInBody { node_id, code, after } => {
-            let file = file_of(node_id);
-            let range = subnode_range(node_id, "body", structure_of, "no editable body")?;
-            let text = vfs
-                .read_range(Path::new(file), &range)
-                .ok_or_else(|| Error::Other("body text unavailable".into()))?;
-            // A Python-suite body starts mid-indent, so its first line's indentation isn't in the
-            // text; the body's start column supplies it. (Brace bodies keep indents in the text.)
-            let base_indent = " ".repeat(range.start_char as usize);
-            let new_body = insert_stmt_in_body(&text, code, after.as_deref(), &base_indent)?;
-            vfs.replace_range(Path::new(file), &range, &new_body)
-        }
-        EditOp::DeleteInBody { node_id, text: needle } => {
-            let file = file_of(node_id);
-            let range = subnode_range(node_id, "body", structure_of, "no editable body")?;
-            let text = vfs
-                .read_range(Path::new(file), &range)
-                .ok_or_else(|| Error::Other("body text unavailable".into()))?;
-            let new_body = delete_stmt_in_body(&text, needle)?;
-            vfs.replace_range(Path::new(file), &range, &new_body)
-        }
-        // Insert a member at the TOP of the container's `{ … }` block (interface field, class
-        // member, object property). Works off the container node's own text — no `:body` sub-node
-        // needed, so it targets a plain interface/type/class/object symbol directly. Landing first
-        // (right after `{`) means our member carries its own separator and never needs the PRIOR
-        // item to gain a trailing comma, so it stays valid for both `;`-separated interface members
-        // and `,`-separated object properties. The type-check gate verifies the result.
-        EditOp::InsertMember { node_id, code } => {
-            let file = file_of(node_id);
-            let node = node_by_id(node_id, structure_of)?;
-            let text = vfs.read_range(Path::new(file), &node.range).ok_or_else(|| {
-                Error::Other(format!(
-                    "cannot read the text of '{node_id}' (its file is missing or was deleted/moved                      earlier in this batch) — re-target the op at the file's NEW path, or drop it                      if a rename/move already covers this edit"
-                ))
-            })?;
-            let open = block_open(&text).ok_or_else(|| {
-                Error::Other(format!("INSERT_MEMBER: node '{node_id}' has no `{{ … }}` block to insert into"))
-            })?;
-            let member_indent = format!("{}  ", " ".repeat(node.range.start_char as usize));
-            let (head, tail) = text.split_at(open + 1); // just past the opening brace
-            let new_text = format!("{head}\n{member_indent}{}{tail}", code.trim());
-            vfs.replace_range(Path::new(file), &node.range, &new_text)
-        }
-        // Append a parameter: rewrite the `:params` `(...)` list, inserting before the `)`.
-        EditOp::AddParameter { node_id, param } => {
-            let file = file_of(node_id);
-            let range = subnode_range(node_id, "params", structure_of, "no parameter list")?;
-            let text = vfs
-                .read_range(Path::new(file), &range)
-                .ok_or_else(|| Error::Other("parameter list text unavailable".into()))?;
-            vfs.replace_range(Path::new(file), &range, &insert_param(&text, param)?)
-        }
-        // Add a return type where none exists, at the language's insertion point (right after the
-        // `)`). If one already exists we refuse — the agent should replace_node target:return.
-        EditOp::SetReturnType { node_id, ty } => {
-            let file = file_of(node_id);
-            let nodes = structure_of(file);
-            if find(&nodes, &format!("{node_id}:return")).is_some() {
-                return Err(Error::Other(format!(
-                    "SET_RETURN_TYPE: '{node_id}' already has a return type — use replace_node target:return to change it"
-                )));
-            }
-            let params = find(&nodes, &format!("{node_id}:params"))
-                .ok_or_else(|| Error::Anchor(format!("{node_id}:params — no parameter list to anchor a return type after")))?;
-            // Insert at the params' end position (immediately after `)`).
-            let at = Range {
-                start_line: params.range.end_line,
-                start_char: params.range.end_char,
-                end_line: params.range.end_line,
-                end_char: params.range.end_char,
-            };
-            vfs.insert_before(Path::new(file), &at, &format!("{}{ty}", return_delim(file)))
-        }
-        EditOp::MoveFile { .. } | EditOp::DeleteFile { .. } => {
-            Err(Error::Driver("file ops (move/delete) land in P3".into()))
-        }
-        EditOp::Rename { .. } => Err(Error::Driver("rename must go through apply_rename".into())),
-    }
-}
-
-/// Byte index of the block-opening `{` in a container's text — the first `{` that isn't inside a
-/// generic `<…>` or a parameter `(…)`, so `interface Foo extends Bar<{ x }> {` finds the BODY
-/// brace, not the one in the type argument. `None` if there's no such brace (e.g. a `type X = number`
-/// alias with no block). Braces inside strings/comments are a theoretical edge the gate would catch.
-fn block_open(text: &str) -> Option<usize> {
-    let (mut angle, mut paren) = (0i32, 0i32);
-    for (i, c) in text.char_indices() {
-        match c {
-            '<' => angle += 1,
-            '>' if angle > 0 => angle -= 1,
-            '(' => paren += 1,
-            ')' if paren > 0 => paren -= 1,
-            '{' if angle == 0 && paren == 0 => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Resolve `{node_id}:{sub}` to its range, or an `Anchor` error carrying `why` (the symbol lacks
-/// that sub-node — no body/params, or the provider has no AST granularity).
-fn subnode_range(
-    node_id: &str,
-    sub: &str,
-    structure_of: &impl Fn(&str) -> Vec<Node>,
-    why: &str,
-) -> Result<Range> {
-    let nodes = structure_of(file_of(node_id));
-    let sub_id = format!("{node_id}:{sub}");
-    find(&nodes, &sub_id).map(|n| n.range.clone()).ok_or_else(|| {
-        Error::Anchor(format!(
-            "{sub_id} — {why} (symbol has no {sub} anchor, or this provider lacks AST granularity)"
-        ))
-    })
-}
-
-/// The leading whitespace (indent) of a line.
-fn indent_of(line: &str) -> String {
-    line.chars().take_while(|c| *c == ' ' || *c == '\t').collect()
-}
-
-/// Prefix every non-empty line of `code` with `indent`, preserving its own relative indentation —
-/// so a single- or multi-line insert aligns with the statements around it.
-fn reindent(code: &str, indent: &str) -> String {
-    code.split('\n')
-        .map(|l| if l.is_empty() { String::new() } else { format!("{indent}{l}") })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Insert `code` as a statement inside a body block's text. With `after`, it lands on the line
-/// after the unique line containing that fragment; without it, at the end of the body — before a
-/// trailing lone `}` for brace languages, else after the last statement (Python suite). A line
-/// whose leading whitespace isn't in the text (a suite's first line) falls back to `base_indent`.
-fn insert_stmt_in_body(body: &str, code: &str, after: Option<&str>, base_indent: &str) -> Result<String> {
-    // The indentation to align an insert with `line`, falling back to `base_indent` when the line
-    // carries none in the text (the first statement of a Python suite).
-    let line_indent = |line: &str| {
-        let i = indent_of(line);
-        if i.is_empty() { base_indent.to_string() } else { i }
-    };
-    let mut lines: Vec<String> = body.split('\n').map(String::from).collect();
-    if let Some(anchor) = after {
-        let hits: Vec<usize> =
-            lines.iter().enumerate().filter(|(_, l)| l.contains(anchor)).map(|(i, _)| i).collect();
-        if hits.len() != 1 {
-            return Err(Error::Other(format!(
-                "INSERT_IN_BODY: `after` {anchor:?} {} the body — give an exact, unique line fragment",
-                if hits.is_empty() { "was not found in" } else { "is not unique in" }
-            )));
-        }
-        let i = hits[0];
-        let indent = line_indent(&lines[i]);
-        lines.insert(i + 1, reindent(code, &indent));
-        return Ok(lines.join("\n"));
-    }
-    match lines.iter().rposition(|l| !l.trim().is_empty()) {
-        None => Ok(code.to_string()), // empty body — insert as-is
-        Some(i) if lines[i].trim() == "}" => {
-            // Insert before the closing brace, matching a sibling statement's indent (else one
-            // level past the brace).
-            let sib = lines[..i].iter().rev().find(|l| !l.trim().is_empty()).map(|l| line_indent(l));
-            let indent = sib.unwrap_or_else(|| format!("{}    ", indent_of(&lines[i])));
-            lines.insert(i, reindent(code, &indent));
-            Ok(lines.join("\n"))
-        }
-        Some(i) => {
-            let indent = line_indent(&lines[i]);
-            lines.insert(i + 1, reindent(code, &indent));
-            Ok(lines.join("\n"))
-        }
-    }
-}
-
-/// Delete the unique statement line containing `needle` from a body block's text.
-fn delete_stmt_in_body(body: &str, needle: &str) -> Result<String> {
-    let lines: Vec<String> = body.split('\n').map(String::from).collect();
-    let hits: Vec<usize> =
-        lines.iter().enumerate().filter(|(_, l)| l.contains(needle)).map(|(i, _)| i).collect();
-    if hits.len() != 1 {
-        return Err(Error::Other(format!(
-            "DELETE_IN_BODY: {needle:?} {} the body — give an exact, unique line fragment",
-            if hits.is_empty() { "was not found in" } else { "is not unique in" }
-        )));
-    }
-    let drop = hits[0];
-    Ok(lines.into_iter().enumerate().filter(|(j, _)| *j != drop).map(|(_, l)| l).collect::<Vec<_>>().join("\n"))
-}
-
-/// Insert `param` into a `(...)` parameter-list text, before the closing `)`, prefixing `, ` when
-/// the list already has parameters.
-fn insert_param(params: &str, param: &str) -> Result<String> {
-    let open = params.find('(').ok_or_else(|| Error::Other("ADD_PARAMETER: no '(' in the parameter list".into()))?;
-    let close = params.rfind(')').ok_or_else(|| Error::Other("ADD_PARAMETER: no ')' in the parameter list".into()))?;
-    if close < open {
-        return Err(Error::Other("ADD_PARAMETER: malformed parameter list".into()));
-    }
-    let sep = if params[open + 1..close].trim().is_empty() { "" } else { ", " };
-    Ok(format!("{}{sep}{param}{}", &params[..close], &params[close..]))
-}
-
-/// The return-type delimiter for a file's language: `-> T` for Rust/Python, `: T` for TS.
-fn return_delim(file: &str) -> &'static str {
-    if file.ends_with(".rs") || file.ends_with(".py") || file.ends_with(".pyi") {
-        " -> "
-    } else {
-        ": "
-    }
-}
-
-/// Apply a rename through the gate engine at the symbol's name position, then apply the
-/// returned WorkspaceEdit to the VFS (all references). Engine handles its own warmup.
-fn apply_rename(
-    vfs: &mut Vfs,
-    node_id: &str,
-    new_name: &str,
-    root: &Path,
-    structure_of: &impl Fn(&str) -> Vec<Node>,
-    engine: &mut dyn GateEngine,
-) -> Result<()> {
-    let file = file_of(node_id);
-    let nodes = structure_of(file);
-    let node = find(&nodes, node_id).ok_or_else(|| Error::Anchor(node_id.to_string()))?;
-    let nr = node.name_range.as_ref().unwrap_or(&node.range);
-    let we = engine.rename(file, nr.start_line.saturating_sub(1), nr.start_char, new_name)?;
-    // A rename always rewrites at least its own definition. Zero edits means the position
-    // didn't resolve to a renameable symbol — fail loudly instead of silently reporting "no
-    // changes," which (with apply_edits' "this is complete, don't verify" message) would let
-    // the agent ship a rename that did nothing.
-    if workspace_edit_is_empty(&we) {
-        return Err(Error::Driver(format!(
-            "rename produced no edits — '{node_id}' did not resolve to a renameable symbol; nothing was changed"
-        )));
-    }
-    apply_workspace_edit(vfs, root, &we)
-}
-
-/// True when a WorkspaceEdit carries no actual text edits (empty `documentChanges`/`changes`).
-fn workspace_edit_is_empty(we: &Value) -> bool {
-    let nonempty = |edits: Option<&Vec<Value>>| edits.is_some_and(|e| !e.is_empty());
-    if let Some(dc) = we.get("documentChanges").and_then(Value::as_array) {
-        return !dc.iter().any(|d| nonempty(d.get("edits").and_then(Value::as_array)));
-    }
-    if let Some(ch) = we.get("changes").and_then(Value::as_object) {
-        return !ch.values().any(|e| nonempty(e.as_array()));
-    }
-    true
-}
-
-/// Move a file: ask the engine to compute importer rewrites (`willRename`), apply them to
-/// the VFS, then move the file. If the engine can't compute them, the move still proceeds
-/// (the blast-radius gate catches any breakage).
-fn apply_move(vfs: &mut Vfs, from: &Path, to: &Path, root: &Path, engine: &mut dyn GateEngine) -> Result<()> {
-    let from_rel = from.to_string_lossy().replace('\\', "/");
-    let to_rel = to.to_string_lossy().replace('\\', "/");
-    let t_wr = std::time::Instant::now();
-    if let Ok(we) = engine.will_rename(&from_rel, &to_rel) {
-        if std::env::var("CI_TIMING").is_ok() {
-            eprintln!("[timing]   will_rename() {:?}", t_wr.elapsed());
-        }
-        if std::env::var("CI_LSP_DEBUG").is_ok() {
-            eprintln!("willRename -> {we}");
-        }
-        let _ = apply_workspace_edit(vfs, root, &we);
-    }
-    vfs.move_file(from, to)
-}
-
-/// An import/use/mod/require line referencing module token `stem` — the shape those
-/// statements share across languages. Best-effort by design: the gate (deleted-reference
-/// diagnostics + the compiler over the radius) is the net behind this fast-path guard.
-fn is_import_line_for(line: &str, stem: &str) -> bool {
-    let t = line.trim();
-    (t.starts_with("use ") || t.starts_with("pub use ") || t.starts_with("import ")
-        || t.starts_with("from ") || t.starts_with("mod ") || t.starts_with("pub mod ")
-        || t.contains("require("))
-        && t.contains(stem)
-}
-
-/// Delete a file — refused (statically, via the SCIP reverse import graph) if
-/// anything still imports it. The refusal is SELF-SUFFICIENT (the §5 law): each importer's
-/// referencing line is shown with a ready-to-copy removal fix, so clearing the way is one
-/// re-issued batch (fixes first, delete LAST) instead of a read-and-hunt per importer.
-pub fn apply_delete(
-    vfs: &mut Vfs,
-    path: &Path,
-    reverse_imports: &impl Fn(&str) -> Vec<String>,
-) -> Result<()> {
-    let rel = path.to_string_lossy().replace('\\', "/");
-    let stem = Path::new(&rel).file_stem().and_then(|s| s.to_str()).unwrap_or(&rel).to_string();
-    // The graph is PRE-BATCH truth; the refusal's own recipe is "fixes + delete LAST in one
-    // batch", so an importer this batch already edited is judged by its STAGED content: no
-    // referencing line left ⇒ cleared. Untouched importers stay blocking even when no line
-    // matches (the stem heuristic is best-effort; unmatched means "inspect", not "clean").
-    let importers: Vec<String> = reverse_imports(&rel)
-        .into_iter()
-        .filter(|imp| {
-            if !vfs.is_staged(Path::new(imp)) {
-                return true;
-            }
-            match vfs.read(Path::new(imp)) {
-                Some(content) => content.lines().any(|l| is_import_line_for(l, &stem)),
-                None => false, // importer itself deleted earlier in this batch
-            }
-        })
-        .collect();
-    if !importers.is_empty() {
-        // The referencing lines, each with a ready-to-copy removal fix. An importer with no
-        // matched line is still named (the agent inspects that one).
-        let mut lines_out: Vec<String> = Vec::new();
-        for imp in importers.iter().take(10) {
-            let mut found = false;
-            if let Some(content) = vfs.read(Path::new(imp)) {
-                for (i, line) in content.lines().enumerate() {
-                    if is_import_line_for(line, &stem) {
-                        found = true;
-                        lines_out.push(format!("  {imp}:{}: {}", i + 1, line.trim()));
-                        lines_out.push(format!(
-                            "    fix (ready to copy): {}",
-                            serde_json::json!({"action":"replace_text","path":imp,"oldText":line.trim_end(),"newText":""})
-                        ));
-                    }
-                }
-            }
-            if !found {
-                lines_out.push(format!("  {imp}: (references it — no single import line matched; inspect this one)"));
-            }
-        }
-        return Err(Error::Driver(format!(
-            "DELETE_FILE refused: {rel} is still imported by {} file(s). Remove the references first — \
-             re-issue ONE batch with each `fix` VERBATIM plus the delete_file LAST:\n{}",
-            importers.len(),
-            lines_out.join("\n")
-        )));
-    }
-    vfs.delete(path);
-    Ok(())
-}
-
-fn apply_workspace_edit(vfs: &mut Vfs, root: &Path, we: &Value) -> Result<()> {
-    let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
-    if let Some(dc) = we.get("documentChanges").and_then(Value::as_array) {
-        for d in dc {
-            // LSP resource operations: `documentChanges` may mix CreateFile ops with text
-            // edits (ordered — a created file's content edit follows its create op).
-            if d.get("kind").and_then(Value::as_str) == Some("create") {
-                if let Some(uri) = d.get("uri").and_then(Value::as_str) {
-                    let rel = uri_to_rel(uri, root)
-                        .ok_or_else(|| Error::Other(format!("create uri outside root: {uri}")))?;
-                    vfs.create(Path::new(&rel), String::new())?;
-                }
-                continue;
-            }
-            if let (Some(uri), Some(edits)) = (
-                d.get("textDocument").and_then(|t| t.get("uri")).and_then(Value::as_str),
-                d.get("edits").and_then(Value::as_array),
-            ) {
-                groups.push((uri.to_string(), edits.clone()));
-            }
-        }
-    } else if let Some(changes) = we.get("changes").and_then(Value::as_object) {
-        for (uri, edits) in changes {
-            if let Some(arr) = edits.as_array() {
-                groups.push((uri.clone(), arr.clone()));
-            }
-        }
-    }
-
-    for (uri, mut edits) in groups {
-        let rel = uri_to_rel(&uri, root).ok_or_else(|| Error::Other(format!("uri outside root: {uri}")))?;
-        // Descending by start so earlier edits don't shift later offsets.
-        edits.sort_by_key(|e| std::cmp::Reverse(edit_start(e)));
-        for e in &edits {
-            let range = lsp_range(e.get("range"))?;
-            let new_text = e.get("newText").and_then(Value::as_str).unwrap_or("");
-            vfs.replace_range(Path::new(&rel), &range, new_text)?;
-        }
-    }
-    Ok(())
-}
-
-fn edit_start(e: &Value) -> (i64, i64) {
-    let s = e.get("range").and_then(|r| r.get("start"));
-    (
-        s.and_then(|x| x.get("line")).and_then(Value::as_i64).unwrap_or(0),
-        s.and_then(|x| x.get("character")).and_then(Value::as_i64).unwrap_or(0),
-    )
-}
-
-fn lsp_range(r: Option<&Value>) -> Result<Range> {
-    let r = r.ok_or_else(|| Error::Other("edit range missing".into()))?;
-    let g = |k: &str, f: &str| r.get(k).and_then(|x| x.get(f)).and_then(Value::as_i64).unwrap_or(0) as u32;
-    Ok(Range {
-        start_line: g("start", "line") + 1,
-        start_char: g("start", "character"),
-        end_line: g("end", "line") + 1,
-        end_char: g("end", "character"),
-    })
-}
-
-fn uri_to_rel(uri: &str, root: &Path) -> Option<String> {
-    let prefix = format!("file://{}/", root.to_string_lossy());
-    uri.strip_prefix(&prefix).map(str::to_string)
 }
 
 /// Apply `ops` atomically behind the LSP type-check gate. On any NEW diagnostic
@@ -1492,231 +846,11 @@ pub fn commit_edits(
     Ok(CommitResult::Ok { applied_ops: ops.len(), changed_files: changed, repair_rounds: 0, preexisting_in_radius: preexisting, redundant_ops, rewrite_summary })
 }
 
-// ── Composed: ReadIndex × GateEngine = LanguageProvider ─────────────────────────────────────
-
-/// Builds the write engine on first use (lazily / off-thread via `prewarm`).
-pub type EngineFactory = std::sync::Arc<dyn Fn(&Path) -> Result<Box<dyn GateEngine + Send>> + Send + Sync>;
-
-/// A [`LanguageProvider`] assembled from its two halves: a [`ReadIndex`] (the artifact or
-/// live parser the agent PLANS against) and a [`GateEngine`] (the checker its edits run
-/// through). The halves talk over exactly three channels, and the wiring POLICY is derived
-/// from the reader's advertised properties instead of hand-wired per language:
-///
-/// 1. **radius** (read -> engine): the reverse-import set fed to [`commit_edits`] — one hop
-///    when [`ReadIndex::semantic_edges`] (compiler-accurate graphs flatten barrels),
-///    transitive otherwise (bench T9: a syntactic one-hop radius lets a barrel hide its
-///    consumers).
-/// 2. **freshness** (engine -> read): after a committed edit, artifact readers get overrides
-///    from `GateEngine::file_summaries` so reads track the commit until the next reindex;
-///    [`ReadIndex::live`] readers skip this — they re-parse current disk by construction.
-/// 3. **anchors**: edit ops resolve against the read structure the agent actually saw.
-use ci_core::{Granularity, ImportGraph, LanguageProvider, ReadIndex};
-use std::sync::{Arc, Mutex};
-
-/// Live re-description of one repo-relative file (current-disk symbols + imports) for
-/// artifact readers whose ENGINE can't provide `file_summaries` — e.g. a tree-sitter parse.
-pub type LiveSummarizer = Arc<dyn Fn(&str) -> Option<FileSummary> + Send + Sync>;
-
-pub struct Composed<R: ReadIndex> {
-    root: PathBuf,
-    read: R,
-    engine_factory: EngineFactory,
-    engine: Arc<Mutex<Option<Box<dyn GateEngine + Send>>>>,
-    fresh: Arc<Mutex<HashMap<String, FileSummary>>>,
-    live_summarizer: Option<LiveSummarizer>,
-}
-
-impl<R: ReadIndex> Composed<R> {
-    pub fn new(root: &Path, read: R, engine_factory: EngineFactory) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            read,
-            engine_factory,
-            engine: Arc::new(Mutex::new(None)),
-            fresh: Arc::new(Mutex::new(HashMap::new())),
-            live_summarizer: None,
-        }
-    }
-
-    /// The freshness fallback for artifact readers: when the engine returns no
-    /// `file_summaries` (LSP engines), re-describe committed files with this instead of
-    /// letting reads lag until the next reindex. Irrelevant for `live()` readers.
-    pub fn with_live_summarizer(mut self, s: LiveSummarizer) -> Self {
-        self.live_summarizer = Some(s);
-        self
-    }
-
-    /// Repo-relative posix key — callers pass relative OR absolute paths; the fresh map
-    /// must not miss an override because of the spelling.
-    fn rel(&self, file: &Path) -> String {
-        let p = if file.is_absolute() { file.strip_prefix(&self.root).unwrap_or(file) } else { file };
-        p.to_string_lossy().replace('\\', "/")
-    }
-}
-
-impl<R: ReadIndex> LanguageProvider for Composed<R> {
-    fn granularity(&self) -> Granularity {
-        self.read.granularity()
-    }
-
-    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        if !self.read.live() {
-            if let Ok(m) = self.fresh.lock() {
-                if let Some(s) = m.get(&self.rel(file)) {
-                    return Ok(if s.deleted { vec![] } else { s.nodes.clone() });
-                }
-            }
-        }
-        self.read.structure(file)
-    }
-
-    fn import_graph(&self) -> Result<ImportGraph> {
-        let mut g = self.read.import_graph()?;
-        if !self.read.live() {
-            if let Ok(m) = self.fresh.lock() {
-                for s in m.values() {
-                    let key = PathBuf::from(&s.path);
-                    if s.deleted || s.imports.is_empty() {
-                        g.remove(&key);
-                    } else {
-                        g.insert(key, s.imports.clone());
-                    }
-                }
-            }
-        }
-        Ok(g)
-    }
-
-    fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let factory = self.engine_factory.clone();
-        let root = self.root.clone();
-        std::thread::spawn(move || {
-            let Ok(mut guard) = slot.lock() else { return };
-            if guard.is_some() {
-                return;
-            }
-            if let Ok(mut engine) = factory(&root) {
-                let _ = engine.diagnostics(&[]);
-                *guard = Some(engine);
-            }
-        });
-    }
-
-    fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some((self.engine_factory)(&self.root)?);
-        }
-        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
-
-        let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
-        // Channel 1 — radius policy from the reader's edge semantics.
-        let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
-        let semantic = self.read.semantic_edges();
-        let reverse_imports = |file: &str| {
-            if semantic {
-                reverse.get(file).cloned().unwrap_or_default()
-            } else {
-                ci_core::transitive_reverse_imports(&reverse, file)
-            }
-        };
-        let r = commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
-
-        // Channel 2 — freshness push-back, artifact readers only (best-effort: a refresh
-        // hiccup must never fail an already-committed edit; reads then lag until reindex).
-        if !self.read.live() {
-            if let Ok(CommitResult::Ok { changed_files, .. }) = &r {
-                if opts.write && !opts.dry_run && !changed_files.is_empty() {
-                    let rels: Vec<String> =
-                        changed_files.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
-                    match engine.file_summaries(&rels) {
-                        Ok(Some(summaries)) => {
-                            if let Ok(mut m) = self.fresh.lock() {
-                                for s in summaries {
-                                    m.insert(s.path.clone(), s);
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            // Engine can't re-describe (LSP engines): use the recipe's live
-                            // summarizer if it has one; else reads lag until the next reindex.
-                            if let Some(summarize) = &self.live_summarizer {
-                                if let Ok(mut m) = self.fresh.lock() {
-                                    for rel in &rels {
-                                        if let Some(s) = summarize(rel) {
-                                            m.insert(rel.clone(), s);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => eprintln!("[composed] post-edit read refresh failed ({e}); reads lag until reindex"),
-                    }
-                }
-            }
-        }
-        r
-    }
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod testutil {
+    use ci_core::{Node, NodeKind, Range, SymbolKind};
 
-    // The delete refusal must be self-sufficient: each importer's referencing line + a
-    // ready-to-copy removal fix, so clearing the way is ONE re-issued batch.
-    #[test]
-    fn delete_refusal_carries_copyable_removal_fixes() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/gone.rs"), "pub fn g() {}\n").unwrap();
-        std::fs::write(root.join("src/user.rs"), "use crate::gone::g;\npub fn u() { g() }\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let rev = |f: &str| if f == "src/gone.rs" { vec!["src/user.rs".to_string()] } else { vec![] };
-        let err = apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).unwrap_err().to_string();
-        assert!(err.contains("src/user.rs:1: use crate::gone::g;"), "line shown: {err}");
-        assert!(err.contains("fix (ready to copy)") && err.contains("\"oldText\":\"use crate::gone::g;\""), "fix carried: {err}");
-        assert!(err.contains("delete_file LAST"), "batch guidance: {err}");
-    }
-
-    // The refusal's recipe must actually work: an importer whose referencing line was removed
-    // by an EARLIER op in the same batch is cleared (judged by staged content, not the
-    // pre-batch graph) — while an importer the batch never touched stays blocking, even when
-    // no line matches the stem heuristic.
-    #[test]
-    fn delete_clears_when_the_batch_already_removed_the_references() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/gone.rs"), "pub fn g() {}\n").unwrap();
-        std::fs::write(root.join("src/user.rs"), "use crate::gone::g;\npub fn u() { g() }\n").unwrap();
-        let rev = |f: &str| if f == "src/gone.rs" { vec!["src/user.rs".to_string()] } else { vec![] };
-
-        // untouched importer -> still refused
-        let mut vfs = Vfs::new(root);
-        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_err());
-
-        // the same batch staged the fix -> delete allowed
-        let mut vfs = Vfs::new(root);
-        vfs.write(Path::new("src/user.rs"), "pub fn u() {}\n".into());
-        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_ok());
-
-        // importer deleted earlier in the batch -> delete allowed
-        let mut vfs = Vfs::new(root);
-        vfs.delete(Path::new("src/user.rs"));
-        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_ok());
-
-        // staged edit that KEEPS the reference -> still refused
-        let mut vfs = Vfs::new(root);
-        vfs.write(Path::new("src/user.rs"), "use crate::gone::g;\n".into());
-        assert!(apply_delete(&mut vfs, Path::new("src/gone.rs"), &rev).is_err());
-    }
-    use super::*;
-    use ci_core::{NodeKind, SymbolKind};
-    use std::fs;
-
-    fn fn_node(file: &str, name: &str, sl: u32, el: u32) -> Node {
+    pub(crate) fn fn_node(file: &str, name: &str, sl: u32, el: u32) -> Node {
         Node {
             id: format!("{file}#{name}"),
             name: Some(name.into()),
@@ -1725,6 +859,77 @@ mod tests {
             name_range: Some(Range { start_line: sl, start_char: 16, end_line: sl, end_char: 19 }),
             children: vec![],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::fn_node;
+    use ci_core::{NodeKind, Range, SymbolKind};
+    use std::fs;
+
+    // The prewarm contract: the warming thread holds the slot lock for the whole
+    // construction+warming call, so an `apply_edits` arriving mid-warm (its discipline: lock
+    // the slot, cold-start only if empty) blocks and finds the WARMED engine — never a
+    // second cold start.
+    #[test]
+    fn apply_during_inflight_prewarm_waits_for_the_warm_engine() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slot: Arc<Mutex<Option<&'static str>>> = Arc::new(Mutex::new(None));
+        let cold_starts = Arc::new(AtomicUsize::new(0));
+        let (warming_tx, warming_rx) = std::sync::mpsc::channel();
+        let handle = spawn_prewarm(slot.clone(), move || {
+            warming_tx.send(()).unwrap(); // the slot lock is held from before this point
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            Some("warm")
+        });
+        warming_rx.recv().unwrap();
+        let mut guard = slot.lock().unwrap();
+        if guard.is_none() {
+            cold_starts.fetch_add(1, Ordering::SeqCst);
+            *guard = Some("cold");
+        }
+        assert_eq!(*guard, Some("warm"), "mid-warm arrival must reuse the warmed engine");
+        assert_eq!(cold_starts.load(Ordering::SeqCst), 0, "must wait, not double-start");
+        drop(guard);
+        handle.join().unwrap();
+    }
+
+    // An already-warm slot makes a second prewarm a no-op (the `is_some()` guard), and a
+    // failed construction leaves the slot empty so first use starts lazily and surfaces
+    // the real error.
+    #[test]
+    fn prewarm_guards_warm_slots_and_tolerates_failed_starts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let slot: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let starts = Arc::new(AtomicUsize::new(0));
+
+        let s = starts.clone();
+        spawn_prewarm(slot.clone(), move || {
+            s.fetch_add(1, Ordering::SeqCst);
+            None // engine failed to start
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), None, "failed start leaves the slot cold");
+
+        let s = starts.clone();
+        spawn_prewarm(slot.clone(), move || {
+            s.fetch_add(1, Ordering::SeqCst);
+            Some(1)
+        })
+        .join()
+        .unwrap();
+        let s = starts.clone();
+        spawn_prewarm(slot.clone(), move || {
+            s.fetch_add(1, Ordering::SeqCst);
+            Some(2)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(*slot.lock().unwrap(), Some(1), "warm slot is never replaced");
+        assert_eq!(starts.load(Ordering::SeqCst), 2, "third prewarm never constructs");
     }
 
     /// `resolve_all_in` returns EVERY same-named symbol (incl. two in the same scope depth), while
@@ -1770,131 +975,6 @@ mod tests {
         assert_eq!(enclosing_symbol(&nodes, 99), None); // out of range
     }
 
-    #[test]
-    fn insert_member_lands_first_in_the_block() {
-        use ci_vfs::Vfs;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // An interface with a generic-bound `{` in `extends` — block_open must skip it and find the
-        // real body brace.
-        std::fs::write(
-            root.join("t.ts"),
-            "export interface Foo extends Bar<{ x: number }> {\n  id: string;\n}\n",
-        )
-        .unwrap();
-        let node = Node {
-            id: "t.ts#Foo".into(),
-            name: Some("Foo".into()),
-            kind: NodeKind::Symbol(SymbolKind::Interface),
-            range: Range { start_line: 1, start_char: 0, end_line: 3, end_char: 1 },
-            name_range: None,
-            children: vec![],
-        };
-        let structure_of = |_f: &str| vec![node.clone()];
-        let mut vfs = Vfs::new(root);
-        apply_structural(
-            &mut vfs,
-            &EditOp::InsertMember { node_id: "t.ts#Foo".into(), code: "tag: string;".into() },
-            &structure_of,
-        )
-        .unwrap();
-        let out = vfs.read(Path::new("t.ts")).unwrap();
-        // New member is inserted right after the BODY `{` (not the generic one), ahead of `id`.
-        assert!(
-            out.contains("> {\n  tag: string;\n  id: string;\n}"),
-            "member should land first in the body block, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn insert_member_rejects_a_blockless_node() {
-        use ci_vfs::Vfs;
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::write(root.join("t.ts"), "export type Id = string;\n").unwrap();
-        let node = Node {
-            id: "t.ts#Id".into(),
-            name: Some("Id".into()),
-            kind: NodeKind::Symbol(SymbolKind::TypeAlias),
-            range: Range { start_line: 1, start_char: 0, end_line: 1, end_char: 24 },
-            name_range: None,
-            children: vec![],
-        };
-        let structure_of = |_f: &str| vec![node.clone()];
-        let mut vfs = Vfs::new(root);
-        let err = apply_structural(
-            &mut vfs,
-            &EditOp::InsertMember { node_id: "t.ts#Id".into(), code: "x: string;".into() },
-            &structure_of,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("no `{"), "expected a no-block error, got: {err}");
-    }
-
-    #[test]
-    fn action_maps_set_body_and_subnode_targets() {
-        let resolve = |_p: &str, _t: Option<&str>, n: Option<&str>| n.map(|n| format!("a.ts#{n}"));
-        let act = |action: &str, target: Option<&str>| {
-            action_to_op(
-                &Action {
-                    path: "a.ts".into(),
-                    action: action.into(),
-                    target: target.map(str::to_string),
-                    name: Some("add".into()),
-                    value: Some("v".into()),
-                    ..Default::default()
-                },
-                resolve,
-            )
-        };
-
-        // rename targets the whole symbol regardless of `target`.
-        assert!(matches!(act("rename", Some("function")).unwrap(), EditOp::Rename { .. }));
-
-        // set_body maps to SET_BODY against the symbol (apply_structural narrows to `:body`).
-        match act("set_body", None).unwrap() {
-            EditOp::SetBody { node_id, .. } => assert_eq!(node_id, "a.ts#add"),
-            o => panic!("expected SetBody, got {o:?}"),
-        }
-
-        // replace_node narrows to the sub-node anchor when `target` names one.
-        let id = |op| match op {
-            EditOp::ReplaceNode { node_id, .. } => node_id,
-            o => panic!("expected ReplaceNode, got {o:?}"),
-        };
-        assert_eq!(id(act("replace_node", Some("body")).unwrap()), "a.ts#add:body");
-        assert_eq!(id(act("replace_node", Some("return")).unwrap()), "a.ts#add:return");
-        assert_eq!(id(act("replace_node", Some("param.1")).unwrap()), "a.ts#add:param.1");
-        assert_eq!(id(act("replace_node", Some("doc")).unwrap()), "a.ts#add:doc");
-        // an unknown target is REJECTED (it used to fall through to the whole symbol — which
-        // silently applied sub-node code over the entire declaration); no target = whole symbol.
-        assert!(act("replace_node", Some("function")).is_err());
-        assert_eq!(id(act("replace_node", None).unwrap()), "a.ts#add");
-
-        // replace_text carries oldText/newText and honors `target` for sub-node scoping.
-        let rt = action_to_op(
-            &Action {
-                path: "a.ts".into(),
-                action: "replace_text".into(),
-                target: Some("body".into()),
-                name: Some("add".into()),
-                old_text: Some("foo".into()),
-                new_text: Some("bar".into()),
-                ..Default::default()
-            },
-            resolve,
-        )
-        .unwrap();
-        match rt {
-            EditOp::ReplaceText { node_id, old_text, new_text } => {
-                assert_eq!(node_id, "a.ts#add:body");
-                assert_eq!(old_text, "foo");
-                assert_eq!(new_text, "bar");
-            }
-            o => panic!("expected ReplaceText, got {o:?}"),
-        }
-    }
-
     // Regression (bench T5 trajectory variance): a blast-radius diagnostic BELOW a same-file
     // op's node must NOT be attributed to that op — the op-anchored branch never emits the
     // ready-to-copy `fix:`, so a swallowed site forces the agent back into read/list_anchors.
@@ -1928,23 +1008,6 @@ mod tests {
         // a diagnostic in another file isn't attributed to these ops
         let d_other = Diag { file: "b.ts".into(), code: 1, message: "z".into(), line: 1 };
         assert_eq!(anchor(&d_other, &ops, &structure_of), None);
-    }
-
-    #[test]
-    fn action_maps_file_ops() {
-        let resolve = |_p: &str, _t: Option<&str>, _n: Option<&str>| None;
-        let mv = action_to_op(
-            &Action { path: "a.ts".into(), action: "move_file".into(), target: None, name: None, value: Some("b/a.ts".into()), ..Default::default() },
-            resolve,
-        )
-        .unwrap();
-        assert!(matches!(mv, EditOp::MoveFile { .. }));
-        let del = action_to_op(
-            &Action { path: "a.ts".into(), action: "delete_file".into(), target: None, name: None, value: None, ..Default::default() },
-            resolve,
-        )
-        .unwrap();
-        assert!(matches!(del, EditOp::DeleteFile { .. }));
     }
 
     #[test]
@@ -2038,39 +1101,6 @@ mod tests {
                 assert!(feedback.contains("2 times") || feedback.contains("occurs"), "counts the matches: {feedback}")
             }
             other => panic!("ambiguous oldText must reject: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn unknown_target_is_rejected_never_widened() {
-        let resolve = |_: &str, _: Option<&str>, _: Option<&str>| Some("a.ts#foo".to_string());
-        let act = |target: Option<&str>| Action {
-            path: String::new(),
-            action: "replace_node".into(),
-            target: target.map(str::to_string),
-            name: Some("foo".into()),
-            value: Some("x".into()),
-            old_text: None,
-            new_text: None,
-        };
-        // A bogus target must error — falling back to the whole symbol would apply sub-node code
-        // over the entire declaration.
-        for bad in ["function", "params", "param 1", "param.x", "first"] {
-            let err = action_to_op(&act(Some(bad)), resolve).unwrap_err().to_string();
-            assert!(err.contains("unknown target"), "target {bad:?} must be rejected, got: {err}");
-        }
-        // Valid targets narrow to the sub-node; none/empty stays the whole symbol.
-        for (t, want) in [("body", "a.ts#foo:body"), ("returnType", "a.ts#foo:return"), ("param.1", "a.ts#foo:param.1")] {
-            match action_to_op(&act(Some(t)), resolve).unwrap() {
-                EditOp::ReplaceNode { node_id, .. } => assert_eq!(node_id, want),
-                other => panic!("unexpected op: {other:?}"),
-            }
-        }
-        for whole in [None, Some("")] {
-            match action_to_op(&act(whole), resolve).unwrap() {
-                EditOp::ReplaceNode { node_id, .. } => assert_eq!(node_id, "a.ts#foo"),
-                other => panic!("unexpected op: {other:?}"),
-            }
         }
     }
 
@@ -2270,23 +1300,6 @@ mod tests {
         assert!(out.contains("return { name: \"x\" };"), "function body intact:\n{out}");
     }
 
-    #[test]
-    fn delete_refused_when_imported() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.ts"), "export const x = 1;\n").unwrap();
-        let mut vfs = Vfs::new(root);
-
-        // imported -> refused
-        let imported = |f: &str| if f == "a.ts" { vec!["b.ts".to_string()] } else { vec![] };
-        assert!(apply_delete(&mut vfs, Path::new("a.ts"), &imported).is_err());
-
-        // not imported -> removed from the VFS overlay
-        let none = |_: &str| Vec::<String>::new();
-        assert!(apply_delete(&mut vfs, Path::new("a.ts"), &none).is_ok());
-        assert!(vfs.read(Path::new("a.ts")).is_none());
-    }
-
     /// Serializes tsls STARTUP across the two real-LSP tests in this binary: both spawn
     /// `npx --yes` against the same npm cache, and concurrent npx installs corrupt it —
     /// the loser dies at spawn ("lsp server disconnected"). Same contention lang-ts fixed
@@ -2332,22 +1345,6 @@ mod tests {
         assert!(!root.join("src/math.ts").exists(), "old path removed");
         let app = fs::read_to_string(root.join("src/app.ts")).unwrap();
         assert!(app.contains("util/math"), "importer rewritten by willRenameFiles, got: {app}");
-    }
-
-    #[test]
-    fn structural_replace_node_in_vfs() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.ts"), "export function add() {\n  return 1;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_node("a.ts", "add", 1, 3)];
-        apply_structural(
-            &mut vfs,
-            &EditOp::ReplaceNode { node_id: "a.ts#add".into(), code: "export function add() {\n  return 2;\n}".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.ts")).unwrap(), "export function add() {\n  return 2;\n}\n");
     }
 
     // Real gate end-to-end: spawns typescript-language-server. #[ignore]; run with
@@ -2398,257 +1395,5 @@ mod tests {
         .unwrap();
         assert!(matches!(ok, CommitResult::Ok { .. }), "clean edit must pass, got {ok:?}");
         assert!(fs::read_to_string(root.join("src/a.ts")).unwrap().contains("return 2;"));
-    }
-
-    fn rng(sl: u32, sc: u32, el: u32, ec: u32) -> Range {
-        Range { start_line: sl, start_char: sc, end_line: el, end_char: ec }
-    }
-    fn sub(id: &str, r: Range) -> Node {
-        Node { id: id.into(), name: None, kind: NodeKind::Syntax("x".into()), range: r, name_range: None, children: vec![] }
-    }
-    /// A function symbol node carrying the given sub-node children (`:body`/`:params`/`:return`).
-    fn fn_with(id: &str, sym: Range, children: Vec<Node>) -> Node {
-        Node {
-            id: id.into(),
-            name: Some(id.split('#').nth(1).unwrap_or(id).into()),
-            kind: NodeKind::Symbol(SymbolKind::Function),
-            range: sym,
-            name_range: None,
-            children,
-        }
-    }
-
-    #[test]
-    fn insert_in_body_appends_before_closing_brace() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.rs"), "fn foo() {\n    let x = 1;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        // body spans `{ … }` (line1 col9 .. line3 col1).
-        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 3, 1), vec![sub("a.rs#foo:body", rng(1, 9, 3, 1))])];
-        apply_structural(
-            &mut vfs,
-            &EditOp::InsertInBody { node_id: "a.rs#foo".into(), code: "let y = 2;".into(), after: None },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    let x = 1;\n    let y = 2;\n}\n");
-    }
-
-    #[test]
-    fn insert_in_body_after_anchor_and_delete() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.rs"), "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 4, 1), vec![sub("a.rs#foo:body", rng(1, 9, 4, 1))])];
-        // insert after the `let a` line
-        apply_structural(
-            &mut vfs,
-            &EditOp::InsertInBody { node_id: "a.rs#foo".into(), code: "let mid = 0;".into(), after: Some("let a".into()) },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(
-            vfs.read(Path::new("a.rs")).unwrap(),
-            "fn foo() {\n    let a = 1;\n    let mid = 0;\n    let b = 2;\n}\n"
-        );
-    }
-
-    #[test]
-    fn delete_in_body_removes_matching_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.rs"), "fn foo() {\n    let a = 1;\n    let b = 2;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 4, 1), vec![sub("a.rs#foo:body", rng(1, 9, 4, 1))])];
-        apply_structural(
-            &mut vfs,
-            &EditOp::DeleteInBody { node_id: "a.rs#foo".into(), text: "let b".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    let a = 1;\n}\n");
-    }
-
-    #[test]
-    fn add_symbol_appends_with_hygiene() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // No trailing newline on the last item — hygiene must still yield one blank line + \n.
-        fs::write(root.join("a.rs"), "fn foo() {\n    1;\n}").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_node("a.rs", "foo", 1, 3)];
-        apply_structural(
-            &mut vfs,
-            &EditOp::AddSymbol { path: "a.rs".into(), code: "\nfn bar() {\n    2;\n}\n\n".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() {\n    1;\n}\n\nfn bar() {\n    2;\n}\n");
-
-        // Empty file: no leading blank lines, just the symbol.
-        fs::write(root.join("b.rs"), "\n\n").unwrap();
-        apply_structural(
-            &mut vfs,
-            &EditOp::AddSymbol { path: "b.rs".into(), code: "fn solo() {}".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("b.rs")).unwrap(), "fn solo() {}\n");
-
-        // Missing file: soft error pointing at create_file.
-        let err = apply_structural(
-            &mut vfs,
-            &EditOp::AddSymbol { path: "nope.rs".into(), code: "fn x() {}".into() },
-            &structure_of,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("create_file"), "points at create_file for new files: {err}");
-    }
-
-    #[test]
-    fn add_symbol_is_satisfied_when_code_already_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.rs"), "fn foo() {\n    1;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_node("a.rs", "foo", 1, 3)];
-        apply_structural(
-            &mut vfs,
-            &EditOp::AddSymbol { path: "a.rs".into(), code: "fn foo() {\n    1;\n}".into() },
-            &structure_of,
-        )
-        .unwrap();
-        // Satisfied ⇒ nothing staged (commit_edits counts this as a redundant op).
-        assert!(vfs.is_empty(), "identical code must be a no-op, not a duplicate append");
-    }
-
-    // A same-named top-level symbol with DIFFERENT content refuses with the existing source —
-    // mechanically important for UNGATED languages, where appending a redefinition is legal
-    // syntax and would silently shadow the original.
-    #[test]
-    fn add_symbol_refuses_same_name_different_content() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.rs"), "pub fn foo() {\n    1;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_node("a.rs", "foo", 1, 3)];
-        let err = apply_structural(
-            &mut vfs,
-            &EditOp::AddSymbol { path: "a.rs".into(), code: "pub fn foo() {\n    2;\n}".into() },
-            &structure_of,
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("already exists") && err.contains("replace_node"), "redirects to replace_node: {err}");
-        assert!(err.contains("pub fn foo() {"), "shows the existing source: {err}");
-        assert!(vfs.is_empty(), "refusal stages nothing");
-    }
-
-    #[test]
-    fn leading_symbol_name_covers_the_declaration_shapes() {
-        // Rust: modifiers, attributes above.
-        assert_eq!(leading_symbol_name("pub fn parse(x: u8) -> u8 { x }").as_deref(), Some("parse"));
-        assert_eq!(leading_symbol_name("#[test]\nfn roundtrip_holds() {\n}").as_deref(), Some("roundtrip_holds"));
-        assert_eq!(leading_symbol_name("pub(crate) struct Widget {\n    n: i32,\n}").as_deref(), Some("Widget"));
-        // TS/JS: export chains, generics glued to the name.
-        assert_eq!(leading_symbol_name("export function slug(s: string): string { return s; }").as_deref(), Some("slug"));
-        assert_eq!(leading_symbol_name("export default class Loader<T> {\n}").as_deref(), Some("Loader"));
-        assert_eq!(leading_symbol_name("export const LIMIT = 10;").as_deref(), Some("LIMIT"));
-        // Python: decorator above, name glued to `(`.
-        assert_eq!(leading_symbol_name("@cached\ndef fetch_all(db):\n    pass").as_deref(), Some("fetch_all"));
-        // Unnameable shapes -> None (no pre-check; the gate judges the result).
-        assert_eq!(leading_symbol_name("impl Widget {\n    fn n(&self) {}\n}"), None);
-        assert_eq!(leading_symbol_name("x + 1"), None);
-        assert_eq!(leading_symbol_name(""), None);
-    }
-
-    #[test]
-    fn add_parameter_into_empty_and_nonempty_list() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        // params `()` at line1 col6..col8.
-        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 1, 11), vec![sub("a.rs#foo:params", rng(1, 6, 1, 8))])];
-        apply_structural(
-            &mut vfs,
-            &EditOp::AddParameter { node_id: "a.rs#foo".into(), param: "x: i32".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo(x: i32) {}\n");
-
-        // Now the list is non-empty: a second add prefixes ", ". params now span col6..col14.
-        let structure_of2 = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 1, 17), vec![sub("a.rs#foo:params", rng(1, 6, 1, 14))])];
-        apply_structural(
-            &mut vfs,
-            &EditOp::AddParameter { node_id: "a.rs#foo".into(), param: "y: i32".into() },
-            &structure_of2,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo(x: i32, y: i32) {}\n");
-    }
-
-    #[test]
-    fn set_return_type_inserts_after_params_and_refuses_when_present() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        // Rust: `-> T` after `)`.
-        fs::write(root.join("a.rs"), "fn foo() {}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_with("a.rs#foo", rng(1, 0, 1, 11), vec![sub("a.rs#foo:params", rng(1, 6, 1, 8))])];
-        apply_structural(
-            &mut vfs,
-            &EditOp::SetReturnType { node_id: "a.rs#foo".into(), ty: "i32".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("a.rs")).unwrap(), "fn foo() -> i32 {}\n");
-
-        // TS: `: T` after `)`.
-        fs::write(root.join("b.ts"), "function bar() {}\n").unwrap();
-        let ts_struct = |_f: &str| vec![fn_with("b.ts#bar", rng(1, 0, 1, 17), vec![sub("b.ts#bar:params", rng(1, 12, 1, 14))])];
-        apply_structural(
-            &mut vfs,
-            &EditOp::SetReturnType { node_id: "b.ts#bar".into(), ty: "number".into() },
-            &ts_struct,
-        )
-        .unwrap();
-        assert_eq!(vfs.read(Path::new("b.ts")).unwrap(), "function bar(): number {}\n");
-
-        // Refused when a return type already exists (agent should replace_node target:return).
-        let with_ret = |_f: &str| {
-            vec![fn_with(
-                "a.rs#foo",
-                rng(1, 0, 1, 11),
-                vec![sub("a.rs#foo:params", rng(1, 6, 1, 8)), sub("a.rs#foo:return", rng(1, 12, 1, 15))],
-            )]
-        };
-        let err = apply_structural(
-            &mut vfs,
-            &EditOp::SetReturnType { node_id: "a.rs#foo".into(), ty: "u8".into() },
-            &with_ret,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("already has a return type"), "got: {err}");
-    }
-
-    #[test]
-    fn replace_text_within_node_unique_guard() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        fs::write(root.join("a.ts"), "export function add() {\n  return 1;\n}\n").unwrap();
-        let mut vfs = Vfs::new(root);
-        let structure_of = |_f: &str| vec![fn_node("a.ts", "add", 1, 3)];
-        apply_structural(
-            &mut vfs,
-            &EditOp::ReplaceText { node_id: "a.ts#add".into(), old_text: "return 1".into(), new_text: "return 42".into() },
-            &structure_of,
-        )
-        .unwrap();
-        assert!(vfs.read(Path::new("a.ts")).unwrap().contains("return 42"));
     }
 }

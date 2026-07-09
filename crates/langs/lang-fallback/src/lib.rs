@@ -12,20 +12,41 @@
 //! The honest tradeoff: there is no type-check engine here, so edits are applied through the
 //! same VFS/blast-radius machinery as the gated providers but with a no-op gate — they are
 //! *structural, not verified*. Callers surface this as `gated: false`. Per language, upgrade
-//! to the gated [`GateEngine`] path as its LSP/indexer lands (the Rust provider is the model).
+//! to the gated [`ci_edit::GateEngine`] path as its LSP/indexer lands (the Rust provider is
+//! the model).
 use ci_core::{
-    CommitResult, Diag, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node,
-    NodeKind, Result, SymbolKind,
+    rel_path, CommitResult, EditOp, EditOpts, Granularity, ImportGraph, LanguageProvider, Node,
+    Result, SymbolKind,
 };
-use ci_edit::GateEngine;
-use ci_treesitter::{syntax_node, ts_range};
-use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use tree_sitter::{Node as TsNode, Parser, Point};
+use tree_sitter::Parser;
+
+mod gate;
+mod imports;
+mod structure;
+
+/// Java syntactic resolution primitives, exposed so `lang-java`'s move model speaks the SAME
+/// resolver as the import graph (contract §7: one source of truth, no divergent reimplementation).
+/// `file_to_fqn` inverts a path to its FQN, `resolve_import` maps an `import` to a file, and
+/// `package_decl` is the shared package-declaration scanner (line index + name) both the move
+/// model's membership edits and the resolver's `package_of` key off.
+pub mod java {
+    pub use crate::imports::{file_to_fqn, package_decl, resolve_import};
+}
+
+/// PHP syntactic resolution primitives, exposed so `lang-php`'s move model speaks the SAME
+/// PSR-4 resolver as the import graph (contract §7: one source of truth). `file_to_fqcn`
+/// inverts a path to its namespaced FQCN, `resolve_use` maps a `use` FQCN to a file, and
+/// `namespace_decl` is the shared namespace-declaration scanner (line index + name) both the
+/// move model's membership edits and the resolver's `namespace_of` key off.
+pub mod php {
+    pub use crate::imports::{file_to_fqcn, namespace_decl, resolve_use};
+}
 
 /// A language served by the tree-sitter fallback. Adding one = a grammar dependency, a variant
-/// here, and rows in [`classify`]/[`outline`]'s tables — no core changes, no new walker.
+/// here, and rows in `classify` (structure.rs) / [`outline`]'s tables — no core changes, no
+/// new walker.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FbLang {
     Python,
@@ -36,17 +57,19 @@ pub enum FbLang {
     Ts,
     Go,
     Java,
+    Php,
     Ruby,
     C,
     Cpp,
+    Swift,
 }
 
-pub const ALL: &[FbLang] = &[FbLang::Python, FbLang::Js, FbLang::Go, FbLang::Java, FbLang::Ruby, FbLang::C, FbLang::Cpp];
+pub const ALL: &[FbLang] = &[FbLang::Python, FbLang::Js, FbLang::Go, FbLang::Java, FbLang::Php, FbLang::Ruby, FbLang::C, FbLang::Cpp, FbLang::Swift];
 
 impl FbLang {
     /// Pick a fallback language for `root` by the source files actually present.
     pub fn detect(root: &Path) -> Option<FbLang> {
-        ALL.iter().copied().find(|l| l.exts().iter().any(|e| has_ext(root, e)))
+        ALL.iter().copied().find(|l| l.exts().iter().any(|e| imports::has_ext(root, e)))
     }
 
     pub fn from_name(name: &str) -> Option<FbLang> {
@@ -56,9 +79,11 @@ impl FbLang {
             "ts-fallback" => Some(FbLang::Ts), // ablation arms only — never plain "ts"
             "go" => Some(FbLang::Go),
             "java" => Some(FbLang::Java),
+            "php" => Some(FbLang::Php),
             "ruby" | "rb" => Some(FbLang::Ruby),
             "c" => Some(FbLang::C),
             "cpp" | "c++" | "cxx" => Some(FbLang::Cpp),
+            "swift" => Some(FbLang::Swift),
             _ => None,
         }
     }
@@ -68,29 +93,35 @@ impl FbLang {
         ALL.iter().copied().find(|l| l.exts().contains(&ext))
     }
 
-    fn ts_language(self) -> tree_sitter::Language {
+    pub(crate) fn ts_language(self) -> tree_sitter::Language {
         match self {
             FbLang::Python => tree_sitter_python::LANGUAGE.into(),
             FbLang::Js => tree_sitter_javascript::LANGUAGE.into(),
             FbLang::Ts => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
             FbLang::Go => tree_sitter_go::LANGUAGE.into(),
             FbLang::Java => tree_sitter_java::LANGUAGE.into(),
+            // The FULL PHP grammar (not php_only): it handles HTML-interleaved `.php` files,
+            // which the single-language grammar rejects.
+            FbLang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             FbLang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             FbLang::C => tree_sitter_c::LANGUAGE.into(),
             FbLang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            FbLang::Swift => tree_sitter_swift::LANGUAGE.into(),
         }
     }
 
-    fn exts(self) -> &'static [&'static str] {
+    pub(crate) fn exts(self) -> &'static [&'static str] {
         match self {
             FbLang::Python => &["py", "pyi"],
             FbLang::Js => &["js", "jsx", "mjs", "cjs"],
             FbLang::Ts => &["ts", "mts", "cts"],
             FbLang::Go => &["go"],
             FbLang::Java => &["java"],
+            FbLang::Php => &["php"],
             FbLang::Ruby => &["rb"],
             FbLang::C => &["c", "h"],
             FbLang::Cpp => &["cpp", "cc", "cxx", "hpp", "hh"],
+            FbLang::Swift => &["swift"],
         }
     }
 
@@ -101,9 +132,11 @@ impl FbLang {
             FbLang::Ts => "typescript (tree-sitter ablation)",
             FbLang::Go => "go",
             FbLang::Java => "java",
+            FbLang::Php => "php",
             FbLang::Ruby => "ruby",
             FbLang::C => "c",
             FbLang::Cpp => "cpp",
+            FbLang::Swift => "swift",
         }
     }
 }
@@ -136,24 +169,21 @@ impl FallbackProvider {
     /// the whole repo. Languages without cheap-and-reliable resolution return no edges,
     /// same as the whole-graph path.
     pub fn file_imports(&self, rel: &str) -> Vec<PathBuf> {
-        if !matches!(self.lang, FbLang::Python | FbLang::Js | FbLang::Ts) {
+        if !matches!(self.lang, FbLang::Python | FbLang::Js | FbLang::Ts | FbLang::Java | FbLang::Php) {
             return Vec::new();
         }
         let Ok(content) = std::fs::read_to_string(self.root.join(rel)) else { return Vec::new() };
         let Some(tree) = self.parse(&content) else { return Vec::new() };
         let mut edges: Vec<PathBuf> = Vec::new();
         match self.lang {
-            FbLang::Python => collect_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
-            _ => collect_js_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+            FbLang::Python => imports::collect_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+            FbLang::Java => imports::collect_java_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+            FbLang::Php => imports::collect_php_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+            _ => imports::collect_js_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
         }
         edges.sort();
         edges.dedup();
         edges
-    }
-
-    fn rel(&self, file: &Path) -> String {
-        let p = if file.is_absolute() { file.strip_prefix(&self.root).unwrap_or(file) } else { file };
-        p.to_string_lossy().replace('\\', "/")
     }
 }
 
@@ -190,7 +220,7 @@ impl LanguageProvider for FallbackProvider {
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        let rel = self.rel(file);
+        let rel = rel_path(&self.root, file);
         let content = match std::fs::read_to_string(self.root.join(&rel)) {
             Ok(c) => c,
             Err(_) => return Ok(vec![]),
@@ -201,21 +231,23 @@ impl LanguageProvider for FallbackProvider {
         let prefix = format!("{rel}#");
         match self.lang {
             // Python keeps its specialized walk (docstrings, decorated definitions).
-            FbLang::Python => collect_items(tree.root_node(), bytes, &prefix, SymbolKind::Function, &mut out),
+            FbLang::Python => structure::collect_items(tree.root_node(), bytes, &prefix, SymbolKind::Function, &mut out),
             // Everything else shares the generic field-convention collector.
-            lang => collect_generic(lang, tree.root_node(), bytes, &prefix, &mut out),
+            lang => structure::collect_generic(lang, tree.root_node(), bytes, &prefix, &mut out),
         }
         Ok(out)
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
         // Import resolution exists where the syntax makes it cheap and reliable: Python
-        // (dotted modules) and JS/TS (relative specifiers). Other fallback languages honestly
-        // report NO edges (retrieval still works — graph expansion just doesn't) rather than
-        // guessing edges from partially-understood import syntax.
+        // (dotted modules), JS/TS (relative specifiers), Java (`import a.b.C` →
+        // `<source-root>/a/b/C.java`, package-path-bound), and PHP (`use A\B\C` via the
+        // composer.json PSR-4 map). Other fallback languages honestly report NO edges
+        // (retrieval still works — graph expansion just doesn't) rather than guessing edges
+        // from partially-understood import syntax.
         let mut graph: ImportGraph = BTreeMap::new();
         for ext in self.lang.exts() {
-            for rel in source_files(&self.root, ext) {
+            for rel in imports::source_files(&self.root, ext) {
                 let edges = self.file_imports(&rel);
                 if !edges.is_empty() {
                     graph.insert(PathBuf::from(&rel), edges);
@@ -229,7 +261,7 @@ impl LanguageProvider for FallbackProvider {
         // No type-check engine for this language yet → a no-op gate (always passes). Edits flow
         // through the SAME VFS / blast-radius / atomic-commit path as the gated providers; only
         // the diagnostics step is empty. Structural, not verified — callers report gated: false.
-        let mut engine = NoGate::new(&self.root, self.lang);
+        let mut engine = gate::NoGate::new(&self.root, self.lang);
         let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
 
         // Reverse import map (file -> who imports it) for the delete-safety check.
@@ -256,8 +288,13 @@ pub fn outline(lang: FbLang, content: &str) -> String {
         FbLang::Js | FbLang::Ts => &["function_declaration", "generator_function_declaration", "method_definition"],
         FbLang::Go => &["function_declaration", "method_declaration"],
         FbLang::Java => &["method_declaration", "constructor_declaration"],
+        FbLang::Php => &["function_definition", "method_declaration"],
         FbLang::Ruby => &["method", "singleton_method"],
         FbLang::C | FbLang::Cpp => &["function_definition"],
+        // Swift: the grammar names both free functions and members `function_declaration`;
+        // `init_declaration` is the initializer, `protocol_function_declaration` the bodyless
+        // requirement in a protocol (folding it is a no-op, harmless to list).
+        FbLang::Swift => &["function_declaration", "init_declaration"],
     };
     let bodies = ci_treesitter::body_ranges(tree.root_node(), fn_kinds, &[]);
     if lang == FbLang::Python {
@@ -267,721 +304,60 @@ pub fn outline(lang: FbLang, content: &str) -> String {
     }
 }
 
-// ── the generic collector (every fallback language except Python) ───────────
-
-/// What a matched node kind IS, per language: a function/method (emits with sub-nodes, no
-/// recursion into its body), a named type (leaf — struct/enum/type alias), or a container
-/// (class/module/namespace — emits, then recurses into its body with a qualified prefix).
-enum Shape {
-    Fn,
-    Type,
-    Container,
-    /// A named value: class field, top-level const, interface property, enum member. Emitted
-    /// as `SymbolKind::Variable`; the range widens to the enclosing STATEMENT so editing the
-    /// field by name can see its initializer (`k1 = 1.5;`, not just `k1`).
-    Field,
-}
-
-/// The per-language kind table — the ONLY language-specific part of the generic collector.
-fn classify(lang: FbLang, kind: &str) -> Option<Shape> {
-    use Shape::*;
-    Some(match (lang, kind) {
-        // JS (grammar includes JSX): classes qualify their methods; arrow-function consts are
-        // variable declarators (no name field on the function) and stay out — same tradeoff as
-        // scip's Term handling, revisit if it bites.
-        (FbLang::Js | FbLang::Ts, "function_declaration" | "generator_function_declaration" | "method_definition") => Fn,
-        (FbLang::Js | FbLang::Ts, "class_declaration") => Container,
-        (FbLang::Ts, "interface_declaration" | "enum_declaration" | "abstract_class_declaration") => Container,
-        (FbLang::Ts, "type_alias_declaration") => Type,
-        // Named values: SCIP collects these as Term symbols; edit targets in every language.
-        (FbLang::Ts, "public_field_definition" | "property_signature" | "enum_assignment") => Field,
-        (FbLang::Js, "field_definition") => Field,
-        (FbLang::Js | FbLang::Ts, "variable_declarator") => Field,
-        (FbLang::Go, "const_spec" | "var_spec") => Field,
-        (FbLang::Java, "field_declaration") => Field,
-        (FbLang::Go, "function_declaration" | "method_declaration") => Fn,
-        (FbLang::Go, "type_spec") => Type,
-        (FbLang::Java, "method_declaration" | "constructor_declaration") => Fn,
-        (FbLang::Java, "class_declaration" | "interface_declaration" | "enum_declaration" | "record_declaration") => Container,
-        (FbLang::Ruby, "method" | "singleton_method") => Fn,
-        (FbLang::Ruby, "class" | "module") => Container,
-        (FbLang::C | FbLang::Cpp, "function_definition") => Fn,
-        (FbLang::C | FbLang::Cpp, "struct_specifier" | "enum_specifier" | "union_specifier") => Type,
-        (FbLang::Cpp, "class_specifier") => Container,
-        (FbLang::Cpp, "namespace_definition") => Container,
-        _ => return None,
-    })
-}
-
-/// The definition's name node: the `name` field, else (C/C++) the first identifier-ish node
-/// down the `declarator` chain (`function_definition → function_declarator → identifier`).
-fn def_name<'a>(node: &TsNode<'a>) -> Option<TsNode<'a>> {
-    if let Some(n) = node.child_by_field_name("name") {
-        return Some(n);
+/// Byte ranges `(start, end)` of every string-literal and comment node in `content`, per the
+/// language grammar. The move rewriter uses this to NEVER retarget a fully-qualified name that
+/// merely appears inside a string or comment (a `Class.forName("a.b.C")` reflection string, a doc
+/// mention): a rewrite there still compiles, so the type-check gate can't catch it — excluding it
+/// is the safe contract. Uses tree-sitter (not a hand-rolled string lexer) so heredocs, block
+/// comments, interpolated and escaped strings are all covered exactly. Empty on a parse/grammar
+/// failure — the caller then scans unmasked, no worse than before this guard existed.
+pub fn string_comment_spans(lang: FbLang, content: &str) -> Vec<(usize, usize)> {
+    let mut parser = Parser::new();
+    if parser.set_language(&lang.ts_language()).is_err() {
+        return Vec::new();
     }
-    let mut d = node.child_by_field_name("declarator")?;
-    for _ in 0..6 {
-        if d.kind().ends_with("identifier") {
-            return Some(d);
-        }
-        if let Some(n) = d.child_by_field_name("name") {
-            return Some(n); // java: field_declaration -> variable_declarator(name)
-        }
-        d = d.child_by_field_name("declarator")?;
-    }
-    None
-}
-
-/// Walk the tree emitting definitions per [`classify`]. Function bodies are NOT descended into
-/// (locals are not symbols); container bodies are, with a `Container.` qualified prefix.
-/// Unmatched nodes are transparent wrappers (declaration lists, export statements, preproc…).
-fn collect_generic(lang: FbLang, node: TsNode, bytes: &[u8], prefix: &str, out: &mut Vec<Node>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        let Some(shape) = classify(lang, child.kind()) else {
-            collect_generic(lang, child, bytes, prefix, out);
-            continue;
-        };
-        let Some(name_node) = def_name(&child) else { continue };
-        let Ok(name) = name_node.utf8_text(bytes) else { continue };
-        // A C `struct Foo x;` mentions the kind without a body — only DEFINITIONS count. Two
-        // bodyless exceptions ARE definitions: go's `type_spec` (payload in its `type` field,
-        // only appears inside `type_declaration`) and TS's `type_alias_declaration` (payload
-        // in its `value` field).
-        let is_definition = child.child_by_field_name("body").is_some()
-            || matches!(shape, Shape::Fn | Shape::Field)
-            || (lang == FbLang::Go && child.kind() == "type_spec")
-            || (lang == FbLang::Ts && child.kind() == "type_alias_declaration");
-        if !is_definition {
-            continue;
-        }
-        // Inside a container the prefix is `file#Scope.` — a trailing `.` marks a member.
-        let kind = match shape {
-            Shape::Fn if prefix.ends_with('.') => SymbolKind::Method,
-            Shape::Fn => SymbolKind::Function,
-            Shape::Type | Shape::Container => SymbolKind::Class,
-            Shape::Field => SymbolKind::Variable,
-        };
-        // A declarator's own range stops at the name — climb to the declaration statement so
-        // `replace_text`/`replace_node` on the field can see `const k1 = 1.5;` whole.
-        let span_node = if matches!(shape, Shape::Field) && child.kind() == "variable_declarator" {
-            child.parent().unwrap_or(child)
-        } else {
-            child
-        };
-        let mut n = Node {
-            id: format!("{prefix}{name}"),
-            name: Some(name.to_string()),
-            kind: NodeKind::Symbol(kind),
-            range: ts_range(&span_node),
-            name_range: Some(ts_range(&name_node)),
-            children: vec![],
-        };
-        // Leading comment → the `:doc` anchor (parity with the gated providers). The comment
-        // may sit above a single-child WRAPPER instead (`// doc` above go's `type Bucket …`
-        // annotates the `type_declaration`, we emit its inner `type_spec`) — climb one level
-        // when the parent wraps exactly this definition.
-        let is_comment = |c: &TsNode| matches!(c.kind(), "comment" | "line_comment" | "block_comment");
-        let doc = ci_treesitter::leading_comment_range(&child, is_comment).or_else(|| {
-            child
-                .parent()
-                .filter(|p| p.named_child_count() == 1)
-                .and_then(|p| ci_treesitter::leading_comment_range(&p, is_comment))
-        });
-        if let Some(r) = doc {
-            n.children.push(Node {
-                id: format!("{}:doc", n.id),
-                name: None,
-                kind: NodeKind::Syntax("doc".into()),
-                range: r,
-                name_range: None,
-                children: vec![],
-            });
-        }
-        match shape {
-            Shape::Fn => {
-                add_fn_subnodes(&mut n, &child, bytes);
-                out.push(n);
-            }
-            Shape::Type | Shape::Field => out.push(n),
-            Shape::Container => {
-                let inner = format!("{prefix}{name}.");
-                out.push(n);
-                if let Some(body) = child.child_by_field_name("body") {
-                    collect_generic(lang, body, bytes, &inner, out);
-                }
-            }
-        }
-    }
-}
-
-// ── the no-op gate (ungated edits) ───────────────────────────────────────────
-
-/// A [`GateEngine`] with no type-checker. `diagnostics` is always empty (the baseline-diff in
-/// `commit_edits` then never rejects), so edits are structural-only. `rename` is a best-effort
-/// **within-file** textual rename via tree-sitter (every identifier matching the symbol's name
-/// in the same file) — honest about its scope, not cross-file like a real LSP. `will_rename`
-/// has no importer rewrites to offer.
-struct NoGate {
-    root: PathBuf,
-    lang: FbLang,
-}
-
-impl NoGate {
-    fn new(root: &Path, lang: FbLang) -> Self {
-        Self { root: root.to_path_buf(), lang }
-    }
-
-    fn parse(&self, content: &str) -> Option<tree_sitter::Tree> {
-        let mut parser = Parser::new();
-        parser.set_language(&self.lang.ts_language()).ok()?;
-        parser.parse(content, None)
-    }
-}
-
-impl GateEngine for NoGate {
-    /// tree-sitter can't type-check, but it CAN parse — and since it never refuses input
-    /// (error-RECOVERING: any bytes yield a tree, breakage becomes ERROR/missing nodes), the
-    /// way to "ask" it whether the edited content is acceptable is to count those nodes.
-    /// `commit_edits`' baseline-diff then rejects any edit introducing a NEW syntax error
-    /// (the unbalanced brace a bad set_body leaves behind) while pre-existing breakage never
-    /// blocks an unrelated edit. Honest limit: a syntax gate, not a compiler — some invalid
-    /// code still parses clean.
-    fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
-        let mut out = Vec::new();
-        for (path, content) in files {
-            let Some(tree) = self.parse(content) else { continue };
-            collect_syntax_errors(tree.root_node(), content, path, &mut out);
-        }
-        Ok(out)
-    }
-
-    fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
-        let content = std::fs::read_to_string(self.root.join(file))
-            .map_err(|e| Error::Driver(format!("rename: reading {file}: {e}")))?;
-        let bytes = content.as_bytes();
-        let tree = self.parse(&content).ok_or_else(|| Error::Driver("rename: parse failed".into()))?;
-        let pt = Point { row: line as usize, column: character as usize };
-        let at = tree
-            .root_node()
-            .named_descendant_for_point_range(pt, pt)
-            .ok_or_else(|| Error::Driver("rename: no node at position".into()))?;
-        // Walk out to the enclosing identifier if the point landed on a child token.
-        let ident = if is_ident(&at) { at } else { at.parent().filter(is_ident).unwrap_or(at) };
-        let old = ident
-            .utf8_text(bytes)
-            .map_err(|_| Error::Driver("rename: bad utf8".into()))?
-            .to_string();
-        if old.is_empty() || !is_ident(&ident) {
-            return Ok(json!({})); // not a renameable identifier → empty (commit_edits rejects loudly)
-        }
-        // Every identifier in THIS file with the same text (best-effort, ungated).
-        let mut edits = Vec::new();
-        collect_identifier_edits(tree.root_node(), bytes, &old, new_name, &mut edits);
-        let uri = format!("file://{}", self.root.join(file).to_string_lossy());
-        Ok(json!({ "changes": { uri: edits } }))
-    }
-
-    /// JS/TS moves rewrite importers SYNTACTICALLY — the same job the compiler does in gated
-    /// mode, minus type knowledge: every relative specifier that resolves to `from` retargets
-    /// to `to`, and the MOVED file's own relative specifiers are recomputed from its new
-    /// directory. Quote and extension style are preserved (`"./x.js"` stays a `.js` specifier
-    /// even though the file on disk is `.ts`). Other fallback languages import by
-    /// package/module name, not file path — nothing to rewrite, the move proceeds as before.
-    fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
-        if !matches!(self.lang, FbLang::Js | FbLang::Ts) {
-            return Ok(json!({}));
-        }
-        let to_dir = Path::new(to).parent().unwrap_or(Path::new("")).to_path_buf();
-        let mut changes = serde_json::Map::new();
-        for ext in self.lang.exts() {
-            for rel in source_files(&self.root, ext) {
-                let Ok(content) = std::fs::read_to_string(self.root.join(&rel)) else { continue };
-                let Some(tree) = self.parse(&content) else { continue };
-                let mut specs = Vec::new();
-                collect_spec_nodes(tree.root_node(), content.as_bytes(), &mut specs);
-                let mut edits = Vec::new();
-                for (range, spec) in specs {
-                    if !(spec.starts_with("./") || spec.starts_with("../")) {
-                        continue;
-                    }
-                    let new_spec = if rel == from {
-                        // The moved file's own imports: whatever they resolve to today, the
-                        // path there is different from the NEW directory.
-                        resolve_js_specifier(&self.root, &rel, &spec)
-                            .map(|target| with_spec_ext(relative_specifier(&to_dir, &target), &spec))
-                    } else if resolve_js_specifier(&self.root, &rel, &spec).as_deref() == Some(Path::new(from)) {
-                        // An importer of the moved file: retarget to the new location.
-                        let rel_dir = Path::new(&rel).parent().unwrap_or(Path::new("")).to_path_buf();
-                        Some(with_spec_ext(relative_specifier(&rel_dir, Path::new(to)), &spec))
-                    } else {
-                        None
-                    };
-                    if let Some(ns) = new_spec {
-                        if ns != spec {
-                            edits.push(json!({ "range": range, "newText": ns }));
-                        }
-                    }
-                }
-                if !edits.is_empty() {
-                    let uri = format!("file://{}", self.root.join(&rel).to_string_lossy());
-                    changes.insert(uri, Value::Array(edits));
-                }
-            }
-        }
-        Ok(json!({ "changes": changes }))
-    }
-}
-
-/// Identifier-ish token across grammars: `identifier`, `field_identifier`, `type_identifier`
-/// (go/c/cpp/java), ruby's `constant`.
-fn is_ident(n: &TsNode) -> bool {
-    n.kind().ends_with("identifier") || n.kind() == "constant"
-}
-
-/// ERROR / missing nodes → `Diag`s. The message embeds a short source excerpt rather than the
-/// line number, so a pre-existing error whose line SHIFTS under an edit keeps an identical
-/// message — baseline-diff keys on (file, code, message) and must not re-flag it as new.
-/// ERROR subtrees are not descended (nested noise); capped per file.
-fn collect_syntax_errors(root: TsNode, content: &str, file: &str, out: &mut Vec<Diag>) {
-    let mut stack = vec![root];
-    let mut count = 0;
-    while let Some(n) = stack.pop() {
-        if count >= 10 {
-            return;
-        }
-        if n.is_error() || n.is_missing() {
-            let line = n.start_position().row as u32 + 1;
-            let message = if n.is_missing() {
-                format!("syntax error: missing `{}`", n.kind())
-            } else {
-                let excerpt: String = content[n.byte_range()].chars().take(40).collect();
-                format!("syntax error near `{}`", excerpt.trim())
-            };
-            out.push(Diag { file: file.to_string(), code: 0, message, line });
-            count += 1;
-            continue; // don't descend into an ERROR subtree
-        }
-        let mut c = n.walk();
-        for ch in n.children(&mut c) {
-            stack.push(ch);
-        }
-    }
-}
-
-/// Import/export specifier STRING nodes: `(inner range excluding quotes, specifier text)`.
-/// Specifiers never span lines, so the inner range is start col+1 .. end col-1.
-fn collect_spec_nodes(node: TsNode, bytes: &[u8], out: &mut Vec<(Value, String)>) {
-    if matches!(node.kind(), "import_statement" | "export_statement") {
-        if let Some(src) = node.child_by_field_name("source") {
-            let raw = src.utf8_text(bytes).unwrap_or("");
-            let spec = raw.trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
-            let (s, e) = (src.start_position(), src.end_position());
-            let range = json!({
-                "start": { "line": s.row, "character": s.column + 1 },
-                "end": { "line": e.row, "character": e.column.saturating_sub(1) },
-            });
-            out.push((range, spec));
-        }
-    }
-    let mut c = node.walk();
-    for ch in node.named_children(&mut c) {
-        collect_spec_nodes(ch, bytes, out);
-    }
-}
-
-/// `./`-style relative path from `from_dir` to `target` (both repo-relative).
-fn relative_specifier(from_dir: &Path, target: &Path) -> String {
-    let f: Vec<_> = from_dir.components().collect();
-    let t: Vec<_> = target.components().collect();
-    let common = f.iter().zip(t.iter()).take_while(|(a, b)| a == b).count();
-    let mut s = String::new();
-    if f.len() == common {
-        s.push_str("./");
-    } else {
-        for _ in common..f.len() {
-            s.push_str("../");
-        }
-    }
-    let tail: Vec<String> = t[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-    s + &tail.join("/")
-}
-
-/// Restyle `path_spec`'s extension to match how `old_spec` wrote it: `"./x.js"` keeps `.js`
-/// (TS convention), an extension-less specifier stays extension-less.
-fn with_spec_ext(path_spec: String, old_spec: &str) -> String {
-    let mut base = path_spec;
-    let slash = base.rfind('/').map_or(0, |i| i + 1);
-    if let Some(dot) = base[slash..].rfind('.') {
-        base.truncate(slash + dot);
-    }
-    let old_leaf = old_spec.rsplit('/').next().unwrap_or(old_spec);
-    if let Some(dot) = old_leaf.rfind('.') {
-        base.push_str(&old_leaf[dot..]);
-    }
-    base
-}
-
-fn collect_identifier_edits(node: TsNode, bytes: &[u8], old: &str, new: &str, out: &mut Vec<Value>) {
-    if is_ident(&node) && node.utf8_text(bytes).map(|t| t == old).unwrap_or(false) {
-        let s = node.start_position();
-        let e = node.end_position();
-        out.push(json!({
-            "range": {
-                "start": { "line": s.row, "character": s.column },
-                "end": { "line": e.row, "character": e.column },
-            },
-            "newText": new,
-        }));
-    }
-    let mut c = node.walk();
-    for ch in node.named_children(&mut c) {
-        collect_identifier_edits(ch, bytes, old, new, out);
-    }
-}
-
-// ── structure ────────────────────────────────────────────────────────────────
-
-/// Walk a statement list, emitting a `Node` per function / class. `fn_kind` is the kind for
-/// functions found here (Function at module level, Method inside a class body). `prefix` is the
-/// id stem (`"file.py#"`, or `"file.py#Class."` inside a class).
-fn collect_items(node: TsNode, bytes: &[u8], prefix: &str, fn_kind: SymbolKind, out: &mut Vec<Node>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "function_definition" => emit_fn(&child, bytes, prefix, fn_kind, out),
-            "class_definition" => emit_class(&child, bytes, prefix, out),
-            "decorated_definition" => {
-                if let Some(def) = child.child_by_field_name("definition") {
-                    match def.kind() {
-                        "function_definition" => emit_fn(&def, bytes, prefix, fn_kind, out),
-                        "class_definition" => emit_class(&def, bytes, prefix, out),
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn emit_fn(def: &TsNode, bytes: &[u8], prefix: &str, fn_kind: SymbolKind, out: &mut Vec<Node>) {
-    if let Some(mut n) = named_node(def, bytes, prefix, fn_kind) {
-        add_fn_subnodes(&mut n, def, bytes);
-        out.push(n);
-    }
-}
-
-fn emit_class(def: &TsNode, bytes: &[u8], prefix: &str, out: &mut Vec<Node>) {
-    if let Some(mut n) = named_node(def, bytes, prefix, SymbolKind::Class) {
-        let inner = format!("{prefix}{}.", n.name.as_deref().unwrap_or_default());
-        if let Some(body) = def.child_by_field_name("body") {
-            // class docstring → `:doc` anchor (parity with functions/methods).
-            if let Some(ds) = python_docstring(&body) {
-                n.children.push(syntax_node(&format!("{}:doc", n.id), None, "doc", &ds));
-            }
-        }
-        out.push(n);
-        if let Some(body) = def.child_by_field_name("body") {
-            collect_items(body, bytes, &inner, SymbolKind::Method, out);
-        }
-    }
-}
-
-fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Option<Node> {
-    let name_node = item.child_by_field_name("name")?;
-    let name = name_node.utf8_text(bytes).ok()?.to_string();
-    Some(Node {
-        id: format!("{prefix}{name}"),
-        name: Some(name),
-        kind: NodeKind::Symbol(kind),
-        range: ts_range(item),
-        name_range: Some(ts_range(&name_node)),
-        children: vec![],
-    })
-}
-
-fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
-    // The parameter list: a `parameters` field, else (C/C++) the one inside the declarator
-    // chain (`function_definition → function_declarator(parameters: …)`).
-    let params_node = item.child_by_field_name("parameters").or_else(|| {
-        let mut d = item.child_by_field_name("declarator")?;
-        for _ in 0..6 {
-            if let Some(p) = d.child_by_field_name("parameters") {
-                return Some(p);
-            }
-            d = d.child_by_field_name("declarator")?;
-        }
-        None
-    });
-    if let Some(params) = params_node {
-        // The whole `(...)` list — the insertion anchor for `add_parameter` / a missing return type.
-        n.children.push(syntax_node(&format!("{}:params", n.id), None, "params", &params));
-        let mut cursor = params.walk();
-        for (i, p) in params.named_children(&mut cursor).enumerate() {
-            // skip `self`/`cls` — they aren't meaningful edit targets
-            let name = p.utf8_text(bytes).ok().map(str::to_string);
-            if matches!(name.as_deref(), Some("self") | Some("cls")) {
-                continue;
-            }
-            n.children.push(syntax_node(&format!("{}:param.{i}", n.id), name, "parameter", &p));
-        }
-    }
-    // Return type field name varies by grammar: `return_type` (python/ruby), `result` (go),
-    // `type` (java's method_declaration return).
-    if let Some(rt) = item
-        .child_by_field_name("return_type")
-        .or_else(|| item.child_by_field_name("result"))
-        .or_else(|| item.child_by_field_name("type"))
-    {
-        n.children.push(syntax_node(&format!("{}:return", n.id), None, "returnType", &rt));
-    }
-    if let Some(body) = item.child_by_field_name("body") {
-        // Docstring = the first statement when it's a bare string literal — the `:doc` anchor.
-        if let Some(ds) = python_docstring(&body) {
-            n.children.push(syntax_node(&format!("{}:doc", n.id), None, "doc", &ds));
-        }
-        n.children.push(syntax_node(&format!("{}:body", n.id), None, "body", &body));
-    }
-}
-
-/// The docstring node of a function/class body: its first statement, if that statement is a bare
-/// string expression (`"""…"""` / `'…'`).
-fn python_docstring<'a>(body: &TsNode<'a>) -> Option<TsNode<'a>> {
-    let first = body.named_child(0)?;
-    if first.kind() == "expression_statement" {
-        let s = first.named_child(0)?;
-        if s.kind() == "string" {
-            return Some(s);
-        }
-    }
-    None
-}
-
-// ── import graph ─────────────────────────────────────────────────────────────
-
-/// Collect resolvable import edges from a file's syntax tree.
-fn collect_imports(node: TsNode, bytes: &[u8], from_rel: &str, root: &Path, out: &mut Vec<PathBuf>) {
-    match node.kind() {
-        "import_statement" => {
-            // `import a.b.c [as x], d.e` — each dotted name is an absolute module.
-            let mut c = node.walk();
-            for ch in node.named_children(&mut c) {
-                let dotted = match ch.kind() {
-                    "dotted_name" => Some(ch),
-                    "aliased_import" => ch.child_by_field_name("name"),
-                    _ => None,
-                };
-                if let Some(d) = dotted {
-                    let parts = dotted_parts(&d, bytes);
-                    push_absolute(root, &parts, out);
-                }
-            }
-        }
-        "import_from_statement" => {
-            if let Some(module) = node.child_by_field_name("module_name") {
-                let (level, mod_parts) = module_spec(&module, bytes);
-                if let Some(base) = base_dir(from_rel, level) {
-                    // the module itself (`from a.b import …` → a/b.py or a/b/__init__.py)
-                    if !mod_parts.is_empty() {
-                        if let Some(p) = resolve(root, &base, &mod_parts) {
-                            out.push(p);
-                        }
-                    }
-                    // each imported name, in case it's a submodule (`from pkg import sub`)
-                    for name in imported_names(&node, &module, bytes) {
-                        let mut parts = mod_parts.clone();
-                        parts.push(name);
-                        if let Some(p) = resolve(root, &base, &parts) {
-                            out.push(p);
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-    // Recurse: imports can be nested (inside functions / try blocks).
-    let mut c = node.walk();
-    for ch in node.named_children(&mut c) {
-        collect_imports(ch, bytes, from_rel, root, out);
-    }
-}
-
-/// JS/TS import edges from RELATIVE specifiers (`import … from './x'`, `export … from '../y'`).
-/// Bare specifiers are packages (skipped); TS convention `./x.js` resolves to `./x.ts`. Resolution
-/// tries the specifier as written, each source extension, then `index.<ext>` — misses cost an
-/// edge, never invent one.
-fn collect_js_imports(node: TsNode, bytes: &[u8], from_rel: &str, root: &Path, out: &mut Vec<PathBuf>) {
-    if matches!(node.kind(), "import_statement" | "export_statement") {
-        if let Some(src) = node.child_by_field_name("source") {
-            let spec = src.utf8_text(bytes).unwrap_or("").trim_matches(|c| c == '"' || c == '\'' || c == '`').to_string();
-            if spec.starts_with("./") || spec.starts_with("../") {
-                if let Some(p) = resolve_js_specifier(root, from_rel, &spec) {
-                    out.push(p);
-                }
-            }
-        }
-    }
-    let mut c = node.walk();
-    for ch in node.named_children(&mut c) {
-        collect_js_imports(ch, bytes, from_rel, root, out);
-    }
-}
-
-fn resolve_js_specifier(root: &Path, from_rel: &str, spec: &str) -> Option<PathBuf> {
-    // Lexically normalize `./` and `../` so graph keys stay clean repo-relative paths.
-    let joined = Path::new(from_rel).parent().unwrap_or(Path::new("")).join(spec);
-    let mut base = PathBuf::new();
-    for c in joined.components() {
-        match c {
-            std::path::Component::ParentDir => {
-                base.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => base.push(other),
-        }
-    }
-    // `./x.js` in TS source means `./x.ts` on disk — strip a source extension before probing.
-    let stripped = ["js", "mjs", "cjs", "jsx", "ts", "tsx", "mts", "cts"]
-        .iter()
-        .find(|e| base.extension().and_then(|x| x.to_str()) == Some(**e))
-        .map(|_| base.with_extension(""))
-        .unwrap_or_else(|| base.clone());
-    const EXTS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
-    let mut candidates = vec![base.clone()];
-    for e in EXTS {
-        candidates.push(stripped.with_extension(e));
-    }
-    for e in EXTS {
-        candidates.push(stripped.join(format!("index.{e}")));
-    }
-    candidates.into_iter().find(|c| root.join(c).is_file()).map(|c| norm(&c))
-}
-
-/// `import a.b.c` → try `a/b/c.py`, `a/b/c/__init__.py` from the repo root and `src/`.
-fn push_absolute(root: &Path, parts: &[String], out: &mut Vec<PathBuf>) {
-    for base in [PathBuf::new(), PathBuf::from("src")] {
-        if let Some(p) = resolve(root, &base, parts) {
-            out.push(p);
-            return;
-        }
-    }
-}
-
-/// Split a `dotted_name` into its identifier parts.
-fn dotted_parts(node: &TsNode, bytes: &[u8]) -> Vec<String> {
-    node.utf8_text(bytes).unwrap_or("").split('.').filter(|s| !s.is_empty()).map(str::to_string).collect()
-}
-
-/// `(level, parts)` for a `module_name`: a `dotted_name` is absolute (level 0); a
-/// `relative_import` carries leading dots (level = dot count) and an optional dotted tail.
-fn module_spec(node: &TsNode, bytes: &[u8]) -> (usize, Vec<String>) {
-    match node.kind() {
-        "dotted_name" => (0, dotted_parts(node, bytes)),
-        "relative_import" => {
-            let mut level = 0;
-            let mut parts = Vec::new();
-            let mut c = node.walk();
-            for ch in node.children(&mut c) {
-                match ch.kind() {
-                    "import_prefix" => level = ch.utf8_text(bytes).unwrap_or("").matches('.').count(),
-                    "dotted_name" => parts = dotted_parts(&ch, bytes),
-                    _ => {}
-                }
-            }
-            (level.max(1), parts)
-        }
-        _ => (0, vec![]),
-    }
-}
-
-/// The imported names of a `from … import a, b as c` (skips the module_name node + wildcard).
-fn imported_names(stmt: &TsNode, module: &TsNode, bytes: &[u8]) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut c = stmt.walk();
-    for ch in stmt.named_children(&mut c) {
-        if ch.id() == module.id() {
-            continue;
-        }
-        match ch.kind() {
-            "dotted_name" => {
-                if let Some(first) = dotted_parts(&ch, bytes).into_iter().next() {
-                    names.push(first);
-                }
-            }
-            "aliased_import" => {
-                if let Some(n) = ch.child_by_field_name("name") {
-                    if let Some(first) = dotted_parts(&n, bytes).into_iter().next() {
-                        names.push(first);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    names
-}
-
-/// The package directory a relative import is anchored at. Level 0 (absolute) → repo root;
-/// level 1 → the file's own directory; each extra dot ascends one more.
-fn base_dir(from_rel: &str, level: usize) -> Option<PathBuf> {
-    if level == 0 {
-        return Some(PathBuf::new());
-    }
-    let mut dir = Path::new(from_rel).parent()?.to_path_buf();
-    for _ in 1..level {
-        dir = dir.parent()?.to_path_buf();
-    }
-    Some(dir)
-}
-
-/// Resolve `base/parts…` to a repo-relative `.py` file or package `__init__.py`, if it exists.
-fn resolve(root: &Path, base: &Path, parts: &[String]) -> Option<PathBuf> {
-    if parts.is_empty() {
-        return None;
-    }
-    let mut p = base.to_path_buf();
-    for part in parts {
-        p.push(part);
-    }
-    let as_file = p.with_extension("py");
-    if root.join(&as_file).is_file() {
-        return Some(norm(&as_file));
-    }
-    let as_init = p.join("__init__.py");
-    if root.join(&as_init).is_file() {
-        return Some(norm(&as_init));
-    }
-    None
-}
-
-fn norm(p: &Path) -> PathBuf {
-    PathBuf::from(p.to_string_lossy().replace('\\', "/"))
-}
-
-/// Repo-relative source files with the given extension, gitignore-aware.
-fn source_files(root: &Path, ext: &str) -> Vec<String> {
+    let Some(tree) = parser.parse(content, None) else { return Vec::new() };
     let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(root).build().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some(ext) {
-            continue;
-        }
-        if let Ok(rel) = path.strip_prefix(root) {
-            out.push(rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
+    collect_string_comment(tree.root_node(), &mut out);
     out
 }
 
-fn has_ext(root: &Path, ext: &str) -> bool {
-    !source_files(root, ext).is_empty()
+/// Byte offset where each line begins (line 0 at 0, then just past each `\n`) — maps a movefix
+/// `(line, column)` reference span to an absolute content offset for [`string_comment_spans`]
+/// masking. CRLF-safe: only line STARTS are recorded, and a column is start-relative either way.
+pub fn line_start_offsets(content: &str) -> Vec<usize> {
+    std::iter::once(0).chain(content.match_indices('\n').map(|(i, _)| i + 1)).collect()
+}
+
+fn collect_string_comment(node: tree_sitter::Node, out: &mut Vec<(usize, usize)>) {
+    if is_string_or_comment(node.kind()) {
+        out.push((node.start_byte(), node.end_byte()));
+        return; // the whole node is masked — an interpolated var inside a string is no rewrite target
+    }
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        collect_string_comment(child, out);
+    }
+}
+
+/// Grammar-version-robust string/comment classification: match on kind SUBSTRINGS so a renamed
+/// node (`string_literal` vs `string` vs `encapsed_string`; `line_comment` vs `comment`) still
+/// masks. Over-masking a rare coincidental kind is harmless — it only suppresses a name rewrite
+/// there, and the move fallback is best-effort by design.
+fn is_string_or_comment(kind: &str) -> bool {
+    kind.contains("string")
+        || kind.contains("comment")
+        || kind == "heredoc"
+        || kind == "nowdoc"
+        || kind == "text_block"
+        || kind == "character_literal"
+        || kind == "char_literal"
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ci_core::NodeKind;
     use std::fs;
 
     /// One structure() round-trip per generic language: write a source file, assert the
@@ -1120,6 +496,37 @@ mod tests {
         assert_eq!(edges, &vec![PathBuf::from("src/util/math.ts")], ".js specifier resolved to .ts: {edges:?}");
     }
 
+    // The Java resolver: `import a.b.C` -> a real repo edge under the conventional source
+    // root, and CONSERVATIVE per contract §3 — an external import (`java.util.List`, no
+    // in-repo source) contributes NO edge, never a guessed one.
+    #[test]
+    fn java_import_graph_resolves_in_repo_and_invents_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("src/main/java/app")).unwrap();
+        std::fs::create_dir_all(root.join("src/main/java/lib")).unwrap();
+        std::fs::write(
+            root.join("src/main/java/app/Svc.java"),
+            "package app;\n\nimport lib.Dep;\nimport java.util.List;\n\npublic class Svc {\n  public int probe() {\n    return new Dep().value();\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("src/main/java/lib/Dep.java"),
+            "package lib;\n\npublic class Dep {\n  public int value() {\n    return 1;\n  }\n}\n",
+        )
+        .unwrap();
+
+        let prov = FallbackProvider::new(root, FbLang::Java);
+        let g = prov.import_graph().unwrap();
+        let edges = g.get(&PathBuf::from("src/main/java/app/Svc.java")).expect("Svc.java edges");
+        // The in-repo import resolves; the external `java.util.List` is silently dropped.
+        assert_eq!(
+            edges,
+            &vec![PathBuf::from("src/main/java/lib/Dep.java")],
+            "only the in-repo import is an edge (no invented edge for java.util.List): {edges:?}"
+        );
+    }
+
     #[test]
     fn go_structure_functions_methods_types() {
         let nodes = generic_structure(
@@ -1152,6 +559,201 @@ mod tests {
         assert!(matches!(probe.kind, NodeKind::Symbol(SymbolKind::Method)), "member kind: {:?}", probe.kind);
         assert!(probe.children.iter().any(|c| c.id.ends_with(":body")), "java body sub-node");
         assert!(!ids.contains(&"Svc.java#hits"), "fields are not emitted (no local noise): {ids:?}");
+    }
+
+    // The tree-sitter-php grammar LOADS at the pinned core ABI (0.26.10) — a one-line parse
+    // that would panic/return None on an ABI mismatch — and the FULL grammar parses
+    // HTML-interleaved `.php` without choking. This is the spec's residual grammar-load check.
+    #[test]
+    fn php_grammar_loads_at_pinned_abi() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = FallbackProvider::new(dir.path(), FbLang::Php);
+        let tree = p.parse("<?php\nfunction f() { return 1; }\n?>\n<div>html</div>\n").expect("php parses");
+        assert!(!tree.root_node().is_error(), "php root node parses clean (grammar ABI ok)");
+    }
+
+    #[test]
+    fn php_structure_class_members_qualified() {
+        let nodes = generic_structure(
+            FbLang::Php,
+            "Svc.php",
+            "<?php\nnamespace App;\n\n// Probes the service.\nclass Svc {\n  private int $hits = 0;\n  const MAX = 5;\n  public function probe(string $url): int {\n    return 1;\n  }\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"Svc.php#Svc"), "php class: {ids:?}");
+        assert!(ids.contains(&"Svc.php#Svc.probe"), "php method qualified: {ids:?}");
+        assert!(ids.iter().any(|i| i.starts_with("Svc.php#Svc.") && i.contains("hits")), "php property: {ids:?}");
+        assert!(ids.contains(&"Svc.php#Svc.MAX"), "php const: {ids:?}");
+        let probe = nodes.iter().find(|n| n.id == "Svc.php#Svc.probe").unwrap();
+        assert!(matches!(probe.kind, NodeKind::Symbol(SymbolKind::Method)), "member kind: {:?}", probe.kind);
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":body")), "php body sub-node");
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":return")), "php return sub-node (suffix-typed)");
+        let svc = nodes.iter().find(|n| n.id == "Svc.php#Svc").unwrap();
+        assert!(svc.children.iter().any(|c| c.id.ends_with(":doc")), "leading comment -> :doc");
+    }
+
+    // Bare-return `function` at top level (no class) is a Function, not a Method.
+    #[test]
+    fn php_top_level_function() {
+        let nodes = generic_structure(
+            FbLang::Php,
+            "helpers.php",
+            "<?php\nfunction fold(int $n): int {\n  return $n;\n}\n",
+        );
+        let f = nodes.iter().find(|n| n.id == "helpers.php#fold").expect("top-level fn");
+        assert!(matches!(f.kind, NodeKind::Symbol(SymbolKind::Function)), "top-level fn is Function: {:?}", f.kind);
+    }
+
+    // PSR-4: `use App\Lib\Dep;` under `"App\\": "src/"` resolves to `src/Lib/Dep.php`; a vendor
+    // class (no PSR-4 prefix) and a repo with no composer.json contribute NO edge (contract §3).
+    #[test]
+    fn php_import_graph_psr4_resolves_and_invents_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/App/Lib")).unwrap();
+        fs::write(
+            root.join("composer.json"),
+            "{\n  \"autoload\": { \"psr-4\": { \"App\\\\\": \"src/App/\" } }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/App/Svc.php"),
+            "<?php\nnamespace App;\nuse App\\Lib\\Dep;\nuse Psr\\Log\\LoggerInterface;\nclass Svc {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/App/Lib/Dep.php"), "<?php\nnamespace App\\Lib;\nclass Dep {}\n").unwrap();
+
+        let p = FallbackProvider::new(root, FbLang::Php);
+        let g = p.import_graph().unwrap();
+        let edges = g.get(&PathBuf::from("src/App/Svc.php")).expect("Svc.php edges");
+        assert_eq!(
+            edges,
+            &vec![PathBuf::from("src/App/Lib/Dep.php")],
+            "only the PSR-4-resolvable in-repo use is an edge (no invented edge for the vendor class): {edges:?}"
+        );
+    }
+
+    #[test]
+    fn php_import_graph_empty_without_composer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Svc.php"), "<?php\nuse App\\Lib\\Dep;\nclass Svc {}\n").unwrap();
+        let p = FallbackProvider::new(root, FbLang::Php);
+        assert!(p.import_graph().unwrap().is_empty(), "no composer.json => the honest empty graph");
+    }
+
+    // PSR-4 is EXCLUSIVE: the longest matching prefix OWNS the FQCN. When its mapped dir doesn't
+    // hold the file, the class is unresolved — resolution must NOT fall through to a broader prefix
+    // and land on a coincidental shadow file (an invented edge that inverts delete-safety, §3).
+    #[test]
+    fn php_psr4_longest_prefix_owns_no_fallthrough_to_shadow() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/Sub")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(
+            root.join("composer.json"),
+            "{ \"autoload\": { \"psr-4\": { \"App\\\\\": \"src/\", \"App\\\\Sub\\\\\": \"other/\" } } }\n",
+        )
+        .unwrap();
+        // The SHADOW file lives under the broad `App\` prefix; the OWNER dir (`other/`) is empty.
+        fs::write(root.join("src/Sub/Thing.php"), "<?php\nnamespace App\\Sub;\nclass Thing {}\n").unwrap();
+        fs::write(
+            root.join("src/Consumer.php"),
+            "<?php\nnamespace App;\nuse App\\Sub\\Thing;\nclass Consumer {}\n",
+        )
+        .unwrap();
+
+        let p = FallbackProvider::new(root, FbLang::Php);
+        let g = p.import_graph().unwrap();
+        assert!(
+            g.get(&PathBuf::from("src/Consumer.php")).map(|e| e.is_empty()).unwrap_or(true),
+            "App\\Sub\\ owns the FQCN; its dir is empty => unresolved, NOT the src/Sub/Thing.php shadow: {:?}",
+            g.get(&PathBuf::from("src/Consumer.php"))
+        );
+    }
+
+    // Java resolution must VERIFY the target declares the import's package: a file sitting at the
+    // import's path but belonging to a DIFFERENT package is a path coincidence, not a dependency —
+    // emitting the edge would invent one (contract §3), worst in the flat-root fallback.
+    #[test]
+    fn java_import_no_edge_on_package_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("util")).unwrap();
+        fs::write(root.join("App.java"), "import util.Helper;\npublic class App {}\n").unwrap();
+        // A file at util/Helper.java, but it declares a DIFFERENT package — not `util.Helper`.
+        fs::write(root.join("util/Helper.java"), "package wrongpkg;\npublic class Helper {}\n").unwrap();
+
+        let p = FallbackProvider::new(root, FbLang::Java);
+        let g = p.import_graph().unwrap();
+        assert!(
+            g.get(&PathBuf::from("App.java")).map(|e| e.is_empty()).unwrap_or(true),
+            "package mismatch => no edge (path coincidence, not a real dependency): {:?}",
+            g.get(&PathBuf::from("App.java"))
+        );
+    }
+
+    // The tree-sitter-swift grammar LOADS at the pinned core ABI (0.26.10) — a one-line parse
+    // that would panic/return None on an ABI mismatch. The spec flags ABI-14-in-core-0.26 as
+    // inference, so this load test is REQUIRED, not optional.
+    #[test]
+    fn swift_grammar_loads_at_pinned_abi() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = FallbackProvider::new(dir.path(), FbLang::Swift);
+        let tree = p.parse("import Foundation\nfunc f() -> Int { return 1 }\n").expect("swift parses");
+        assert!(!tree.root_node().has_error(), "swift root node parses clean (grammar ABI ok)");
+    }
+
+    // Swift structure: the grammar collapses struct/class/enum/extension onto `class_declaration`
+    // (protocol has its own node), members qualify under their container, `func`/`init` carry
+    // `:body` + `:params` + a SUFFIX `:return`, a `var`/`let` property is a Field, and a leading
+    // `///` comment surfaces as `:doc`.
+    #[test]
+    fn swift_structure_types_members_and_subnodes() {
+        let nodes = generic_structure(
+            FbLang::Swift,
+            "Svc.swift",
+            "/// A service.\nclass Svc {\n  var hits: Int = 0\n  func probe(url: String) -> Bool {\n    return true\n  }\n  init(x: Int) { self.hits = x }\n}\n\nstruct Bucket {\n  let p99: Double = 0\n}\n\nprotocol Pinger {\n  func ping() -> Int\n}\n\nenum Color { case red, green }\n\nfunc topLevel(n: Int) -> Int {\n  return n\n}\n",
+        );
+        let ids: Vec<&str> = nodes.iter().map(|n| n.id.as_str()).collect();
+        assert!(ids.contains(&"Svc.swift#Svc"), "class: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Svc.probe"), "method qualified by class: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Svc.hits"), "property qualified by class: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Bucket"), "struct (also class_declaration): {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Bucket.p99"), "struct property: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Pinger"), "protocol: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Pinger.ping"), "protocol requirement: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Color"), "enum (also class_declaration): {ids:?}");
+        assert!(ids.contains(&"Svc.swift#Color.red"), "enum case via first enum_entry name: {ids:?}");
+        assert!(ids.contains(&"Svc.swift#topLevel"), "top-level function: {ids:?}");
+
+        let probe = nodes.iter().find(|n| n.id == "Svc.swift#Svc.probe").unwrap();
+        assert!(matches!(probe.kind, NodeKind::Symbol(SymbolKind::Method)), "member kind: {:?}", probe.kind);
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":body")), "swift :body sub-node");
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":params")), "swift :params sub-node");
+        assert!(probe.children.iter().any(|c| c.id.ends_with(":return")), "swift suffix :return sub-node");
+
+        let svc = nodes.iter().find(|n| n.id == "Svc.swift#Svc").unwrap();
+        assert!(svc.children.iter().any(|c| c.id.ends_with(":doc")), "leading /// comment -> :doc");
+        let top = nodes.iter().find(|n| n.id == "Svc.swift#topLevel").unwrap();
+        assert!(matches!(top.kind, NodeKind::Symbol(SymbolKind::Function)), "top-level fn is Function: {:?}", top.kind);
+    }
+
+    // Swift imports are MODULE-level (SwiftPM targets glob directories), so there are no
+    // file-file edges to extract — the honest empty graph (contract §3, the module-model note in
+    // the rollout spec). `import Foundation` contributes nothing, never a guessed edge.
+    #[test]
+    fn swift_import_graph_is_empty_by_design() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("A.swift"), "import Foundation\nstruct A {}\n").unwrap();
+        fs::write(root.join("B.swift"), "struct B {}\n").unwrap();
+        let p = FallbackProvider::new(root, FbLang::Swift);
+        assert!(
+            p.import_graph().unwrap().is_empty(),
+            "module-level imports yield no file edges — the honest empty graph"
+        );
     }
 
     #[test]
@@ -1263,6 +865,67 @@ mod tests {
         let edges = g.get(&PathBuf::from("app.py")).expect("app.py edges");
         assert!(edges.contains(&PathBuf::from("pkg/math_utils.py")), "from pkg.math_utils: {edges:?}");
         assert!(edges.contains(&PathBuf::from("pkg/__init__.py")), "import pkg: {edges:?}");
+    }
+
+    // Java import resolution over a MAVEN layout: `import a.b.C` under `src/main/java` resolves
+    // to the file, a wildcard resolves to the package's files, and an EXTERNAL dependency
+    // (`java.util.List`) produces zero edges (contract §3 — no invented edge).
+    #[test]
+    fn java_import_graph_maven_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/main/java/com/acme/util")).unwrap();
+        fs::write(
+            root.join("src/main/java/com/acme/App.java"),
+            "package com.acme;\nimport com.acme.util.Helper;\nimport com.acme.util.*;\nimport java.util.List;\npublic class App {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main/java/com/acme/util/Helper.java"),
+            "package com.acme.util;\npublic class Helper {}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/main/java/com/acme/util/Extra.java"),
+            "package com.acme.util;\npublic class Extra {}\n",
+        )
+        .unwrap();
+
+        let p = FallbackProvider::new(root, FbLang::Java);
+        let g = p.import_graph().unwrap();
+        let edges = g.get(&PathBuf::from("src/main/java/com/acme/App.java")).expect("App.java edges");
+        assert!(
+            edges.contains(&PathBuf::from("src/main/java/com/acme/util/Helper.java")),
+            "explicit import resolved under the maven source root: {edges:?}"
+        );
+        assert!(
+            edges.contains(&PathBuf::from("src/main/java/com/acme/util/Extra.java")),
+            "wildcard import pulled in the package's other file: {edges:?}"
+        );
+        assert!(
+            !edges.iter().any(|e| e.to_string_lossy().contains("java/util")),
+            "external dependency (java.util.List) produces NO edge: {edges:?}"
+        );
+    }
+
+    // Java import resolution over a FLAT layout (no src/main/java): the package-decl-to-path
+    // offset makes the repo root the source root, so `import com.x.B` still resolves.
+    #[test]
+    fn java_import_graph_flat_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("com/x")).unwrap();
+        fs::write(
+            root.join("com/x/A.java"),
+            "package com.x;\nimport com.x.B;\npublic class A {}\n",
+        )
+        .unwrap();
+        fs::write(root.join("com/x/B.java"), "package com.x;\npublic class B {}\n").unwrap();
+
+        let p = FallbackProvider::new(root, FbLang::Java);
+        let g = p.import_graph().unwrap();
+        let edges = g.get(&PathBuf::from("com/x/A.java")).expect("A.java edges");
+        assert_eq!(edges, &vec![PathBuf::from("com/x/B.java")], "flat-layout import resolved via package offset: {edges:?}");
     }
 
     #[test]

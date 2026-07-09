@@ -1,35 +1,31 @@
-//! lang-ts — the TypeScript [`LanguageProvider`]. v1 read path: run
-//! `scip-typescript` (via `npx`, no global install) to produce `index.scip`, then
-//! serve `structure()` + `import_graph()` from [`ScipIndex`]. The write path
-//! (VFS + LSP gate) lands in P2.
+//! lang-ts — the TypeScript [`LanguageProvider`]. Read path: run `scip-typescript` (via
+//! `npx`, no global install) to produce `index.scip`, then serve `structure()` +
+//! `import_graph()` from [`ScipIndex`], deepened with tree-sitter sub-nodes. Write path:
+//! the tsgo/ts-morph/tsls engine behind the shared `ci_edit::commit_edits` gate.
 use ci_core::{
-    CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph, LanguageProvider,
-    Node, Result,
+    rel_path, CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
+    LanguageProvider, Node, ReadIndex, Result,
 };
-use ci_edit::GateEngine;
+use ci_edit::Composed;
 use ci_scip::ScipIndex;
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+mod ablation;
 mod ast;
+mod engine;
 mod fingerprint;
 mod outline;
 mod tsmorph;
 
-use fingerprint::{fingerprint_path, fingerprint_drift, hash_file, load_fingerprint, source_fingerprint, store_fingerprint, Fingerprint};
+use engine::start_engine;
+use fingerprint::{augment_fingerprint, fingerprint_path, fingerprint_drift, load_fingerprint, source_fingerprint, store_fingerprint, Fingerprint};
 
+pub use ablation::TsTreeGated;
 pub use outline::outline;
 
-/// Pinned TS toolchain. Unpinned npx/npm floats to "latest", which drifts under us: a new
-/// scip-typescript can change index content between two startups (silently invalidating the
-/// cache semantics), and a new tsserver/typescript changes what the gate accepts. Bump these
-/// deliberately; `SCIP_TS_VERSION` participates in the source fingerprint, so bumping it
-/// reindexes on the next startup.
-pub(crate) const SCIP_TS_VERSION: &str = "0.4.0";
-const TS_LSP_VERSION: &str = "5.3.0";
-const TYPESCRIPT_VERSION: &str = "6.0.3";
+pub(crate) use engine::{npm_cache, NpxCacheLock, SCIP_TS_VERSION};
 
 /// What ONE bare `move_file` covers for TypeScript — composed into the MCP `apply_edits`
 /// description by ci-mcp, so the completeness claim the agent reads lives NEXT TO the code
@@ -61,12 +57,6 @@ pub fn toolchain() -> ci_core::ToolchainReport {
     }
 }
 
-/// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`. Shared with the
-/// ts-morph sidecar (`tsmorph.rs`) so both TS tooling paths use the same cache location.
-pub(crate) fn npm_cache() -> PathBuf {
-    std::env::var("CI_NPM_CACHE").map(PathBuf::from).unwrap_or_else(|_| std::env::temp_dir().join("ci-npm-cache"))
-}
-
 /// The TS/TSX sources the LSP sweep indexes: gitignore-aware walk, `.d.ts` and the usual
 /// build/dependency dirs excluded (scip-typescript's own discovery is tsconfig-driven; this
 /// walk is the sweep arm's approximation of it).
@@ -93,127 +83,99 @@ fn discover_ts_files(root: &Path) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-/// A best-effort cross-process advisory lock so concurrent `npx` invocations don't corrupt the
-/// SHARED npm cache. `npx --yes` stages packages into `<cache>/_npx/<hash>` with atomic renames;
-/// two invocations racing there produce `ENOTEMPTY` / half-installed packages (`Cannot find module
-/// './Counter'`), so scip-typescript fails intermittently whenever several MCP instances start at
-/// once (an agent benchmark, or a few editor sessions). Held for the npx run, released on drop.
-/// Best-effort: a stale lock (crashed holder) is stolen after 5 min, and we give up waiting after
-/// 3 min and proceed unlocked rather than ever hang the tool.
-pub(crate) struct NpxCacheLock(PathBuf);
-
-impl NpxCacheLock {
-    pub(crate) fn acquire() -> Option<Self> {
-        let dir = npm_cache();
-        let _ = std::fs::create_dir_all(&dir);
-        let lock = dir.join(".npx.lock");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-        loop {
-            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
-                Ok(_) => return Some(NpxCacheLock(lock)),
-                Err(_) => {
-                    let stale = std::fs::metadata(&lock)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|e| e.as_secs() > 300);
-                    if stale {
-                        let _ = std::fs::remove_file(&lock);
-                        continue;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        return None;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            }
-        }
-    }
-}
-
-impl Drop for NpxCacheLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// A persistent, warmed-once gate engine (ts-morph sidecar or LSP server), reused across
-/// edits. The whole reason rust `apply_edits` was 68s was a COLD engine per call (project
-/// typecheck from scratch); keeping one warm here is the fix. Behind a Mutex so [`prewarm`]
-/// can load the project on a background thread while the agent is still searching/thinking.
-type WarmEngine = Arc<Mutex<Option<Box<dyn GateEngine + Send>>>>;
-
+/// The TypeScript provider, assembled from its two halves — [`TsRead`] (the scip-artifact
+/// read index the agent plans against) × the write engine (tsgo/ts-morph/tsls, selected in
+/// `engine.rs`) — glued by [`Composed`]: post-commit read freshness and the blast-radius
+/// policy are derived from the reader's advertised properties (`live`/`semantic_edges`),
+/// never hand-wired here. What stays TS-specific in this crate: the scip indexing
+/// orchestration + fingerprint cache, the tree-sitter deepen/re-anchor merge, the engine
+/// selection ladder, and the npm/NPX cache discipline.
 #[derive(Clone)]
 pub struct TsProvider {
-    root: PathBuf,
     // Arc so the provider is cheap to clone out of the MCP server's lock; the SCIP index and
-    // the warm engine are shared, not copied.
+    // the glue (with its warm engine + fresh overrides) are shared, not copied.
+    /// Shared with the read half; also held here for the fingerprint augment (`index_with`)
+    /// and the prewarmer's warm-file pick.
     scip: Arc<ScipIndex>,
-    engine: WarmEngine,
-    /// Per-file read overrides captured from the write engine right after a committed edit
-    /// (see `GateEngine::file_summaries`). The loaded SCIP index is a startup artifact: without
-    /// this, a symbol ADDED by an edit stays invisible to structure()/list_anchors and the
-    /// import graph keeps pre-edit edges until the next reindex. Keyed by repo-relative path;
-    /// consulted before the SCIP index, cleared implicitly by the next startup (re)index.
-    fresh: Arc<Mutex<HashMap<String, FileSummary>>>,
+    inner: Arc<Composed<TsRead>>,
 }
 
-/// Start the lightest available write engine for `root`: ts-morph in-process (synchronous,
-/// no LSP settle race) when its sidecar can start, else the generic LSP server. Override with
-/// `CI_EDIT_ENGINE=lsp|tsmorph`.
-/// Engine preference: **tsgo → ts-morph → tsls**. tsgo (the TS7 native LSP) gates ~138x
-/// faster warm than the alternatives with identical verdicts (docs/benchmarks.md), but is
-/// auto-picked only when it needs NO network (`CI_TSGO`, or `tsgo` on PATH) — a surprise npx
-/// download doesn't belong in the middle of someone's first edit. `CI_EDIT_ENGINE` forces one
-/// tier: `tsgo` | `tsmorph` | `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names).
-fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
-    let pref = std::env::var("CI_EDIT_ENGINE").unwrap_or_default();
-    match pref.as_str() {
-        "tsgo" => return Ok(Box::new(ci_lsp::LspClient::start(root, TsProvider::tsgo_lsp_command())?)),
-        "lsp" => return start_tsls(root),
-        _ => {}
-    }
-    if pref.is_empty() {
-        if let Some(bin) = local_tsgo() {
-            let mut c = Command::new(bin);
-            c.args(["--lsp", "-stdio"]);
-            match ci_lsp::LspClient::start(root, c) {
-                Ok(client) => return Ok(Box::new(client)),
-                Err(e) => eprintln!("[lang-ts] local tsgo failed to start ({e}); falling back to ts-morph"),
-            }
-        }
-    }
-    match tsmorph::TsMorphClient::start(root) {
-        Ok(c) => return Ok(Box::new(c)),
-        Err(e) if pref == "tsmorph" => return Err(e), // forced: surface the failure
-        Err(_) => {} // auto: fall back to LSP
-    }
-    start_tsls(root)
+/// The TypeScript READ half ([`ReadIndex`]): a loaded SCIP artifact (scip-typescript, or
+/// the tsgo LSP sweep — same consumer) whose symbols are re-anchored and deepened with
+/// tree-sitter sub-nodes against CURRENT disk on every read. An artifact through and
+/// through: `live` is false — the loaded index is a startup snapshot, so without the glue's
+/// freshness overlay a symbol ADDED by an edit stays invisible and the import graph keeps
+/// pre-edit edges until the next reindex — and its edges are `semantic` (the
+/// compiler-resolved graph flattens barrels, so the one-hop blast radius is sound —
+/// bench T9).
+#[derive(Clone)]
+struct TsRead {
+    root: PathBuf,
+    scip: Arc<ScipIndex>,
 }
 
-/// The tsls fallback tier, with the toolchain-aware error message.
-fn start_tsls(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
-    match ci_lsp::LspClient::start(root, TsProvider::ts_lsp_command()) {
-        Ok(c) => Ok(Box::new(c)),
-        // Both engines need Node; when the toolchain itself is the problem, say THAT (with the
-        // install hint) instead of a raw spawn error.
-        Err(e) => match toolchain().describe_missing() {
-            Some(missing) => Err(Error::Driver(format!("TypeScript edit engine failed to start ({e}).\n{missing}"))),
-            None => Err(e),
-        },
+impl ReadIndex for TsRead {
+    fn granularity(&self) -> Granularity {
+        Granularity::Ast // SCIP symbols + tree-sitter sub-nodes
+    }
+
+    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
+        let rel = rel_path(&self.root, file);
+        Ok(deepen_from_disk(&self.root, &rel, self.scip.structure(&rel)?))
+    }
+
+    fn import_graph(&self) -> Result<ImportGraph> {
+        self.scip.import_graph()
+    }
+
+    fn live(&self) -> bool {
+        false
+    }
+
+    fn semantic_edges(&self) -> bool {
+        true
     }
 }
 
-/// A tsgo binary that costs nothing to use: `CI_TSGO`, else a `tsgo` on PATH. `None` means
-/// the auto tier skips tsgo (explicit `CI_EDIT_ENGINE=tsgo` may still fetch via npx).
-fn local_tsgo() -> Option<PathBuf> {
-    if let Ok(bin) = std::env::var("CI_TSGO") {
-        return Some(PathBuf::from(bin));
+/// The read-time tree-sitter merge: subdivide each SCIP symbol into sub-nodes
+/// (params/return/body/doc) and re-anchor symbols whose file drifted since the index was
+/// built (`ast::deepen`), from CURRENT disk content. `CI_NO_TREESITTER` skips the merge
+/// (SCIP-only — for the benchmark); no content on disk serves the symbols shallow. Both the
+/// read half and the glue's fresh-summary path (the [`ci_edit::FreshDeepener`]) run THIS
+/// step, so a post-commit override reads at the same AST depth as an artifact read.
+fn deepen_from_disk(root: &Path, rel: &str, nodes: Vec<Node>) -> Vec<Node> {
+    if std::env::var("CI_NO_TREESITTER").is_ok() {
+        return nodes;
     }
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .flat_map(|d| ["tsgo", "tsgo.exe", "tsgo.cmd"].map(|n| d.join(n)))
-        .find(|p| p.is_file())
+    match std::fs::read_to_string(root.join(rel)) {
+        Ok(content) => ast::deepen(&content, nodes),
+        Err(_) => nodes,
+    }
+}
+
+/// Re-describe one committed file for the glue's freshness channel — the fallback when the
+/// write engine can't re-describe its live project (`file_summaries` -> `None`: the LSP
+/// engines, tsgo/tsls; the ts-morph sidecar serves real summaries and never gets here).
+/// Tree-sitter on CURRENT disk — the same read shape [`TsTreeGated`] serves — so reads
+/// track the commit instead of serving pre-edit state; scip fidelity (flattened barrels,
+/// semantic edges) returns at the next reindex. Per-file: only the changed files are
+/// parsed, never a whole-repo walk per commit. EVERY changed file gets a summary (a non-TS
+/// file simply reads back empty), so no committed change can be served stale.
+fn file_summary(root: &Path, rel: &str) -> FileSummary {
+    let fb = lang_fallback::FallbackProvider::new(root, lang_fallback::FbLang::Ts);
+    let deleted = !root.join(rel).exists();
+    let (nodes, imports) = if deleted {
+        (vec![], vec![])
+    } else {
+        (LanguageProvider::structure(&fb, Path::new(rel)).unwrap_or_default(), fb.file_imports(rel))
+    };
+    FileSummary { path: rel.into(), deleted, nodes, imports }
+}
+
+/// Builds the write engine (lazily in `apply_edits`, or via the prewarmer): the selection
+/// ladder in `engine.rs` (tsgo → ts-morph → tsls), with its toolchain-aware error.
+fn engine_factory() -> ci_edit::EngineFactory {
+    Arc::new(|root: &Path| start_engine(root))
 }
 
 impl TsProvider {
@@ -282,13 +244,7 @@ impl TsProvider {
         // tsconfig still includes) so their edits invalidate the cache too. Hashed AFTER the
         // run, so the conservative pre-run guarantee narrows to just these hidden files.
         let mut fp = fp;
-        for doc in provider.scip.documents() {
-            if let std::collections::btree_map::Entry::Vacant(slot) = fp.entry(doc) {
-                if let Some(h) = hash_file(&root.join(slot.key())) {
-                    slot.insert(h);
-                }
-            }
-        }
+        augment_fingerprint(&mut fp, root, provider.scip.documents());
         if let Err(e) = store_fingerprint(&fingerprint_path(root), &fp) {
             // Not fatal: without a fingerprint the next `open` just reindexes.
             eprintln!("[lang-ts] could not persist the index fingerprint ({e}); next startup will reindex");
@@ -303,7 +259,7 @@ impl TsProvider {
     /// scip-typescript index. No fingerprint cache yet: this arm always re-sweeps.
     pub fn index_with_lsp_sweep(root: &Path) -> Result<Self> {
         let files = discover_ts_files(root)?;
-        let bytes = ci_lsp_index::sweep_index(root, &files, Self::tsgo_lsp_command(), "lspx-ts")?;
+        let bytes = ci_lsp_index::sweep_index(root, &files, engine::tsgo_lsp_command(), "lspx-ts")?;
         let out = root.join(".marksman").join("index.lspx.scip");
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
@@ -314,137 +270,33 @@ impl TsProvider {
 
     /// Load a provider from an existing `index.scip` (skip running the indexer).
     pub fn from_index(root: &Path, index_scip: &Path) -> Result<Self> {
-        Ok(Self {
-            root: root.to_path_buf(),
-            scip: Arc::new(ScipIndex::load(index_scip)?),
-            engine: Arc::new(Mutex::new(None)),
-            fresh: Arc::new(Mutex::new(HashMap::new())),
-        })
+        Ok(Self::assemble(root, Arc::new(ScipIndex::load(index_scip)?), engine_factory()))
     }
 
-    /// The tsgo (TypeScript 7 native) LSP command for the sweep indexer. `CI_TSGO` points at
-    /// a tsgo binary directly; the default fetches the native preview via npx (the `typescript`
-    /// RC npm package ships only `tsc` — the LSP binary lives in `@typescript/native-preview`).
-    fn tsgo_lsp_command() -> Command {
-        if let Ok(bin) = std::env::var("CI_TSGO") {
-            let mut c = Command::new(bin);
-            c.args(["--lsp", "-stdio"]);
-            return c;
-        }
-        let mut c = Command::new("npx");
-        c.arg("--yes")
-            .arg("-p")
-            .arg("@typescript/native-preview")
-            .args(["tsgo", "--lsp", "-stdio"])
-            .env("npm_config_cache", npm_cache());
-        c
-    }
-
-    /// The TS language-server command (npx tsls). All external/Node tooling lives
-    /// here in the provider — the core + ci-lsp stay pure Rust.
-    ///
-    /// `CI_TS_LSP_SERVER` overrides the whole command line (whitespace-split, no quoting) —
-    /// e.g. `".../node_modules/.bin/tsgo --lsp -stdio"` runs the TS7 native-port server.
-    fn ts_lsp_command() -> Command {
-        if let Ok(raw) = std::env::var("CI_TS_LSP_SERVER") {
-            let mut parts = raw.split_whitespace();
-            if let Some(prog) = parts.next() {
-                let mut c = Command::new(prog);
-                c.args(parts);
-                return c;
-            }
-        }
-        let mut c = Command::new("npx");
-        c.arg("--yes")
-            .arg("-p")
-            .arg(format!("typescript-language-server@{TS_LSP_VERSION}"))
-            .arg("-p")
-            .arg(format!("typescript@{TYPESCRIPT_VERSION}"))
-            .args(["typescript-language-server", "--stdio"])
-            .env("npm_config_cache", npm_cache());
-        c
-    }
-
-    /// Normalize a (possibly absolute) path to the repo-relative posix form SCIP uses.
-    fn rel(&self, file: &Path) -> String {
-        let p = if file.is_absolute() {
-            file.strip_prefix(&self.root).unwrap_or(file)
-        } else {
-            file
-        };
-        p.to_string_lossy().replace('\\', "/")
-    }
-}
-
-impl LanguageProvider for TsProvider {
-    fn granularity(&self) -> Granularity {
-        Granularity::Ast // SCIP symbols + tree-sitter sub-nodes
-    }
-
-    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        let rel = self.rel(file);
-        // A post-edit override wins over the startup SCIP index: it's the same file as
-        // re-described by the compiler that just gated the edit (new symbols included).
-        let fresh = self.fresh.lock().ok().and_then(|m| m.get(&rel).map(|s| (s.deleted, s.nodes.clone())));
-        let scip_nodes = match fresh {
-            Some((true, _)) => return Ok(vec![]),
-            Some((false, nodes)) => nodes,
-            None => self.scip.structure(&rel)?,
-        };
-        // CI_NO_TREESITTER: skip the merge (SCIP-only) — for the benchmark.
-        if std::env::var("CI_NO_TREESITTER").is_ok() {
-            return Ok(scip_nodes);
-        }
-        // Merge: deepen each SCIP symbol with tree-sitter sub-nodes (params/return/body).
-        match std::fs::read_to_string(self.root.join(&rel)) {
-            Ok(content) => Ok(ast::deepen(&content, scip_nodes)),
-            Err(_) => Ok(scip_nodes), // no content on disk -> shallow
-        }
-    }
-
-    fn import_graph(&self) -> Result<ImportGraph> {
-        let mut g = self.scip.import_graph()?;
-        // Overlay post-edit edges: each override replaces that file's OUTGOING edges (incoming
-        // edges live in the importers' own entries, refreshed when those files change).
-        if let Ok(m) = self.fresh.lock() {
-            for (rel, s) in m.iter() {
-                let key = PathBuf::from(rel);
-                if s.deleted || s.imports.is_empty() {
-                    g.remove(&key);
-                } else {
-                    g.insert(key, s.imports.clone());
-                }
-            }
-        }
-        Ok(g)
-    }
-
-    /// Start the write engine and load the project NOW, on a background thread, so the first
-    /// `apply_edits` finds it warm instead of paying the ~seconds cold project load inline.
-    /// The thread holds the engine lock for the duration, so an `apply_edits` that arrives
-    /// mid-warm simply waits for it rather than racing in a second cold engine. Safe no-op if
-    /// the engine can't start (apply_edits falls back to starting one fresh).
-    fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let root = self.root.clone();
-        // A real source file to open: LSP needs it to load the tsconfig project (an empty
-        // diagnostics short-circuits); ts-morph loads at startup, so the round-trip just
-        // confirms it's ready.
-        let warm_file = self
-            .scip
-            .import_graph()
-            .ok()
-            .and_then(|g| g.into_keys().next())
-            .map(|p| p.to_string_lossy().replace('\\', "/"));
-        std::thread::spawn(move || {
-            let mut guard = match slot.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
-            if guard.is_some() {
-                return; // already warm
-            }
-            if let Ok(mut engine) = start_engine(&root) {
+    /// Wire the halves: the read index advertises its properties (artifact, semantic
+    /// edges), the engine factory carries the selection ladder, the prewarmer issues the
+    /// project-loading warm call, the live summarizer re-describes committed files from
+    /// tree-sitter, and the fresh deepener keeps post-commit overrides at AST depth. The
+    /// factory is a parameter so the freshness seams are testable without Node.
+    fn assemble(root: &Path, scip: Arc<ScipIndex>, engine_factory: ci_edit::EngineFactory) -> Self {
+        let read = TsRead { root: root.to_path_buf(), scip: scip.clone() };
+        let sum_root = root.to_path_buf();
+        let deep_root = root.to_path_buf();
+        let warm_scip = scip.clone();
+        let warm_factory = engine_factory.clone();
+        let inner = Composed::new(root, read, engine_factory)
+            .with_live_summarizer(Arc::new(move |rel| Some(file_summary(&sum_root, rel))))
+            .with_fresh_deepener(Arc::new(move |rel, nodes| deepen_from_disk(&deep_root, rel, nodes)))
+            .with_prewarmer(Arc::new(move |root: &Path| {
+                let mut engine = warm_factory(root).ok()?;
+                // A real source file to open: LSP needs it to load the tsconfig project (an
+                // empty diagnostics short-circuits); ts-morph loads at startup, so the
+                // round-trip just confirms it's ready.
+                let warm_file = warm_scip
+                    .import_graph()
+                    .ok()
+                    .and_then(|g| g.into_keys().next())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"));
                 match warm_file.and_then(|f| std::fs::read_to_string(root.join(&f)).ok().map(|c| (f, c))) {
                     Some(file) => {
                         let _ = engine.diagnostics(&[file]); // forces the project to load
@@ -453,172 +305,92 @@ impl LanguageProvider for TsProvider {
                         let _ = engine.diagnostics(&[]);
                     }
                 }
-                *guard = Some(engine);
-            }
-        });
-    }
-
-    fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        // Read structure from the loaded SCIP index; gate via the PERSISTENT write engine
-        // (VFS overlay + baseline-diff diagnostics over the blast radius). Reuse the warm
-        // engine from `prewarm` — locking blocks until an in-flight warm finishes, so we
-        // never start a second cold engine. Only start fresh if prewarm never ran or failed.
-        let timing = std::env::var("CI_TIMING").is_ok();
-        let t0 = std::time::Instant::now();
-        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some(start_engine(&self.root)?);
-        }
-        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
-        if timing {
-            eprintln!("[timing] engine ready (warm or fresh) {:?}", t0.elapsed());
-        }
-        let t1 = std::time::Instant::now();
-        // Resolve anchors from the FULL structure (SCIP + tree-sitter sub-nodes), NOT raw SCIP —
-        // otherwise sub-node targets (`:body`/`:return`/`:param.N`) that `list_anchors` advertises
-        // can't be found here, and `set_body` / `replace_node target:…` reject with "anchor not
-        // found". Must match what `structure()` returns to the agent.
-        let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
-
-        // Reverse import map (file -> who imports it) for the delete-safety check — from the
-        // OVERLAID graph, so edges added/removed by earlier edits in this session count.
-        let reverse = ci_core::reverse_import_map(&self.import_graph().unwrap_or_default());
-        let reverse_imports = |file: &str| reverse.get(file).cloned().unwrap_or_default();
-
-        let r = ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports);
-        if timing {
-            eprintln!("[timing] commit_edits (warmup+rename+gate) {:?}", t1.elapsed());
-        }
-        // Keep reads true in-session: have the engine re-describe the committed files (new
-        // symbols, new import edges) and stash the result as read overrides. Best-effort — a
-        // refresh hiccup must NOT fail the (already-committed) edit; reads then lag until the
-        // next startup reindex, exactly as before this hook existed.
-        if let Ok(CommitResult::Ok { changed_files, .. }) = &r {
-            if opts.write && !opts.dry_run && !changed_files.is_empty() {
-                let rels: Vec<String> =
-                    changed_files.iter().map(|p| p.to_string_lossy().replace('\\', "/")).collect();
-                match engine.file_summaries(&rels) {
-                    Ok(Some(summaries)) => {
-                        if let Ok(mut m) = self.fresh.lock() {
-                            for s in summaries {
-                                m.insert(s.path.clone(), s);
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        // LSP engines (tsgo/tsls) can't re-describe their live project the way
-                        // the ts-morph sidecar does. Approximate from tree-sitter on CURRENT
-                        // disk — the same read shape TsTreeGated serves — so reads track the
-                        // commit instead of serving pre-edit state; scip fidelity (flattened
-                        // barrels, semantic edges) returns at the next reindex. Per-file: only
-                        // the changed files are parsed, never a whole-repo walk per commit.
-                        let fb = lang_fallback::FallbackProvider::new(&self.root, lang_fallback::FbLang::Ts);
-                        if let Ok(mut m) = self.fresh.lock() {
-                            for rel in &rels {
-                                let deleted = !self.root.join(rel).exists();
-                                let (nodes, imports) = if deleted {
-                                    (vec![], vec![])
-                                } else {
-                                    (
-                                        fb.structure(Path::new(rel)).unwrap_or_default(),
-                                        fb.file_imports(rel),
-                                    )
-                                };
-                                m.insert(
-                                    rel.clone(),
-                                    FileSummary { path: rel.clone(), deleted, nodes, imports },
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => eprintln!("[lang-ts] post-edit read refresh failed ({e}); structure/import_graph lag until the next reindex"),
-                }
-            }
-        }
-        r
+                Some(engine)
+            }));
+        Self { scip, inner: Arc::new(inner) }
     }
 }
 
-// ── the CI_TS_MODE=treesitter-gated ablation provider ────────────────────────
-
-/// TypeScript with a tree-sitter READ path (the generic fallback's TS collector + its
-/// relative-import graph — no scip, no index build, no Node at startup) and the SAME warm
-/// ts-morph GATE as the full provider. Exists to measure end to end what SCIP's
-/// compiler-accurate symbols and reference graph actually buy (see docs/benchmarks.md); the
-/// registry builders construct it only under `CI_TS_MODE=treesitter-gated`. Note ts-morph's
-/// `rename` is still project-wide (the compiler finds references) — the ablated piece is the
-/// read/blast-radius fidelity, not the rename.
-#[derive(Clone)]
-pub struct TsTreeGated {
-    root: PathBuf,
-    read: lang_fallback::FallbackProvider,
-    engine: WarmEngine,
-}
-
-impl TsTreeGated {
-    pub fn new(root: &Path) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            read: lang_fallback::FallbackProvider::new(root, lang_fallback::FbLang::Ts),
-            engine: Arc::new(Mutex::new(None)),
-        }
-    }
-}
-
-impl LanguageProvider for TsTreeGated {
+impl LanguageProvider for TsProvider {
     fn granularity(&self) -> Granularity {
-        Granularity::Ast
+        self.inner.granularity()
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        self.read.structure(file)
+        self.inner.structure(file)
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
-        self.read.import_graph()
+        self.inner.import_graph()
     }
 
+    /// Start the write engine and load the project NOW, on a background thread, so the first
+    /// `apply_edits` finds it warm instead of paying the ~seconds cold project load inline.
+    /// The recipe is the [`ci_edit::Prewarmer`] wired in [`TsProvider::assemble`]; the
+    /// lock/wait/no-double-start discipline lives in `ci_edit::spawn_prewarm`, driven by the
+    /// glue. Safe no-op if the engine can't start (apply_edits starts one fresh).
     fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let root = self.root.clone();
-        std::thread::spawn(move || {
-            let Ok(mut guard) = slot.lock() else { return };
-            if guard.is_some() {
-                return;
-            }
-            if let Ok(mut engine) = start_engine(&root) {
-                let _ = engine.diagnostics(&[]);
-                *guard = Some(engine);
-            }
-        });
+        self.inner.prewarm()
     }
 
+    /// The write path is [`Composed`]: persistent warm engine (reuse from prewarm), the
+    /// shared VFS + baseline-diff + blast-radius spine, anchors resolved from the FULL
+    /// structure the agent saw (SCIP + tree-sitter sub-nodes, fresh overrides included),
+    /// radius policy from the read half's semantic edges (one hop), and post-commit read
+    /// freshness from `file_summaries` with the tree-sitter summarizer as the LSP-engine
+    /// fallback.
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
-        if guard.is_none() {
-            *guard = Some(start_engine(&self.root)?);
-        }
-        let engine: &mut dyn GateEngine = guard.as_mut().unwrap().as_mut();
-        let structure_of = |f: &str| self.read.structure(Path::new(f)).unwrap_or_default();
-        // Blast radius from the tree-sitter relative-import graph. Syntactic edges do NOT
-        // flatten barrels — a consumer of `export * from './x'` edges to the barrel, not x —
-        // so the gate's one hop must be served the TRANSITIVE reverse-importer set or a barrel
-        // hides its consumers and the gate claims a false "clean" (measured: bench T9-barrel).
-        // Full/scip mode keeps one-hop: its semantic graph is already flattened.
-        let reverse = ci_core::reverse_import_map(&self.read.import_graph().unwrap_or_default());
-        let reverse_imports = |file: &str| ci_core::transitive_reverse_imports(&reverse, file);
-        ci_edit::commit_edits(&self.root, ops, &structure_of, engine, opts, &reverse_imports)
+        self.inner.apply_edits(ops, opts)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ci_core::Diag;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
     use std::fs;
+    use std::sync::Mutex;
 
-    // The post-edit read override: a `fresh` entry must win over the (empty) SCIP index for
-    // structure() — including tree-sitter deepening from current disk content — and rewrite
-    // that file's outgoing import edges; a deleted entry must blank both.
+    /// A scripted gate: always-clean diagnostics; each `file_summaries` call pops the next
+    /// scripted payload (`None` = "engine can't re-describe", the LSP-engine shape) — the
+    /// freshness channel under test, no Node toolchain required.
+    struct ScriptedEngine(Arc<Mutex<VecDeque<Option<Vec<FileSummary>>>>>);
+
+    impl ci_edit::GateEngine for ScriptedEngine {
+        fn diagnostics(&mut self, _files: &[(String, String)]) -> Result<Vec<Diag>> {
+            Ok(vec![])
+        }
+        fn rename(&mut self, _f: &str, _l: u32, _c: u32, _n: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn will_rename(&mut self, _from: &str, _to: &str) -> Result<Value> {
+            Ok(json!({}))
+        }
+        fn file_summaries(&mut self, _files: &[String]) -> Result<Option<Vec<FileSummary>>> {
+            Ok(self.0.lock().unwrap().pop_front().unwrap_or(None))
+        }
+    }
+
+    /// Commit one trivial in-file replace so the freshness channel fires.
+    fn commit_replace(p: &TsProvider, old_text: &str, new_text: &str) {
+        let r = p
+            .apply_edits(
+                &[EditOp::ReplaceInFile { path: "a.ts".into(), old_text: old_text.into(), new_text: new_text.into() }],
+                &EditOpts { write: true, dry_run: false, tsconfig: None },
+            )
+            .unwrap();
+        assert!(matches!(r, CommitResult::Ok { .. }), "clean commit expected: {r:?}");
+    }
+
+    // The post-edit read override (contract §2, reads stay true in-session), driven through
+    // the Composed glue: an engine summary must win over the (empty) SCIP index for
+    // structure() — still deepened from current disk content (the fresh deepener) — and
+    // rewrite that file's outgoing import edges; a deleted summary must blank both; and when
+    // the engine CAN'T re-describe (`file_summaries` -> None, the LSP engines), the
+    // tree-sitter live summarizer must re-describe current disk instead, so reads never
+    // serve pre-edit state.
     #[test]
     fn fresh_overrides_shadow_the_scip_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -628,9 +400,6 @@ mod tests {
         fs::write(&idx, b"").unwrap(); // valid, empty SCIP index
         fs::write(root.join("a.ts"), "export function add(a: number): number {\n  return a;\n}\n").unwrap();
 
-        let p = TsProvider::from_index(root, &idx).unwrap();
-        assert!(p.structure(Path::new("a.ts")).unwrap().is_empty(), "empty index, no override yet");
-
         let node = Node {
             id: "a.ts#add".into(),
             name: Some("add".into()),
@@ -639,23 +408,49 @@ mod tests {
             name_range: Some(ci_core::Range { start_line: 1, start_char: 16, end_line: 1, end_char: 19 }),
             children: vec![],
         };
-        p.fresh.lock().unwrap().insert(
-            "a.ts".into(),
-            FileSummary { path: "a.ts".into(), deleted: false, nodes: vec![node], imports: vec![PathBuf::from("b.ts")] },
+        let script: Arc<Mutex<VecDeque<Option<Vec<FileSummary>>>>> =
+            Arc::new(Mutex::new(VecDeque::from([
+                // commit 1: the engine re-describes a.ts (a shallow symbol + a new edge).
+                Some(vec![FileSummary {
+                    path: "a.ts".into(),
+                    deleted: false,
+                    nodes: vec![node],
+                    imports: vec![PathBuf::from("b.ts")],
+                }]),
+                // commit 2: the engine says the file is gone.
+                Some(vec![FileSummary { path: "a.ts".into(), deleted: true, nodes: vec![], imports: vec![] }]),
+                // commit 3: the engine can't re-describe -> the live summarizer must.
+                None,
+            ])));
+        let feed = script.clone();
+        let p = TsProvider::assemble(
+            root,
+            Arc::new(ScipIndex::load(&idx).unwrap()),
+            Arc::new(move |_root: &Path| {
+                Ok(Box::new(ScriptedEngine(feed.clone())) as Box<dyn ci_edit::GateEngine + Send>)
+            }),
         );
+        assert!(p.structure(Path::new("a.ts")).unwrap().is_empty(), "empty index, no override yet");
 
+        commit_replace(&p, "return a;", "return a; // one");
         let nodes = p.structure(Path::new("a.ts")).unwrap();
         let add = nodes.iter().find(|n| n.id == "a.ts#add").expect("override symbol served");
         assert!(add.children.iter().any(|c| c.id == "a.ts#add:body"), "override still deepened: {:?}", add.children);
         let g = p.import_graph().unwrap();
         assert_eq!(g.get(&PathBuf::from("a.ts")).unwrap(), &vec![PathBuf::from("b.ts")], "override edge served");
 
-        p.fresh.lock().unwrap().insert(
-            "a.ts".into(),
-            FileSummary { path: "a.ts".into(), deleted: true, nodes: vec![], imports: vec![] },
-        );
+        commit_replace(&p, "// one", "// two");
         assert!(p.structure(Path::new("a.ts")).unwrap().is_empty(), "deleted override blanks structure");
         assert!(!p.import_graph().unwrap().contains_key(&PathBuf::from("a.ts")), "deleted override removes edges");
+
+        commit_replace(&p, "// two", "// three");
+        let nodes = p.structure(Path::new("a.ts")).unwrap();
+        let add = nodes.iter().find(|n| n.id == "a.ts#add").expect("live summarizer re-described the file");
+        assert!(
+            add.children.iter().any(|c| c.id == "a.ts#add:body"),
+            "summarizer-served structure carries sub-node anchors: {:?}",
+            add.children
+        );
     }
 
     // Real end-to-end: shells out to scip-typescript via npx. Slow + network on

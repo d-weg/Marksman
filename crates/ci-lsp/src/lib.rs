@@ -20,6 +20,29 @@ fn file_uri(abs: &Path) -> String {
     format!("file://{}", abs.to_string_lossy())
 }
 
+/// The LSP `languageId` for a file, keyed by extension. A server uses this to route the document
+/// to the right language service — sourcekit-lsp, in particular, ignores a `.swift` file opened as
+/// `typescript` (a rename against it then returns nothing). Unknown extensions default to
+/// `plaintext`, harmless for the servers that key on the URI instead.
+fn language_id(rel: &str) -> &'static str {
+    match Path::new(rel).extension().and_then(|e| e.to_str()) {
+        Some("ts") | Some("mts") | Some("cts") => "typescript",
+        Some("tsx") => "typescriptreact",
+        Some("js") | Some("mjs") | Some("cjs") => "javascript",
+        Some("jsx") => "javascriptreact",
+        Some("rs") => "rust",
+        Some("py") | Some("pyi") => "python",
+        Some("go") => "go",
+        Some("java") => "java",
+        Some("php") => "php",
+        Some("rb") => "ruby",
+        Some("swift") => "swift",
+        Some("c") | Some("h") => "c",
+        Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") => "cpp",
+        _ => "plaintext",
+    }
+}
+
 pub struct LspClient {
     child: Child,
     stdin: ChildStdin,
@@ -132,7 +155,7 @@ impl LspClient {
                     self.open.insert(uri.clone(), 1);
                     self.send_notification(
                         "textDocument/didOpen",
-                        json!({"textDocument": {"uri": uri, "languageId": "typescript", "version": 1, "text": content}}),
+                        json!({"textDocument": {"uri": uri, "languageId": language_id(rel), "version": 1, "text": content}}),
                     )?;
                 }
                 Some(v) => {

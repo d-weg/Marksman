@@ -103,13 +103,24 @@ impl ProviderRegistry {
 }
 
 /// A supported source language: its manifest name, the include globs that select its files, the
-/// `Lang` tags it owns, and any extra exclude globs (build-output dirs). The single source of
-/// truth for `name ↔ extensions`, shared by the CLI and MCP registry builders.
+/// `Lang` tags it owns, any extra exclude globs (build-output dirs), and the language's syntax
+/// facts the shared edit spine needs (so adding a language never means editing `ci-edit`). The
+/// single source of truth for `name ↔ extensions`, shared by the CLI and MCP registry builders.
 struct LangSpec {
     name: &'static str,
     globs: &'static [&'static str],
     langs: &'static [Lang],
     excludes: &'static [&'static str],
+    /// What `set_return_type` inserts between the parameter list's `)` and the new type —
+    /// delimiter plus surrounding spacing, verbatim (`" -> "` yields `fn f() -> T`;
+    /// `": "` yields `function f(): T`).
+    return_type_delimiter: &'static str,
+    /// Whether the language writes its return type AFTER the parameter list (suffix /
+    /// annotation style — the shape `set_return_type`'s insert-after-`)` model can express).
+    /// Prefix-typed languages (Java, C, C++: `int probe(...)`) get `false`, and the op
+    /// refuses with a `replace_text` recipe instead of splicing garbage after the `)`
+    /// (rollout spec, decision Q2).
+    return_type_suffix: bool,
 }
 
 const SUPPORTED: &[LangSpec] = &[
@@ -118,41 +129,127 @@ const SUPPORTED: &[LangSpec] = &[
         globs: &["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
         langs: &[Lang::Ts, Lang::Tsx],
         excludes: &[],
+        return_type_delimiter: ": ",
+        return_type_suffix: true,
     },
     LangSpec {
         name: "rust",
         globs: &["**/*.rs"],
         langs: &[Lang::Rust],
         excludes: &["**/target/**"],
+        return_type_delimiter: " -> ",
+        return_type_suffix: true,
     },
     LangSpec {
         name: "python",
         globs: &["**/*.py", "**/*.pyi"],
         langs: &[Lang::Python],
         excludes: &[],
+        return_type_delimiter: " -> ",
+        return_type_suffix: true,
+    },
+    // Java is served by lang-java (gated tier: tree-sitter reads + javax.tools gate) since
+    // the language rollout; it is PREFIX-typed (`int probe(...)`) — no delimiter exists that
+    // makes an insert-after-`)` correct, so `set_return_type` refuses with a recipe (Q2).
+    LangSpec {
+        name: "java",
+        globs: &["**/*.java"],
+        langs: &[Lang::Java],
+        excludes: &["**/target/**", "**/build/**"],
+        return_type_delimiter: ": ",
+        return_type_suffix: false,
+    },
+    // PHP is served by lang-php (gated tier: tree-sitter reads + PHPStan gate) since the
+    // language rollout. It is SUFFIX-typed (`function f(): int`) — the annotation `": "`
+    // delimiter after `)` is correct, so `set_return_type` is NOT refused (unlike Java/C/C++).
+    LangSpec {
+        name: "php",
+        globs: &["**/*.php"],
+        langs: &[Lang::Php],
+        excludes: &["**/vendor/**"],
+        return_type_delimiter: ": ",
+        return_type_suffix: true,
+    },
+    // Swift is served by lang-swift (gated tier: tree-sitter reads + `swift build` gate) since
+    // the language rollout. It is SUFFIX-typed (`func f() -> Int`) — the ` -> ` delimiter after
+    // `)` is correct, so `set_return_type` is NOT refused (unlike Java/C/C++). `.build` is
+    // SwiftPM's build-output dir.
+    LangSpec {
+        name: "swift",
+        globs: &["**/*.swift"],
+        langs: &[Lang::Swift],
+        excludes: &["**/.build/**"],
+        return_type_delimiter: " -> ",
+        return_type_suffix: true,
     },
     // The generic tree-sitter fallback languages (lang-fallback): read path + ungated edits.
     // JS rides the fallback (not the TS provider): scip-typescript/ts-morph only see JS when a
     // tsconfig opts in via allowJs, and the gate is only as strong as checkJs — routing JS
     // through them would claim "type-checked clean" on barely-checked code. Gated JS via the
     // TS toolchain is a roadmap item.
+    //
+    // The fallback languages below carry the annotation-style `": "` delimiter — the historic
+    // spine default, not a verified per-grammar fact; pin the real syntax (with a test) when a
+    // language gets its own provider.
     LangSpec {
         name: "js",
         globs: &["**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs"],
         langs: &[Lang::Js],
         excludes: &["**/node_modules/**", "**/dist/**", "**/build/**"],
+        return_type_delimiter: ": ",
+        return_type_suffix: true,
     },
-    LangSpec { name: "go", globs: &["**/*.go"], langs: &[Lang::Go], excludes: &["**/vendor/**"] },
-    LangSpec { name: "java", globs: &["**/*.java"], langs: &[Lang::Java], excludes: &[] },
-    LangSpec { name: "ruby", globs: &["**/*.rb"], langs: &[Lang::Ruby], excludes: &[] },
-    LangSpec { name: "c", globs: &["**/*.c", "**/*.h"], langs: &[Lang::C], excludes: &[] },
+    LangSpec {
+        name: "go",
+        globs: &["**/*.go"],
+        langs: &[Lang::Go],
+        excludes: &["**/vendor/**"],
+        return_type_delimiter: ": ",
+        return_type_suffix: true,
+    },
+    LangSpec {
+        name: "ruby",
+        globs: &["**/*.rb"],
+        langs: &[Lang::Ruby],
+        excludes: &[],
+        return_type_delimiter: ": ",
+        return_type_suffix: true,
+    },
+    // C/C++ share Java's prefix return-type position — same Q2 refusal.
+    LangSpec {
+        name: "c",
+        globs: &["**/*.c", "**/*.h"],
+        langs: &[Lang::C],
+        excludes: &[],
+        return_type_delimiter: ": ",
+        return_type_suffix: false,
+    },
     LangSpec {
         name: "cpp",
         globs: &["**/*.cpp", "**/*.cc", "**/*.cxx", "**/*.hpp", "**/*.hh"],
         langs: &[Lang::Cpp],
         excludes: &[],
+        return_type_delimiter: ": ",
+        return_type_suffix: false,
     },
 ];
+
+/// The return-type delimiter for `file`'s language, resolved through the registry by extension —
+/// exactly what `set_return_type` splices between `)` and the type, spacing included. Files no
+/// spec claims (unknown extensions, `.d.ts`) get the annotation-style `": "` default.
+pub fn return_delim(file: &Path) -> &'static str {
+    let lang = Lang::of(file);
+    SUPPORTED.iter().find(|s| s.langs.contains(&lang)).map(|s| s.return_type_delimiter).unwrap_or(": ")
+}
+
+/// The language name when `file`'s language declares its return type BEFORE the name
+/// (prefix-typed: Java, C, C++), `None` for suffix/annotation-typed languages and files no
+/// spec claims. This is the marker `set_return_type` consults to refuse-with-recipe instead
+/// of splicing a delimiter after `)` that no prefix grammar accepts (decision Q2).
+pub fn prefix_return_language(file: &Path) -> Option<&'static str> {
+    let lang = Lang::of(file);
+    SUPPORTED.iter().find(|s| s.langs.contains(&lang)).filter(|s| !s.return_type_suffix).map(|s| s.name)
+}
 
 /// The single language `CI_LANG` forces, if set (`rust` / `ts`|`typescript` / `python`|`py`).
 fn forced_lang() -> Option<&'static str> {
@@ -330,6 +427,38 @@ mod tests {
         assert!(built.failed.is_empty(), "no failures expected, got {:?}", built.failed);
         assert!(built.registry.provider_for(Path::new("src/a.ts")).is_some());
         assert!(built.registry.provider_for(Path::new("src/b.rs")).is_some());
+    }
+
+    /// The registry is the single source of language syntax for the edit spine: `set_return_type`
+    /// splices exactly this delimiter (spacing included) between `)` and the type, so these
+    /// strings are byte-contracts — `" -> "` for the arrow family (Rust/Python), `": "` for the
+    /// annotation family (TS/JS) and for anything the registry doesn't claim.
+    #[test]
+    fn return_delim_resolves_by_extension() {
+        for f in ["src/a.rs", "src/b.py", "src/b.pyi", "Svc.swift"] {
+            assert_eq!(return_delim(Path::new(f)), " -> ", "{f}");
+        }
+        for f in ["src/a.ts", "src/a.tsx", "src/a.mts", "src/a.cts", "src/a.js", "src/a.jsx", "src/a.mjs"] {
+            assert_eq!(return_delim(Path::new(f)), ": ", "{f}");
+        }
+        // Unclaimed files fall back to the annotation-style default.
+        assert_eq!(return_delim(Path::new("notes.txt")), ": ");
+        assert_eq!(return_delim(Path::new("src/types.d.ts")), ": ");
+    }
+
+    /// Q2 pin: the registry is where the edit spine learns a language's return-type POSITION.
+    /// Prefix-typed languages (Java/C/C++ — `int probe(...)`) must be flagged so
+    /// `set_return_type` refuses with a recipe; suffix/annotation languages must NOT be, or
+    /// a legal op would start refusing.
+    #[test]
+    fn prefix_return_languages_are_flagged() {
+        for f in ["Svc.java", "probe.c", "probe.h", "svc.cpp", "svc.hpp"] {
+            assert!(prefix_return_language(Path::new(f)).is_some(), "{f} is prefix-typed");
+        }
+        assert_eq!(prefix_return_language(Path::new("Svc.java")), Some("java"));
+        for f in ["a.rs", "b.py", "a.ts", "a.js", "a.go", "a.rb", "Svc.php", "Svc.swift", "notes.txt"] {
+            assert_eq!(prefix_return_language(Path::new(f)), None, "{f} must stay insertable");
+        }
     }
 
     /// A language that's absent (or disabled) is NOT a failure — `make` is never even called for

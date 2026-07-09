@@ -11,6 +11,9 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 lang-fallback = { path = "../langs/lang-fallback" }
+lang-java = { path = "../langs/lang-java" }
+lang-php = { path = "../langs/lang-php" }
+lang-swift = { path = "../langs/lang-swift" }
 lang-rust = { path = "../langs/lang-rust" }
 lang-template = { path = "../langs/lang-template" }
 lang-ts = { path = "../langs/lang-ts" }

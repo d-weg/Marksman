@@ -6,6 +6,10 @@ license.workspace = true
 description = "Language-blind core types, CodeDriver trait, and config for codeindex."
 
 [dependencies]
+ignore.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

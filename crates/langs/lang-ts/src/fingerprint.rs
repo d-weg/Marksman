@@ -1,14 +1,15 @@
 //! Source fingerprint for the persisted `index.scip` — decides load-cached vs reindex at
-//! startup. A fingerprint is the full map of every file that can change scip-typescript's
-//! output (`.ts*`/`.js*` sources, `tsconfig*.json`, `package.json` + lockfiles) to a hash of
-//! its CONTENT. Comparing whole maps catches everything the index depends on: edited files
-//! (imports included), and added/removed/moved files show up as key changes. Content hashes,
-//! not mtimes, on purpose: a `git checkout`/reset rewrites mtimes but not bytes, and must
-//! still hit the cache. Staleness here is a correctness bug (a stale index once sent a rename
-//! to "symbol not found" and the agent fell back to grep), so every doubtful case — missing
-//! or unparsable fingerprint, version bump — reads as "changed" and reindexes.
-use std::collections::BTreeMap;
+//! startup. The machinery (content hashing, walk, drift detection, versioned atomic
+//! load/store) is [`ci_core::fingerprint`]; this module holds only what is TypeScript's to
+//! know: which files can change scip-typescript's output (`.ts*`/`.js*` sources,
+//! `tsconfig*.json`, `package.json` + lockfiles), where the fingerprint lives, its format
+//! version, and the pinned-tool marker. Staleness here is a correctness bug (a stale index
+//! once sent a rename to "symbol not found" and the agent fell back to grep), so every
+//! doubtful case — missing or unparsable fingerprint, version bump — reads as "changed" and
+//! reindexes.
 use std::path::{Path, PathBuf};
+
+pub(crate) use ci_core::fingerprint::{augment_fingerprint, Fingerprint};
 
 /// Bump when the fingerprint's inputs or format change; old files then read as stale.
 /// v2: added the `//scip-typescript` tool marker + scip-document augmentation.
@@ -18,20 +19,8 @@ const FP_VERSION: u64 = 2;
 /// exactly like a source change would. `//` can never prefix a real repo-relative path.
 const TOOL_KEY: &str = "//scip-typescript";
 
-pub(crate) type Fingerprint = BTreeMap<String, String>;
-
 pub(crate) fn fingerprint_path(root: &Path) -> PathBuf {
     root.join(".marksman").join("index.scip.fingerprint.json")
-}
-
-/// FNV-1a 64-bit. Non-cryptographic is fine: this detects accidental drift, not tampering.
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
 }
 
 /// Does this file feed scip-typescript's output? Sources (`.d.ts` included — it can't hurt),
@@ -47,89 +36,33 @@ fn is_input(name: &str) -> bool {
         || matches!(name, "package.json" | "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml")
 }
 
-/// Content hash of one file, in the fingerprint's format.
-pub(crate) fn hash_file(path: &Path) -> Option<String> {
-    std::fs::read(path).ok().map(|b| format!("{:016x}", fnv1a(&b)))
-}
-
 /// Hash every fingerprint input under `root` (gitignore-aware; hidden dirs and `node_modules`
 /// always skipped, so a repo without a .gitignore can't drag thousands of dependency files in).
 /// Includes the pinned scip-typescript version under [`TOOL_KEY`].
 pub(crate) fn source_fingerprint(root: &Path) -> Fingerprint {
-    let mut map = Fingerprint::new();
+    let mut map = ci_core::fingerprint::source_fingerprint(
+        root,
+        &["node_modules"],
+        |rel| rel.file_name().is_some_and(|n| is_input(&n.to_string_lossy())),
+        &[],
+    );
     map.insert(TOOL_KEY.into(), crate::SCIP_TS_VERSION.into());
-    let walker = ignore::WalkBuilder::new(root)
-        .filter_entry(|e| e.depth() == 0 || e.file_name().to_string_lossy() != "node_modules")
-        .build();
-    for entry in walker.flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        if !is_input(&entry.file_name().to_string_lossy()) {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
-        let Ok(bytes) = std::fs::read(entry.path()) else { continue };
-        map.insert(rel.to_string_lossy().replace('\\', "/"), format!("{:016x}", fnv1a(&bytes)));
-    }
     map
 }
 
 /// `None` when the source still matches `stored`; else a short human-readable reason (for the
-/// "reindexing because …" startup log). Two-sided:
-/// - every entry the CURRENT walk sees must match `stored` (new/changed walk-visible files,
-///   and the tool-version marker);
-/// - every `stored` entry the walk did NOT see is re-hashed from disk. These are the AUGMENTED
-///   files — indexed by scip but invisible to the walk (gitignored/hidden sources a tsconfig
-///   still includes) — plus walk-visible files that were deleted (their read fails → drift).
-///   A file that merely became walk-invisible with identical bytes stays fresh.
+/// "reindexing because …" startup log). Stored-only entries — the AUGMENTED files scip indexed
+/// but the walk can't see — are re-hashed from disk; see [`ci_core::fingerprint::drift_reason`].
 pub(crate) fn fingerprint_drift(root: &Path, stored: &Fingerprint, current: &Fingerprint) -> Option<String> {
-    let mut added = Vec::new();
-    let mut changed = Vec::new();
-    let mut missing = Vec::new();
-    for (k, h) in current {
-        match stored.get(k) {
-            None => added.push(k.clone()),
-            Some(s) if s != h => changed.push(k.clone()),
-            _ => {}
-        }
-    }
-    for (k, s) in stored {
-        if current.contains_key(k) || k.starts_with("//") {
-            continue; // compared above; a stored tool marker absent from current is unreachable
-        }
-        match hash_file(&root.join(k)) {
-            Some(h) if h == *s => {} // unchanged, just not walk-visible
-            Some(_) => changed.push(k.clone()),
-            None => missing.push(k.clone()),
-        }
-    }
-    let mut parts = Vec::new();
-    for (label, set) in [("added", &added), ("changed", &changed), ("removed/unreadable", &missing)] {
-        if let Some(first) = set.first() {
-            parts.push(format!("{} file(s) {label} (e.g. {first})", set.len()));
-        }
-    }
-    if parts.is_empty() { None } else { Some(parts.join(", ")) }
+    ci_core::fingerprint::drift_reason(root, stored, current)
 }
 
 pub(crate) fn load_fingerprint(path: &Path) -> Option<Fingerprint> {
-    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    if v["version"].as_u64() != Some(FP_VERSION) {
-        return None;
-    }
-    v["files"].as_object()?.iter().map(|(k, h)| Some((k.clone(), h.as_str()?.to_string()))).collect()
+    ci_core::fingerprint::load_fingerprint(path, FP_VERSION)
 }
 
-/// Persist atomically (tmp + rename) so a crash mid-write leaves either the old fingerprint or
-/// none — both of which read as "reindex", never as a false match.
 pub(crate) fn store_fingerprint(path: &Path, fp: &Fingerprint) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::json!({ "version": FP_VERSION, "files": fp }).to_string())?;
-    std::fs::rename(&tmp, path)
+    ci_core::fingerprint::store_fingerprint(path, FP_VERSION, fp)
 }
 
 #[cfg(test)]
@@ -201,7 +134,8 @@ mod tests {
 
         let mut stored = source_fingerprint(root);
         assert!(!stored.contains_key(".gen/hidden.ts"), "walk must not see the hidden file");
-        stored.insert(".gen/hidden.ts".into(), hash_file(&root.join(".gen/hidden.ts")).unwrap());
+        augment_fingerprint(&mut stored, root, [".gen/hidden.ts".to_string()]);
+        assert!(stored.contains_key(".gen/hidden.ts"), "augmentation hashes it from disk");
 
         // Unchanged hidden file -> fresh.
         assert_eq!(fingerprint_drift(root, &stored, &source_fingerprint(root)), None);

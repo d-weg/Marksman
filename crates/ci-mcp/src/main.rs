@@ -105,6 +105,66 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
                 }
             }
         }
+        "java" => {
+            // The ungated ABLATION arm (mirrors CI_TS_MODE=treesitter): the generic fallback
+            // provider, reachable for measurement — never the silent degradation path.
+            if std::env::var("CI_JAVA_MODE").as_deref() == Ok("treesitter") {
+                eprintln!("[marksman-mcp] language: java (ABLATION: generic tree-sitter, UNGATED — CI_JAVA_MODE=treesitter)");
+                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Java)));
+            }
+            // Gated tier: reads are in-process tree-sitter, the WRITE gate is the resident
+            // javax.tools sidecar — so a missing JDK disables the language with the install
+            // hint (contract §6), it never falls back to ungated edits silently.
+            if let Some(missing) = lang_java::gate_missing() {
+                eprintln!("[marksman-mcp] java DISABLED:\n{missing}");
+                return ProviderBuild::Unavailable(missing);
+            }
+            if let Some(t) = lang_java::toolchain().tools.iter().find(|t| t.tool == "jdtls" && t.found.is_none()) {
+                eprintln!("[marksman-mcp] warning: java rename/move needs {} — Install: {}\n  (reads and the javac gate work without it)", t.tool, t.install);
+            }
+            eprintln!("[marksman-mcp] language: java (tree-sitter reads; gate: resident javax.tools sidecar, renames: jdtls)");
+            ProviderBuild::Ready(Arc::new(lang_java::JavaProvider::new(root)))
+        }
+        "php" => {
+            // The ungated ABLATION arm (mirrors CI_JAVA_MODE=treesitter): the generic fallback
+            // provider, reachable for measurement — never the silent degradation path.
+            if std::env::var("CI_PHP_MODE").as_deref() == Ok("treesitter") {
+                eprintln!("[marksman-mcp] language: php (ABLATION: generic tree-sitter, UNGATED — CI_PHP_MODE=treesitter)");
+                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Php)));
+            }
+            // Gated tier: reads are in-process tree-sitter, the WRITE gate is PHPStan — so a
+            // missing php/phpstan disables the language with the install hint (contract §6), it
+            // never falls back to ungated edits silently.
+            if let Some(missing) = lang_php::gate_missing(root) {
+                eprintln!("[marksman-mcp] php DISABLED:\n{missing}");
+                return ProviderBuild::Unavailable(missing);
+            }
+            if let Some(t) = lang_php::toolchain(root).tools.iter().find(|t| t.tool == "phpactor" && t.found.is_none()) {
+                eprintln!("[marksman-mcp] warning: php rename/move needs {} — Install: {}\n  (reads and the phpstan gate work without it)", t.tool, t.install);
+            }
+            eprintln!("[marksman-mcp] language: php (tree-sitter reads; gate: phpstan analyse, renames: phpactor)");
+            ProviderBuild::Ready(Arc::new(lang_php::PhpProvider::new(root)))
+        }
+        "swift" => {
+            // The ungated ABLATION arm (mirrors CI_JAVA_MODE=treesitter): the generic fallback
+            // provider, reachable for measurement — never the silent degradation path.
+            if std::env::var("CI_SWIFT_MODE").as_deref() == Ok("treesitter") {
+                eprintln!("[marksman-mcp] language: swift (ABLATION: generic tree-sitter, UNGATED — CI_SWIFT_MODE=treesitter)");
+                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Swift)));
+            }
+            // Gated tier: reads are in-process tree-sitter, the WRITE gate is `swift build` — so a
+            // missing Swift toolchain disables the language with the install hint (contract §6), it
+            // never falls back to ungated edits silently.
+            if let Some(missing) = lang_swift::gate_missing() {
+                eprintln!("[marksman-mcp] swift DISABLED:\n{missing}");
+                return ProviderBuild::Unavailable(missing);
+            }
+            if let Some(t) = lang_swift::toolchain().tools.iter().find(|t| t.tool == "sourcekit-lsp" && t.found.is_none()) {
+                eprintln!("[marksman-mcp] warning: swift rename needs {} — Install: {}\n  (reads and the `swift build` gate work without it)", t.tool, t.install);
+            }
+            eprintln!("[marksman-mcp] language: swift (tree-sitter reads; gate: `swift build`, renames: sourcekit-lsp)");
+            ProviderBuild::Ready(Arc::new(lang_swift::SwiftProvider::new(root)))
+        }
         // Every other supported language rides the generic tree-sitter fallback: full read
         // path, ungated edits, zero external dependencies.
         other => match FbLang::from_name(other) {
@@ -2007,6 +2067,21 @@ fn resp(id: Value, result: Value) -> Value {
     json!({"jsonrpc":"2.0","id":id,"result":result})
 }
 
+// ── tools/call dispatch ────────────────────────────────────────────────────
+/// The ONLY path from a `tools/call` name to a handler — so the callable surface IS this
+/// table, and `tools_call_surface_equals_tools_list` can pin it to `tools_list()`. The
+/// two-tool facade is the whole surface: retrieval handlers (`retrieve_context`,
+/// `find_symbols`, `list_anchors`, `read_node`, `describe_architecture`) are reachable
+/// only through `inspect`'s mode dispatch, never by tool name.
+const TOOL_HANDLERS: &[(&str, fn(&mut Server, &Value) -> Result<String, String>)] = &[
+    ("apply_edits", |server, args| server.apply_edits(args)),
+    ("inspect", |server, args| server.inspect(args)),
+];
+
+fn tool_handler(name: &str) -> Option<fn(&mut Server, &Value) -> Result<String, String>> {
+    TOOL_HANDLERS.iter().find(|(n, _)| *n == name).map(|(_, h)| *h)
+}
+
 fn main() {
     let mut server = Server::new(resolve_root());
     let stdin = std::io::stdin();
@@ -2039,15 +2114,9 @@ fn main() {
                 let params = &msg["params"];
                 let name = params["name"].as_str().unwrap_or("");
                 let args = &params["arguments"];
-                let result = match name {
-                    "retrieve_context" => server.retrieve_context(args),
-                    "describe_architecture" => server.describe_architecture(args),
-                    "find_symbols" => server.find_symbols(args),
-                    "list_anchors" => server.list_anchors(args),
-                    "read_node" => server.read_node(args),
-                    "apply_edits" => server.apply_edits(args),
-                    "inspect" => server.inspect(args),
-                    other => Err(format!("unknown tool: {other}")),
+                let result = match tool_handler(name) {
+                    Some(handler) => handler(&mut server, args),
+                    None => Err(format!("unknown tool: {name}")),
                 };
                 match result {
                     Ok(text) => resp(id, json!({"content":[{"type":"text","text":text}]})),
@@ -2066,7 +2135,32 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_index_matches, scan_word, tools_list};
+    use super::{ensure_index_matches, scan_word, tool_handler, tools_list, TOOL_HANDLERS};
+
+    // The facade contract: the set of tool names `tools/call` accepts equals the set
+    // `tools/list` advertises. TOOL_HANDLERS is the dispatcher's only name→handler path,
+    // so this equality covers the real callable surface — a handler added without being
+    // advertised (or advertised without a handler) fails here, and unadvertised aliases
+    // like the removed six-tool names can never come back silently.
+    #[test]
+    fn tools_call_surface_equals_tools_list() {
+        let tools = tools_list();
+        let advertised: std::collections::BTreeSet<String> = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        let accepted: std::collections::BTreeSet<String> =
+            TOOL_HANDLERS.iter().map(|(name, _)| name.to_string()).collect();
+        assert_eq!(accepted, advertised, "tools/call surface must equal the advertised tools/list");
+
+        // The six-tool surface's retrieval names must hit the unknown-tool error, not a
+        // hidden alias — their handlers are reachable only through `inspect` modes.
+        for legacy in ["retrieve_context", "describe_architecture", "find_symbols", "list_anchors", "read_node"] {
+            assert!(tool_handler(legacy).is_none(), "{legacy} must not be tools/call-addressable");
+        }
+    }
 
     // The BEFORE-context contract, tied to the schema so a new action can't silently opt out:
     // every node-anchored content action gets the original-extent note on a gate reject (the

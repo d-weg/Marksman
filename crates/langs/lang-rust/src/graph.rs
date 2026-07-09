@@ -1,94 +1,55 @@
-//! Freshness for the cached `rust-analyzer scip` graph — the rust twin of what lang-ts does
-//! for its SCIP index. The cache is generated at index time (batch — a full `rust-analyzer
+//! The Rust file-dependency graph: module/`use`-path resolution (tree-sitter, in-process)
+//! and freshness for the cached `rust-analyzer scip` graph — the rust twin of what lang-ts
+//! does for its SCIP index.
+//!
+//! Resolution side: `mod` declarations and `use crate::…`/`self::`/`super::` paths resolved
+//! to repo-relative files ([`file_edges`]) — the edge source for both the instant syntactic
+//! graph and the per-file drift/edit overlay.
+//!
+//! Freshness side: the scip cache is generated at index time (batch — a full `rust-analyzer
 //! scip` is ~a cargo check, never on the live path), so without help it lies twice: silently
 //! stale across sessions (no fingerprint), and blind to same-session committed edits. Fix, in
 //! the same shape as lang-ts: a content fingerprint stored beside the cache decides how much
-//! to trust it at load, and a per-file EDGE OVERLAY (tree-sitter `mod` + resolved `use` paths,
-//! in-process, no rust-analyzer) re-describes exactly the drifted/edited files. Unchanged
-//! files keep compiler-accurate scip edges; changed files get syntax-accurate edges instead
-//! of stale or missing ones.
+//! to trust it at load, and a per-file EDGE OVERLAY ([`overlay_graph`]) re-describes exactly
+//! the drifted/edited files. Unchanged files keep compiler-accurate scip edges; changed files
+//! get syntax-accurate edges instead of stale or missing ones.
+use ci_core::fingerprint::Fingerprint;
 use ci_core::ImportGraph;
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tree_sitter::Node as TsNode;
 
 /// Bump when inputs/format change; old fingerprints then read as fully drifted.
 const FP_VERSION: u64 = 1;
 
-pub(crate) type Fingerprint = BTreeMap<String, String>;
-
 pub(crate) fn fingerprint_path(root: &Path) -> PathBuf {
     root.join(".marksman").join("rust.scip.fingerprint.json")
 }
 
-/// FNV-1a 64-bit — detects accidental drift, not tampering (same rationale as lang-ts).
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x100000001b3);
+/// Does this file feed `rust-analyzer scip`? The `.rs` sources plus the manifests that shape
+/// the crate graph; build output under `target/` never counts.
+fn is_input(rel: &Path) -> bool {
+    if rel.starts_with("target") {
+        return false;
     }
-    h
+    let Some(name) = rel.file_name().map(|n| n.to_string_lossy()) else { return false };
+    name.ends_with(".rs") || name == "Cargo.toml" || name == "Cargo.lock"
 }
 
-/// Hash every file that feeds `rust-analyzer scip`: the `.rs` sources plus the manifests
-/// that shape the crate graph. Content hashes, not mtimes (a git checkout rewrites mtimes).
+/// Hash every file that feeds `rust-analyzer scip`. Content hashes, not mtimes (a git
+/// checkout rewrites mtimes) — see [`ci_core::fingerprint`].
 pub(crate) fn source_fingerprint(root: &Path) -> Fingerprint {
-    let mut map = Fingerprint::new();
-    for entry in ignore::WalkBuilder::new(root).build().flatten() {
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy();
-        let is_input = name.ends_with(".rs") || name == "Cargo.toml" || name == "Cargo.lock";
-        if !is_input {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(root) else { continue };
-        let rel = rel.to_string_lossy().replace('\\', "/");
-        if rel.starts_with("target/") {
-            continue;
-        }
-        if let Ok(bytes) = std::fs::read(entry.path()) {
-            map.insert(rel, format!("{:016x}", fnv1a(&bytes)));
-        }
-    }
-    map
+    ci_core::fingerprint::source_fingerprint(root, &[], is_input, &[])
 }
 
 pub(crate) fn store_fingerprint(root: &Path) -> std::io::Result<()> {
-    let payload = serde_json::json!({ "version": FP_VERSION, "files": source_fingerprint(root) });
-    let path = fingerprint_path(root);
-    if let Some(d) = path.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    std::fs::write(path, serde_json::to_vec(&payload)?)
+    ci_core::fingerprint::store_fingerprint(&fingerprint_path(root), FP_VERSION, &source_fingerprint(root))
 }
 
 /// Files that changed/appeared/disappeared since the fingerprint was stored — the set whose
 /// scip edges can no longer be trusted. `None` = no usable fingerprint (treat EVERYTHING as
 /// drifted: pre-fingerprint caches never get silently blessed).
 pub(crate) fn drifted_files(root: &Path) -> Option<Vec<String>> {
-    let bytes = std::fs::read(fingerprint_path(root)).ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    if v.get("version").and_then(|x| x.as_u64()) != Some(FP_VERSION) {
-        return None;
-    }
-    let stored: Fingerprint = serde_json::from_value(v.get("files")?.clone()).ok()?;
-    let current = source_fingerprint(root);
-    let mut drift: Vec<String> = Vec::new();
-    for (k, h) in &current {
-        if stored.get(k) != Some(h) {
-            drift.push(k.clone());
-        }
-    }
-    for k in stored.keys() {
-        if !current.contains_key(k) {
-            drift.push(k.clone());
-        }
-    }
-    drift.sort();
-    Some(drift)
+    ci_core::fingerprint::drifted_files(root, &fingerprint_path(root), FP_VERSION, &source_fingerprint(root))
 }
 
 /// Apply per-file overrides to a base graph: `Some(edges)` replaces the file's outgoing
@@ -111,6 +72,50 @@ pub(crate) fn overlay_graph(
     base
 }
 
+// ── module resolution (`mod` declarations) ───────────────────────────────────
+
+/// `mod foo;` declarations (file modules only — inline `mod foo { … }` has no file edge).
+pub(crate) fn mod_decls(root: TsNode, bytes: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if child.kind() == "mod_item" && child.child_by_field_name("body").is_none() {
+            if let Some(name) = child.child_by_field_name("name").and_then(|n| n.utf8_text(bytes).ok()) {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Resolve `mod <module>;` declared in `from` (repo-relative) to a repo-relative file:
+/// either `<scope>/module.rs` or `<scope>/module/mod.rs`, where the declaring file's scope
+/// directory follows the module-scope rule ([`own_scope_dir`]).
+pub(crate) fn resolve_mod(root: &Path, from: &str, module: &str) -> Option<PathBuf> {
+    let base = own_scope_dir(from);
+    [base.join(format!("{module}.rs")), base.join(module).join("mod.rs")]
+        .into_iter()
+        .find(|cand| root.join(cand).is_file())
+}
+
+/// Repo-relative `.rs` files, gitignore-aware, skipping `target/`.
+pub(crate) fn rust_files(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in ignore::WalkBuilder::new(root).build().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+            continue;
+        }
+        if let Ok(rel) = path.strip_prefix(root) {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if !rel.starts_with("target/") {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
 // ── use-path resolution (tree-sitter, in-process) ────────────────────────────
 
 /// Outgoing file edges of one rust file from its CURRENT content: `mod` declarations plus
@@ -124,8 +129,8 @@ pub(crate) fn file_edges(root: &Path, from: &str, tree_root: TsNode, bytes: &[u8
             edges.push(p);
         }
     };
-    for module in super::mod_decls(tree_root, bytes) {
-        if let Some(t) = super::resolve_mod(root, from, &module) {
+    for module in mod_decls(tree_root, bytes) {
+        if let Some(t) = resolve_mod(root, from, &module) {
             push(t);
         }
     }
@@ -206,8 +211,9 @@ fn collect_paths(n: TsNode, bytes: &[u8], prefix: &[String], out: &mut Vec<Vec<S
     }
 }
 
-/// The `src/`-style module base of `from`'s own scope: `mod.rs`/`lib.rs`/`main.rs` own their
-/// directory; `foo.rs` owns `foo/` (same rule as `resolve_mod`).
+/// THE module-scope rule, shared by [`resolve_mod`] (decl side) and [`resolve_use`]
+/// (path side): the `src/`-style module base of `from`'s own scope — `mod.rs`/`lib.rs`/
+/// `main.rs` own their directory; `foo.rs` owns `foo/`.
 fn own_scope_dir(from: &str) -> PathBuf {
     let p = Path::new(from);
     let parent = p.parent().unwrap_or(Path::new("")).to_path_buf();

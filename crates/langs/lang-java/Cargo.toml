@@ -1,0 +1,26 @@
+[package]
+name = "lang-java"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Java LanguageProvider at the gated tier: tree-sitter reads (lang-fallback) + a resident javax.tools compiler sidecar as the edit gate; jdtls for cross-file rename/move."
+
+[dependencies]
+ci-core = { path = "../../ci-core" }
+ci-edit = { path = "../../ci-edit" }
+ci-lsp = { path = "../../ci-lsp" }
+ci-proto = { path = "../../ci-proto" }
+lang-fallback = { path = "../lang-fallback" }
+serde_json = { workspace = true }
+# The gate sidecar source (embedded via include_str!) is materialized to a per-engine temp
+# dir; the TempDir handle lives on the engine so the file outlasts the JVM that runs it.
+tempfile = { workspace = true }
+
+[[bin]]
+name = "marksman-provider-java"
+path = "src/sidecar.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
+# The shared fast-tier gate mock (flags a marker string) — same scaffold PHP/Swift/conformance use.
+lang-template = { path = "../lang-template" }

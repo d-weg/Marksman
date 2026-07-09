@@ -20,4 +20,5 @@ ci-proto = { path = "../ci-proto" }
 lang-ts = { path = "../langs/lang-ts" }
 lang-rust = { path = "../langs/lang-rust" }
 lang-fallback = { path = "../langs/lang-fallback" }
+lang-java = { path = "../langs/lang-java" }
 serde_json.workspace = true

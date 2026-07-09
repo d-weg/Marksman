@@ -7,7 +7,7 @@
 //! caller-supplied node-kind names — so they live here once. Each language crate keeps only
 //! *its grammar's node-kind strings* (`"function_item"`, `"statement_block"`, `"comment"`, …).
 use ci_core::{Node, NodeKind, Range};
-use tree_sitter::Node as TsNode;
+use tree_sitter::{Node as TsNode, Parser};
 
 /// The `ci-core` [`Range`] for a single tree-sitter node. tree-sitter positions are 0-based
 /// (row, column); the manifest contract is 1-based lines with 0-based chars.
@@ -69,6 +69,20 @@ pub fn body_ranges(root: TsNode, def_kinds: &[&str], body_kinds: &[&str]) -> Vec
     out
 }
 
+/// Skeletal outline: parse `content` with `language`, fold the function/method bodies selected
+/// by `def_kinds`/`body_kinds` (same filter contract as [`body_ranges`]) via
+/// [`ci_core::elide_bodies`], keeping every signature/type. Best-effort: on any parse failure
+/// the original text is returned unchanged.
+pub fn outline(language: &tree_sitter::Language, content: &str, def_kinds: &[&str], body_kinds: &[&str]) -> String {
+    let mut parser = Parser::new();
+    if parser.set_language(language).is_err() {
+        return content.to_string();
+    }
+    let Some(tree) = parser.parse(content, None) else { return content.to_string() };
+    let bodies = body_ranges(tree.root_node(), def_kinds, body_kinds);
+    ci_core::elide_bodies(content, bodies)
+}
+
 fn collect_bodies(
     node: TsNode,
     def_kinds: &[&str],
@@ -124,6 +138,15 @@ mod tests {
         let mut c = root.walk();
         let kids: Vec<TsNode<'a>> = root.named_children(&mut c).collect();
         kids.into_iter().find(|n| n.kind() == kind).expect("node kind present")
+    }
+
+    #[test]
+    fn outline_folds_bodies_keeps_signatures() {
+        let src = "fn add(a: i32, b: i32) -> i32 {\n    let x = a + b;\n    x\n}\nstruct S { x: i32 }\n";
+        let o = outline(&tree_sitter_rust::LANGUAGE.into(), src, &["function_item"], &["block"]);
+        assert!(o.contains("fn add(a: i32, b: i32) -> i32"), "signature kept: {o}");
+        assert!(!o.contains("let x = a + b"), "body elided: {o}");
+        assert!(o.contains("struct S { x: i32 }"), "non-fn body kept: {o}");
     }
 
     #[test]

@@ -123,6 +123,21 @@ fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
                 }
             }
         }
+        "java" => {
+            // Ungated ABLATION arm (mirrors CI_TS_MODE=treesitter): fallback provider on demand.
+            if std::env::var("CI_JAVA_MODE").as_deref() == Ok("treesitter") {
+                eprintln!("[marksman] language: java (ABLATION: generic tree-sitter, UNGATED — CI_JAVA_MODE=treesitter)");
+                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Java)));
+            }
+            // Gated tier: a missing JDK disables the language with the install hint
+            // (contract §6) — never a silent fall-back to ungated edits.
+            if let Some(missing) = lang_java::gate_missing() {
+                eprintln!("[marksman] java DISABLED:\n{missing}");
+                return ProviderBuild::Unavailable(missing);
+            }
+            eprintln!("[marksman] language: java (tree-sitter reads; gate: resident javax.tools sidecar, renames: jdtls)");
+            ProviderBuild::Ready(Arc::new(lang_java::JavaProvider::new(root)))
+        }
         // Every other supported language rides the generic tree-sitter fallback: full read
         // path, ungated edits, zero external dependencies.
         other => match FbLang::from_name(other) {
@@ -201,11 +216,16 @@ fn cmd_doctor(root: &Path) {
     println!("marksman doctor — {}\n", root.display());
 
     let mut unhealthy = false;
-    let mut section = |report: ci_core::ToolchainReport, note: Option<&str>| {
+    // `optional` names tools whose absence narrows a capability (with the hint shown) without
+    // making the machine unhealthy — java's jdtls is rename/move-only, the gate stands without it.
+    let mut section = |report: ci_core::ToolchainReport, note: Option<&str>, optional: &[&str]| {
         println!("[{}]", report.lang);
         for t in &report.tools {
             match &t.found {
                 Some(v) => println!("  ok       {} ({v})", t.tool),
+                None if optional.contains(&t.tool) => {
+                    println!("  optional {} — needed only for {}\n           install: {}", t.tool, t.needed_for, t.install);
+                }
                 None => {
                     unhealthy = true;
                     println!("  MISSING  {} — needed for {}\n           install: {}", t.tool, t.needed_for, t.install);
@@ -219,16 +239,18 @@ fn cmd_doctor(root: &Path) {
     };
 
     if has(ci_walk::Lang::Ts) || has(ci_walk::Lang::Tsx) {
-        section(lang_ts::toolchain(), Some("scip-typescript / ts-morph are fetched automatically once node+npx exist"));
+        section(lang_ts::toolchain(), Some("scip-typescript / ts-morph are fetched automatically once node+npx exist"), &[]);
     }
     if has(ci_walk::Lang::Rust) {
-        section(lang_rust::toolchain(), Some("reads (structure/import graph) are in-process and need nothing external"));
+        section(lang_rust::toolchain(), Some("reads (structure/import graph) are in-process and need nothing external"), &[]);
+    }
+    if has(ci_walk::Lang::Java) {
+        section(lang_java::toolchain(), Some("reads are in-process; javac gates edits (required), jdtls serves only rename/move"), &["jdtls"]);
     }
     let fallback_langs: Vec<&str> = [
         (ci_walk::Lang::Python, "python"),
         (ci_walk::Lang::Js, "javascript"),
         (ci_walk::Lang::Go, "go"),
-        (ci_walk::Lang::Java, "java"),
         (ci_walk::Lang::Ruby, "ruby"),
         (ci_walk::Lang::C, "c"),
         (ci_walk::Lang::Cpp, "cpp"),

@@ -60,17 +60,33 @@ the naming is deliberate:
   `CI_TSGO` or `tsgo` on PATH) → **ts-morph sidecar** → **tsls**. `CI_EDIT_ENGINE=
   tsgo|tsmorph|lsp` forces a tier; `CI_TS_LSP_SERVER` swaps the LSP-tier server command.
 
-`ci_edit::Composed<R: ReadIndex>` assembles the two halves into a `LanguageProvider`
-(`lang-template`'s `GatedTreeSitter` is the reference instance; `lang-ts`/`lang-rust` wire
-the same channels by hand pending migration). The halves talk over **exactly three
-channels**, and the wiring policy is *derived* from two properties the reader advertises —
-not hand-wired per language:
+`ci_edit::Composed<R: ReadIndex>` assembles the two halves into a `LanguageProvider` —
+and it is the ONLY assembly: `lang-ts`, `lang-rust`, the `TsTreeGated` ablation, and
+`lang-template` all go through it; no provider wires the channels by hand. The halves
+talk over **exactly three channels**, and the wiring policy is *derived* from properties
+the reader advertises — not hand-wired per language:
 
 | channel | direction | policy source |
 |---|---|---|
 | **radius** — the reverse-import set the gate checks | read → engine | `semantic_edges()`: compiler-accurate graphs (SCIP) flatten barrels, one hop is sound; syntactic graphs must expand **transitively** or a barrel hides its consumers (bench T9) |
-| **freshness** — post-commit read overrides | engine → read | `live()`: tree-sitter readers re-parse disk, nothing to do; artifact readers take `file_summaries` overrides (or a tree-sitter approximation when the engine can't re-describe) so reads track the commit until the next reindex |
+| **freshness** — post-commit read overrides | engine → read | `live()` / `live_graph()`: live readers re-parse disk, nothing to do; artifact-backed structure takes `file_summaries` overrides, an artifact-backed graph takes edge overrides. A **hybrid** reader (Rust: live tree-sitter structure over an artifact scip graph) splits the policy per half — that is why the two bits exist |
 | **anchors** — edit ops resolve against the structure the agent saw | read → engine | always: the ids `list_anchors` advertised must be the ids `apply_edits` accepts |
+
+Where a language's reality doesn't fit the generic recipe, the provider registers a
+**hook at assembly time** — never a fork of the glue:
+
+- **`Prewarmer`** — rust-analyzer must be warmed by pulling one real file's diagnostics
+  against the raw LSP client (the default recipe would route through `RustEngine` and
+  spawn a `cargo check` at startup); the TS engines warm on a sample project file.
+- **`LiveSummarizer`** — the freshness fallback when the engine can't re-describe files
+  (LSP-tier TS engines return no `file_summaries`; TS registers a `lang_fallback`
+  tree-sitter re-parse, Rust a `mod`+`use` edge summarizer for its artifact graph).
+- **`FreshDeepener`** — TS re-runs the tree-sitter deepen over structure served from a
+  fresh summary, so post-commit reads keep their `:body`/`:params`/`:return` anchors.
+
+Language-specific op *synthesis* stays in the provider, applied before delegation (Rust
+expands `create_file` with the `pub mod` declaration an orphan `.rs` file needs) —
+`Composed` only ever sees a final batch.
 
 **Artifact producers are swappable too.** The same `index.scip` consumer accepts:
 `scip-typescript` (the default for TS — earns its cold-index cost at scale), the
@@ -79,6 +95,44 @@ protobuf; `CI_TS_MODE=lsp` arm — full parity on fixtures/bench, 38× slower at
 scale, so it is the producer for languages that have an LSP but *no* scip indexer, not a
 scip replacement), or tree-sitter directly (live, syntactic). The conformance suite pins
 producers to the same expectations (`conformance_ts_scip` / `conformance_ts_lsp_sweep`).
+
+### How a provider crate is divided
+
+One capability, one module. The **core crates own every generic capability** — a
+language crate holds only what is genuinely per-language, and its files split cleanly
+by which half they feed:
+
+```
+        ┌─────────────────────── a language provider crate ───────────────────────┐
+        │                                                                          │
+        │   lib.rs — ASSEMBLY ONLY: build the read half × the write half,          │
+        │            hand both to ci_edit::Composed, register hooks                │
+        │                                                                          │
+        │   READ HALF (feeds ReadIndex)          WRITE HALF (feeds GateEngine)     │
+        │   ─────────────────────────────        ────────────────────────────────  │
+        │   lang-rust:                           lang-rust:                        │
+        │     structure.rs  items + sub-nodes      gate.rs     cargo-check gate,   │
+        │     graph.rs      mod/use resolution,                 ra rename,         │
+        │                   scip cache + drift                  deleted-ref gapfill│
+        │                   seeding                movefix.rs  module-move rewriter│
+        │                                                                          │
+        │   lang-ts:                             lang-ts:                          │
+        │     ast.rs        SCIP+tree-sitter        engine.rs   tsgo→ts-morph→tsls │
+        │                   merge, re-anchor                    ladder + npx cache │
+        │     fingerprint.rs cache invalidation     tsmorph.rs  sidecar client     │
+        │     outline.rs    body elision            sidecar.cjs ts-morph ops       │
+        │                                                                          │
+        │   ablation.rs (ts): TsTreeGated = Composed<FallbackProvider> — the       │
+        │   tree-sitter-read ablation is just a different read half, same engine   │
+        └──────────────────────────────────────────────────────────────────────────┘
+
+Generic capabilities live in the core, one module each — a provider DELEGATES, never
+reimplements (enforced by the executable §7 audit in ci-conformance):
+  ci-core:        fingerprint (cache drift) · paths (rel_path) · driver (the traits)
+  ci-edit:        actions (op vocabulary) · apply (op handlers) · composed (the glue) ·
+                  lib (GateEngine + the commit_edits spine) · spawn_prewarm
+  ci-treesitter:  outline (body elision) · sub-node helpers
+```
 
 ### Read = SCIP **+** tree-sitter (merged)
 - **SCIP** gives compiler-grade semantics: symbol identity, cross-file references → the
@@ -90,23 +144,62 @@ producers to the same expectations (`conformance_ts_scip` / `conformance_ts_lsp_
 - Net: SCIP's "no AST → no sub-symbol edits" weakness is solved by tree-sitter; tree-sitter's
   "no semantics" weakness is covered by SCIP. Each fixes the other.
 
-### Read freshness (both providers — the index never lies in-session)
-- **TS**: after a committed `apply_edits`, the engine re-describes the changed files into a
-  per-file **read override** consulted before the loaded SCIP index — new symbols and new
-  import edges are visible immediately, no reindex. The ts-morph sidecar does this natively
-  (`fileInfo` op: symbols + resolved imports); the LSP engines (tsgo/tsls) can't re-describe
-  their live project, so the provider approximates from **tree-sitter on current disk** (the
-  same read shape `TsTreeGated` serves) — reads track the commit either way, and scip
-  fidelity returns at the next reindex. Startup stays fingerprint-cached; the overlay covers
-  the same-session window.
-- **Rust**: `structure()` and the `mod` graph read disk live (always fresh). The opt-in
-  `rust-analyzer scip` use-graph is fingerprinted at `refresh_scip` time; at load, files that
-  drifted since (and files committed in-session) get their edges recomputed from tree-sitter
-  (`mod` + resolved `use` paths) as an overlay — scip fidelity for unchanged files, syntax
-  fidelity for changed ones. A cache with **no** fingerprint is refused (mod-graph fallback),
+### Read freshness (Composed-owned — the index never lies in-session)
+
+One generic channel, implemented once in `Composed`: after a committed `apply_edits`,
+the engine re-describes the changed files (`file_summaries`), or the provider's
+registered `LiveSummarizer` approximates from current disk when it can't; the per-file
+overrides then shadow the artifact (replace / blank-on-empty / drop-on-delete) until the
+next reindex. What differs per provider is only the reader's policy bits and which
+summarizer it registers:
+
+- **TS** (`live()=false` — everything artifact-backed): the ts-morph sidecar
+  re-describes natively (`fileInfo`: symbols + resolved imports); the LSP engines
+  (tsgo/tsls) can't, so the `lang_fallback` tree-sitter summarizer covers them. Fresh
+  structure passes through the `FreshDeepener` so sub-node anchors survive the overlay;
+  scip fidelity returns at the next reindex. Startup stays fingerprint-cached.
+- **Rust** (hybrid: `live()=true`, `live_graph()=false` when the scip graph serves):
+  structure re-parses disk — nothing to overlay; only the artifact use-graph takes edge
+  overrides. Load-time staleness never reaches the glue: the read half bakes
+  fingerprint-drifted files' edges into its base graph itself (tree-sitter `mod` +
+  resolved `use`), and a cache with **no** fingerprint is refused (mod-graph fallback),
   never served at unknown age.
 
+### Retrieval flow (read side)
+
+```
+inspect(search: task text)                       inspect(symbol/file/node/map)
+  │                                                │
+  ├─ BM25 (sparse, ci-index)      ┐                └─ direct index/structure lookups
+  ├─ Model2Vec (dense, ci-embed)  ├─ RRF fusion → seeds
+  └─ symbol-name match            ┘
+  ▼
+graph expansion — import edges, N hops, both directions (ci-retrieve)
+  ▼
+package weighting → Manifest: weighted files + symbols
+  = what the agent PLANS against (the artifact answers; no checker runs)
+```
+
 ### Write = VFS transaction + LSP gate
+
+```
+apply_edits(batch)
+  │  action strings → EditOp (ci-edit/actions) · provider synthesizes language ops
+  │  anchors resolve against the structure the agent saw (read half)
+  ▼
+VFS overlay (ci-vfs) — structural ops bottom-up per file; rename/move as engine
+  │                    WorkspaceEdits; disk untouched
+  ▼
+blast radius — reverse imports from the read half's graph
+  │             one-hop when semantic_edges(), else TRANSITIVE (barrels can't hide)
+  ▼
+GATE — engine diagnostics over the radius, baseline-diffed (only NEW errors count)
+  ├─ reject → anchored, self-sufficient reply (offending source + ready-to-copy fix);
+  │           rollback — disk byte-identical
+  └─ clean  → atomic commit → freshness channel updates the read half
+              → incremental reindex (changed files only)
+```
+
 - Edits stage into an in-memory **VFS** overlay (`ci-vfs`); disk untouched until commit.
 - The **gate**: push `didChange` with the overlay to the language server (`ci-lsp`),
   collect in-memory diagnostics, **baseline-diff** (fail only on NEWLY introduced errors),
@@ -134,17 +227,18 @@ producers to the same expectations (`conformance_ts_scip` / `conformance_ts_lsp_
 | `ci-vfs` | in-memory overlay transaction | ✅ |
 | `ci-lsp` | **generic** LSP transport (provider supplies the command) | ✅ |
 | `ci-lsp-index` | SCIP emitter over any LSP (documentSymbol + references sweep) | ✅ |
-| `ci-edit` | gated atomic edits + anchored repair + `Composed` (ReadIndex × GateEngine) | ✅ |
-| `lang-ts` | TS provider: SCIP + tree-sitter read; gate tiers tsgo → ts-morph → tsls | ✅ |
-| `lang-rust` | Rust provider: tree-sitter read + default `rust-analyzer scip` use-graph (fingerprinted, drift-overlaid), rust-analyzer gated write | ✅ |
+| `ci-edit` | gated atomic edits + anchored repair, split by capability: `actions` (op vocabulary) · `apply` (op handlers) · `composed` (ReadIndex × GateEngine glue) · the `commit_edits` spine | ✅ |
+| `lang-ts` | TS provider = `Composed<TsRead>`: SCIP + tree-sitter read half; gate tiers tsgo → ts-morph → tsls | ✅ |
+| `lang-rust` | Rust provider = `Composed<RustRead>`: live tree-sitter structure + `rust-analyzer scip` use-graph (fingerprinted, drift-seeded) read half; cargo-check gated write | ✅ |
 | `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Java, Ruby, C, C++): read path + ungated edits; the `ReadIndex` reference impl | ✅ |
 | `lang-template` | copyable Step-1 skeleton: `Composed` over tree-sitter reads + your checker | ✅ |
 | `ci-cli` | `index` / `retrieve` binaries | ✅ |
 | `ci-arch` | zero-API architecture map (detects module templates) | ✅ |
-| `ci-mcp` | Rust MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits | ✅ |
+| `ci-mcp` | Rust MCP server (stdio): the two-tool facade — `apply_edits` + `inspect` (search/symbol/file/node/map) — pinned by a surface test | ✅ |
 
-**~60 unit tests + real-tool e2e** (scip-typescript indexing, LSP gate, edit gate, the
-SCIP+tree-sitter deepen).
+**~150 unit tests + real-tool e2e** (scip-typescript indexing, LSP gate, edit gate, the
+SCIP+tree-sitter deepen, the conformance battery incl. the executable §7
+no-reimplementation audit).
 
 ## Done vs pending
 

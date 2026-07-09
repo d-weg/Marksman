@@ -4,255 +4,56 @@
 //! type-checked edits via rust-analyzer are on the roadmap; this is what lets Marksman
 //! index and retrieve Rust — including its own source — today.
 use ci_core::{
-    CommitResult, EditOp, EditOpts, Error, Granularity, ImportGraph, LanguageProvider, Node,
-    NodeKind, Range, Result, SymbolKind,
+    rel_path, CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
+    LanguageProvider, Node, ReadIndex, Result, SymbolKind,
 };
-use ci_edit::GateEngine;
+use ci_edit::{Composed, GateEngine};
 use ci_lsp::LspClient;
-use ci_treesitter::{syntax_node, ts_range};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tree_sitter::{Node as TsNode, Parser};
+use tree_sitter::Parser;
 
+mod gate;
+mod graph;
 mod movefix;
-mod usegraph;
+mod structure;
 
-/// The rust-analyzer LSP server, loaded once and reused as the edit/gate engine — the same
-/// `GateEngine`/`LspClient` path TypeScript uses, just rust-analyzer instead of tsserver.
-type WarmEngine = Arc<Mutex<Option<RustEngine>>>;
+use gate::RustEngine;
 
-/// The Rust write engine: rust-analyzer for diagnostics/rename, plus a SYNTACTIC module-move
-/// fallback for the one operation ra's `willRenameFiles` doesn't cover (moves into a
-/// submodule return NO edits, leaving the `mod` decl and every `crate::` path dangling —
-/// bench `move-rust`). The fallback emits a genuine WorkspaceEdit (see `movefix`); the gate
-/// still verifies the result, so an unsupported shape degrades to a REJECT with named sites,
-/// never a silent break.
-struct RustEngine {
-    root: PathBuf,
-    lsp: LspClient,
-}
-
-/// Diagnostics for references to files the CURRENT BATCH deletes (empty-content buffers, the
-/// gate's deletion convention): `use crate::a::b…` chains and `mod x;` decls resolving to a
-/// deleted path. This is the E0432/E0583 class rust-analyzer's pull diagnostics never report.
-fn deleted_path_references(root: &Path, files: &[(String, String)]) -> Vec<ci_core::Diag> {
-    let deleted: std::collections::HashSet<&str> =
-        files.iter().filter(|(_, c)| c.is_empty()).map(|(f, _)| f.as_str()).collect();
-    if deleted.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for (rel, content) in files.iter().filter(|(_, c)| !c.is_empty()) {
-        for (i, line) in content.lines().enumerate() {
-            // `crate::a::b::…` — walk the segment chain; any prefix landing on a deleted
-            // module file is a stranded reference.
-            let mut rest = line;
-            while let Some(pos) = rest.find("crate::") {
-                let tail = &rest[pos + 7..];
-                let segs: Vec<&str> = tail
-                    .split("::")
-                    .map(|s| s.trim_end_matches(|c: char| !(c.is_alphanumeric() || c == '_')))
-                    .take_while(|s| !s.is_empty() && s.chars().all(|c| c.is_alphanumeric() || c == '_'))
-                    .collect();
-                for n in 1..=segs.len() {
-                    let base = segs[..n].join("/");
-                    for cand in [format!("src/{base}.rs"), format!("src/{base}/mod.rs")] {
-                        if deleted.contains(cand.as_str()) {
-                            out.push(ci_core::Diag {
-                                file: rel.clone(),
-                                code: 0,
-                                message: format!(
-                                    "unresolved import `crate::{}` — {cand} is deleted/moved by this batch (E0432); update the path",
-                                    segs[..n].join("::")
-                                ),
-                                line: i as u32 + 1,
-                            });
-                        }
-                    }
-                }
-                rest = &rest[pos + 7..];
-            }
-            // `mod x;` decls whose file this batch deletes (E0583-class, decl side).
-            let t = line.trim_start();
-            let decl = t.strip_prefix("pub ").unwrap_or(t);
-            if let Some(m) = decl.strip_prefix("mod ") {
-                if let Some(name) = m.trim_end().strip_suffix(';') {
-                    if let Some(target) = resolve_mod(root, rel, name.trim()) {
-                        let target = target.to_string_lossy().replace('\\', "/");
-                        if deleted.contains(target.as_str()) {
-                            out.push(ci_core::Diag {
-                                file: rel.clone(),
-                                code: 0,
-                                message: format!(
-                                    "`mod {}` points at {target}, which this batch deletes/moves (E0583); update or remove the declaration",
-                                    name.trim()
-                                ),
-                                line: i as u32 + 1,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
-/// rustc-grade gate: transiently materialize the candidate buffers, run
-/// `cargo check --message-format=json`, map primary-span errors to Diags, restore the disk.
-/// Whole-crate by nature — errors OUTSIDE the computed radius are reported too (sounder than
-/// the radius; the baseline diff still excuses pre-existing ones). Buffer conventions from
-/// ci-edit hold: an EMPTY buffer for a path already off disk is a staged deletion's stand-in
-/// and must NOT be recreated (that would resurrect the module for the check).
-fn cargo_check_diags(root: &Path, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
-    struct Restore(Vec<(std::path::PathBuf, Option<String>)>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            for (p, orig) in &self.0 {
-                match orig {
-                    Some(c) => {
-                        let _ = std::fs::write(p, c);
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(p);
-                    }
-                }
-            }
-        }
-    }
-    let t0 = std::time::Instant::now();
-    let mut guard = Restore(Vec::new());
-    for (rel, content) in files {
-        let abs = root.join(rel);
-        let on_disk = std::fs::read_to_string(&abs).ok();
-        if content.is_empty() && on_disk.is_none() {
-            continue; // deletion stand-in: the file is (correctly) gone from disk
-        }
-        if on_disk.as_deref() == Some(content.as_str()) {
-            continue; // buffer already equals disk (baseline pass): nothing to stage
-        }
-        if let Some(parent) = abs.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(&abs, content)
-            .map_err(|e| ci_core::Error::Driver(format!("stage {rel} for cargo check: {e}")))?;
-        guard.0.push((abs, on_disk));
-    }
-    let out = std::process::Command::new("cargo")
-        .args(["check", "--message-format=json", "-q"])
-        .current_dir(root)
-        .env("CARGO_TERM_COLOR", "never")
-        .output()
-        .map_err(|e| ci_core::Error::Driver(format!("spawn cargo check: {e}")))?;
-    let mut diags = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if v["reason"] != "compiler-message" || v["message"]["level"] != "error" {
-            continue;
-        }
-        let msg = &v["message"];
-        // Spanless errors ("aborting due to N previous errors") carry no site — skip.
-        let Some(span) = msg["spans"].as_array().and_then(|s| s.iter().find(|sp| sp["is_primary"] == true)) else {
-            continue;
-        };
-        let file = span["file_name"].as_str().unwrap_or("").replace('\\', "/");
-        if file.is_empty() {
-            continue;
-        }
-        let text = msg["message"].as_str().unwrap_or("").to_string();
-        // rustc codes are strings ("E0308"); Diag.code is the numeric TS convention — carry
-        // the rustc code in the MESSAGE (code stays 0 so no "TS…" prefix is rendered).
-        let message = match msg["code"]["code"].as_str() {
-            Some(c) if !text.starts_with(c) => format!("{c}: {text}"),
-            _ => text,
-        };
-        diags.push(ci_core::Diag {
-            file,
-            code: 0,
-            message,
-            line: span["line_start"].as_u64().unwrap_or(0) as u32,
-        });
-    }
-    // Errors but none parsed (a broken Cargo.toml aborts before compiler-messages): surface
-    // the failure as a diagnostic so the gate REJECTS instead of reading silence as clean.
-    if !out.status.success() && diags.is_empty() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("cargo check failed");
-        diags.push(ci_core::Diag { file: "Cargo.toml".into(), code: 0, message: first.to_string(), line: 0 });
-    }
-    if std::env::var("CI_TIMING").is_ok() {
-        eprintln!("[timing]   cargo check gate {:?} ({} staged, {} errors)", t0.elapsed(), guard.0.len(), diags.len());
-    }
-    Ok(diags)
-}
-
-impl GateEngine for RustEngine {
-    fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<ci_core::Diag>> {
-        // The gate VERDICT comes from rustc (`cargo check`), not rust-analyzer: ra's native
-        // pull diagnostics have two verified coverage holes — unresolved imports (bench
-        // move-rust round 4, gap-filled syntactically) and trait/operator errors (bench
-        // locate-edit: `const RRF_K: f64` committed "type-checked clean" while `RRF_K +
-        // rank as f32` was E0277 — a class no syntactic gap-fill can catch). Measured on the
-        // fixture: warm incremental `cargo check` is 0.1–0.25s, CHEAPER than ra's quiescence
-        // dance. Candidate buffers are materialized transiently (drop-guard restores), so
-        // rustc sees exactly the state the batch proposes. ra remains the rename/willRename
-        // engine; CI_RUST_GATE=ra restores the old path (plus gap-fill) as an escape hatch.
-        if std::env::var("CI_RUST_GATE").as_deref() == Ok("ra") {
-            let mut out = self.lsp.diagnostics(files)?;
-            out.extend(deleted_path_references(&self.root, files));
-            return Ok(out);
-        }
-        match cargo_check_diags(&self.root, files) {
-            Ok(diags) => Ok(diags),
-            Err(e) => {
-                // cargo unavailable (unusual: ra requires a toolchain) — degrade to ra +
-                // gap-fill rather than blocking every edit, but say so.
-                eprintln!("[lang-rust] cargo check gate unavailable ({e}); falling back to rust-analyzer diagnostics");
-                let mut out = self.lsp.diagnostics(files)?;
-                out.extend(deleted_path_references(&self.root, files));
-                Ok(out)
-            }
-        }
-    }
-    fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<serde_json::Value> {
-        GateEngine::rename(&mut self.lsp, file, line, character, new_name)
-    }
-    fn will_rename(&mut self, from: &str, to: &str) -> Result<serde_json::Value> {
-        // movefix FIRST: for the move shapes it understands, ra's willRenameFiles both
-        // returns NOTHING and takes ~12s to say so (the request queues behind cache priming
-        // on the main loop — measured: 12.4s of an 18s gate). movefix is deterministic
-        // syntax, and the type-check gate rejects any rewrite it gets wrong, so asking ra
-        // first buys nothing but the wait. Shapes movefix declines still go to ra.
-        if let Some(fix) = movefix::move_workspace_edit(&self.root, from, to) {
-            return Ok(fix);
-        }
-        GateEngine::will_rename(&mut self.lsp, from, to)
-    }
-    fn sync_disk(&mut self) -> Result<()> {
-        self.lsp.sync_disk()
-    }
-    fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
-        self.lsp.fs_events(created, deleted)
-    }
-}
-
+/// The Rust provider, assembled from its two halves — [`RustRead`] (the read index the
+/// agent plans against) × [`gate::RustEngine`] (rust-analyzer rename/move + the `cargo
+/// check` verdict) — glued by [`Composed`]: post-commit graph freshness and the blast-radius
+/// policy are derived from the reader's advertised properties (`live`/`live_graph`/
+/// `semantic_edges`), never hand-wired here. What stays Rust-specific in this crate: the
+/// grammar hooks (structure/graph/movefix), the toolchain probes, and the `pub mod x;`
+/// synthesis on `create_file` (an orphan `.rs` file never compiles).
 #[derive(Clone)]
 pub struct RustProvider {
     root: PathBuf,
-    engine: WarmEngine,
+    inner: Arc<Composed<RustRead>>,
+}
+
+/// The Rust READ half ([`ReadIndex`]): `structure()` is a LIVE tree-sitter parse of current
+/// disk; `import_graph()` serves the cached `rust-analyzer scip` graph when enabled and
+/// trustworthy, else the instant syntactic `mod`+`use` graph. Hence the hybrid contract it
+/// advertises: `live` (structure re-reads disk), `live_graph`/`semantic_edges` following
+/// whether the scip artifact is actually being served — the glue then overlays post-commit
+/// edges on the artifact graph and sizes the blast radius (one-hop scip, transitive
+/// syntactic) to match.
+#[derive(Clone)]
+struct RustRead {
+    root: PathBuf,
     /// Use the cached `rust-analyzer scip` graph (compiler-accurate `use` edges) over the
     /// tree-sitter `mod` graph. Set by the caller from `Config::scip_enabled("rust")`.
     use_scip: bool,
     /// The scip cache's base graph, loaded + drift-checked ONCE per provider (`None` inside =
-    /// cache unusable: absent, unreadable, or no fingerprint to trust it by).
+    /// cache unusable: absent, unreadable, or no fingerprint to trust it by). Files that
+    /// drifted since the cache was built have their edges re-described from tree-sitter and
+    /// baked in AT LOAD — read-side truth the glue never sees; post-commit freshness is the
+    /// glue's job.
     scip_base: Arc<Mutex<Option<Option<ImportGraph>>>>,
-    /// Per-file outgoing-edge overrides on top of the scip base graph (`None` = file deleted).
-    /// Seeded at load for files that drifted since the cache was built, updated after each
-    /// committed edit — so the served graph never reports pre-edit edges. Same pattern as
-    /// lang-ts's post-edit `fresh` overlay, sourced from tree-sitter (`mod` + resolved `use`).
-    fresh_edges: Arc<Mutex<HashMap<String, Option<Vec<PathBuf>>>>>,
 }
 
 /// What ONE bare `move_file` covers for Rust — composed into the MCP `apply_edits`
@@ -292,13 +93,7 @@ pub fn toolchain() -> ci_core::ToolchainReport {
 
 impl RustProvider {
     pub fn new(root: &Path) -> Self {
-        Self {
-            root: root.to_path_buf(),
-            engine: Arc::new(Mutex::new(None)),
-            use_scip: false,
-            scip_base: Arc::new(Mutex::new(None)),
-            fresh_edges: Arc::new(Mutex::new(HashMap::new())),
-        }
+        Self::assemble(root, false)
     }
 
     /// TS-parity startup (`TsProvider::open` is the model): when the semantic graph is
@@ -316,16 +111,22 @@ impl RustProvider {
         Self::new(root).with_scip(use_scip)
     }
 
-    /// Enable the compiler-accurate `rust-analyzer scip` graph (see [`RustProvider::use_scip`]).
-    pub fn with_scip(mut self, use_scip: bool) -> Self {
-        self.use_scip = use_scip;
-        self
+    /// Enable the compiler-accurate `rust-analyzer scip` graph (see [`RustRead::use_scip`]).
+    pub fn with_scip(self, use_scip: bool) -> Self {
+        Self::assemble(&self.root, use_scip)
     }
 
-    /// Normalize a (possibly absolute) path to the repo-relative posix form.
-    fn rel(&self, file: &Path) -> String {
-        let p = if file.is_absolute() { file.strip_prefix(&self.root).unwrap_or(file) } else { file };
-        p.to_string_lossy().replace('\\', "/")
+    /// Wire the halves: the read index advertises its properties, the engine factory carries
+    /// the toolchain hint, the prewarmer issues rust-analyzer's real warming call, and the
+    /// live summarizer re-describes committed files from tree-sitter for the glue's
+    /// post-commit graph overlay.
+    fn assemble(root: &Path, use_scip: bool) -> Self {
+        let read = RustRead::new(root, use_scip);
+        let summarize_root = root.to_path_buf();
+        let inner = Composed::new(root, read, engine_factory())
+            .with_live_summarizer(Arc::new(move |rel| file_summary(&summarize_root, rel)))
+            .with_prewarmer(Arc::new(prewarm_engine));
+        Self { root: root.to_path_buf(), inner: Arc::new(inner) }
     }
 
     pub(crate) fn parse(content: &str) -> Option<tree_sitter::Tree> {
@@ -333,6 +134,68 @@ impl RustProvider {
         let lang: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
         parser.set_language(&lang).ok()?;
         parser.parse(content, None)
+    }
+}
+
+/// Builds the write engine (lazily in `apply_edits`, or via the prewarmer). When the
+/// toolchain itself is the problem, say THAT (with the install hint) instead of a raw spawn
+/// error — reads worked fine, so this is the user's first signal that the WRITE path has a
+/// missing dependency.
+fn engine_factory() -> ci_edit::EngineFactory {
+    Arc::new(|root: &Path| {
+        let lsp = LspClient::start(root, rust_analyzer_command()).map_err(|e| {
+            match toolchain().describe_missing() {
+                Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
+                None => e,
+            }
+        })?;
+        Ok(Box::new(RustEngine { root: root.to_path_buf(), lsp }) as Box<dyn GateEngine + Send>)
+    })
+}
+
+/// The rust-analyzer warming recipe ([`ci_edit::Prewarmer`]): start the LSP and pull one real
+/// file's diagnostics — that call is what forces the cold `cargo metadata` + analysis load.
+/// It must hit the RAW LSP client, not [`RustEngine`] (whose `diagnostics` is the cargo
+/// gate). No-op-safe: `None` if rust-analyzer can't start (apply_edits then surfaces the
+/// error).
+fn prewarm_engine(root: &Path) -> Option<Box<dyn GateEngine + Send>> {
+    let warm = graph::rust_files(root)
+        .into_iter()
+        .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
+    let mut client = LspClient::start(root, rust_analyzer_command()).ok()?;
+    if let Some((f, content)) = warm {
+        let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
+    }
+    Some(Box::new(RustEngine { root: root.to_path_buf(), lsp: client }))
+}
+
+/// Re-describe one committed file for the glue's post-commit graph overlay (tree-sitter,
+/// in-process — cheap and can't fail the edit): current-disk symbols + outgoing edges, a
+/// `deleted` summary when the file is gone (its graph entry must drop), `None` for non-`.rs`
+/// files (manifests never carry edges). A parse failure yields no imports — the entry drops,
+/// matching what serving edges-from-disk did for an unreadable parse.
+fn file_summary(root: &Path, rel: &str) -> Option<FileSummary> {
+    if !rel.ends_with(".rs") {
+        return None;
+    }
+    let Ok(content) = std::fs::read_to_string(root.join(rel)) else {
+        return Some(FileSummary { path: rel.into(), deleted: true, nodes: vec![], imports: vec![] });
+    };
+    let (nodes, imports) = match RustProvider::parse(&content) {
+        Some(tree) => {
+            let bytes = content.as_bytes();
+            let mut nodes = Vec::new();
+            structure::collect_items(tree.root_node(), bytes, &format!("{rel}#"), SymbolKind::Function, &mut nodes);
+            (nodes, graph::file_edges(root, rel, tree.root_node(), bytes))
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    Some(FileSummary { path: rel.into(), deleted: false, nodes, imports })
+}
+
+impl RustRead {
+    fn new(root: &Path, use_scip: bool) -> Self {
+        Self { root: root.to_path_buf(), use_scip, scip_base: Arc::new(Mutex::new(None)) }
     }
 
     /// The cached `rust-analyzer scip` index (the optional compiler-accurate graph source).
@@ -343,29 +206,36 @@ impl RustProvider {
     /// The `use`/reference import graph from the cached SCIP index, kept honest: the base
     /// graph is loaded once and trusted only as far as its fingerprint reaches — every file
     /// that drifted since `refresh_scip` ran gets its edges recomputed from tree-sitter
-    /// (`mod` + resolved `use` paths) as an overlay, and committed edits update that overlay
-    /// (see `apply_edits`). `None` (→ the `mod`-graph fallback) when there is no cache, or a
-    /// cache with no fingerprint at all — a graph we can't vouch for is never served.
+    /// (`mod` + resolved `use` paths) and baked in at load. `None` (→ the `mod`-graph
+    /// fallback) when there is no cache, or a cache with no fingerprint at all — a graph we
+    /// can't vouch for is never served.
     fn scip_graph(&self) -> Option<ImportGraph> {
         let mut base_slot = self.scip_base.lock().ok()?;
         if base_slot.is_none() {
             *base_slot = Some(self.load_scip_base());
         }
-        let base = base_slot.as_ref()?.clone()?;
-        drop(base_slot);
-        let overrides = self.fresh_edges.lock().ok()?;
-        Some(usegraph::overlay_graph(base, &overrides))
+        base_slot.as_ref()?.clone()
     }
 
-    /// Load + drift-check the scip cache (once per provider). On success, seeds `fresh_edges`
-    /// for exactly the files that changed since the cache was built.
+    /// Whether [`scip_graph`](RustRead::scip_graph) would serve (loading it on first ask) —
+    /// the fact `live_graph`/`semantic_edges` advertise, without cloning the graph.
+    fn serving_scip(&self) -> bool {
+        let Ok(mut base_slot) = self.scip_base.lock() else { return false };
+        if base_slot.is_none() {
+            *base_slot = Some(self.load_scip_base());
+        }
+        matches!(base_slot.as_ref(), Some(Some(_)))
+    }
+
+    /// Load + drift-check the scip cache (once per provider). Files that changed since the
+    /// cache was built get their edges re-described from disk and baked into the base.
     fn load_scip_base(&self) -> Option<ImportGraph> {
         let cache = self.scip_cache();
         if !cache.is_file() {
             return None;
         }
         let graph = ci_scip::ScipIndex::load(&cache).ok()?.import_graph().ok()?;
-        let Some(drift) = usegraph::drifted_files(&self.root) else {
+        let Some(drift) = graph::drifted_files(&self.root) else {
             eprintln!(
                 "[lang-rust] scip cache {} has no fingerprint — refusing to serve a graph of unknown \
                  age (falling back to the mod graph); re-run `index` to regenerate it",
@@ -373,21 +243,21 @@ impl RustProvider {
             );
             return None;
         };
-        if !drift.is_empty() {
-            if let Ok(mut m) = self.fresh_edges.lock() {
-                for rel in &drift {
-                    if rel.ends_with(".rs") {
-                        m.entry(rel.clone()).or_insert_with(|| self.edges_from_disk(rel));
-                    }
-                }
-            }
-            eprintln!(
-                "[lang-rust] scip graph: {} file(s) changed since the cache was built; serving \
-                 tree-sitter edges for those files (scip edges for the rest)",
-                drift.len()
-            );
+        if drift.is_empty() {
+            return Some(graph);
         }
-        Some(graph)
+        let mut seed: HashMap<String, Option<Vec<PathBuf>>> = HashMap::new();
+        for rel in &drift {
+            if rel.ends_with(".rs") {
+                seed.insert(rel.clone(), self.edges_from_disk(rel));
+            }
+        }
+        eprintln!(
+            "[lang-rust] scip graph: {} file(s) changed since the cache was built; serving \
+             tree-sitter edges for those files (scip edges for the rest)",
+            drift.len()
+        );
+        Some(graph::overlay_graph(graph, &seed))
     }
 
     /// The instant in-process graph: tree-sitter `mod` + resolved `use` edges over the whole
@@ -397,7 +267,7 @@ impl RustProvider {
     /// were invisible to the gate when no scip cache existed — bench move-rust round 4).
     fn syntactic_graph(&self) -> ImportGraph {
         let mut graph: ImportGraph = BTreeMap::new();
-        for rel in rust_files(&self.root) {
+        for rel in graph::rust_files(&self.root) {
             if let Some(edges) = self.edges_from_disk(&rel) {
                 if !edges.is_empty() {
                     graph.insert(PathBuf::from(&rel), edges);
@@ -410,8 +280,62 @@ impl RustProvider {
     /// Current outgoing edges of `rel` from disk (`None` = file gone).
     fn edges_from_disk(&self, rel: &str) -> Option<Vec<PathBuf>> {
         let content = std::fs::read_to_string(self.root.join(rel)).ok()?;
-        let tree = Self::parse(&content)?;
-        Some(usegraph::file_edges(&self.root, rel, tree.root_node(), content.as_bytes()))
+        let tree = RustProvider::parse(&content)?;
+        Some(graph::file_edges(&self.root, rel, tree.root_node(), content.as_bytes()))
+    }
+}
+
+impl ReadIndex for RustRead {
+    fn granularity(&self) -> Granularity {
+        Granularity::Ast // tree-sitter sub-nodes (params / return / body)
+    }
+
+    fn structure(&self, file: &Path) -> Result<Vec<Node>> {
+        let rel = rel_path(&self.root, file);
+        let content = match std::fs::read_to_string(self.root.join(&rel)) {
+            Ok(c) => c,
+            Err(_) => return Ok(vec![]),
+        };
+        let Some(tree) = RustProvider::parse(&content) else { return Ok(vec![]) };
+        let bytes = content.as_bytes();
+        let mut out = Vec::new();
+        let prefix = format!("{rel}#");
+        structure::collect_items(tree.root_node(), bytes, &prefix, SymbolKind::Function, &mut out);
+        Ok(out)
+    }
+
+    fn import_graph(&self) -> Result<ImportGraph> {
+        // OPT-IN (`use_scip`, from config/env): a compiler-accurate `use`/reference graph from a
+        // cached `rust-analyzer scip` index — far richer than `mod` edges. Read-only here
+        // (generation is `refresh_scip`, run at index time), and we fall back to the instant
+        // tree-sitter `mod` graph whenever the cache is absent, so this never blocks the live path.
+        if self.use_scip {
+            if let Some(g) = self.scip_graph() {
+                return Ok(g);
+            }
+        }
+        Ok(self.syntactic_graph())
+    }
+
+    /// Structure re-parses current disk on every read — no fresh-summary override may ever
+    /// shadow it.
+    fn live(&self) -> bool {
+        true
+    }
+
+    /// The served graph is an artifact exactly when the scip cache is trusted; the glue then
+    /// overlays committed edits' edges so the graph never reports pre-edit edges. The
+    /// syntactic graph re-reads disk per call and needs no overlay.
+    fn live_graph(&self) -> bool {
+        !(self.use_scip && self.serving_scip())
+    }
+
+    /// Blast-radius policy follows the graph's edge semantics (bench T9): the
+    /// compiler-accurate scip `use` graph flattens re-exports, so ONE reverse hop is sound;
+    /// the syntactic fallback does not, so its radius must expand TRANSITIVELY or a
+    /// `pub use` chain hides consumers from the gate.
+    fn semantic_edges(&self) -> bool {
+        self.use_scip && self.serving_scip()
     }
 }
 
@@ -425,7 +349,7 @@ impl RustProvider {
 /// for twice, while a stale one is regenerated at the batch step where slow is acceptable.
 pub fn refresh_scip_if_stale(root: &Path) -> Result<bool> {
     if root.join(".marksman").join("rust.scip").is_file() {
-        if let Some(drift) = usegraph::drifted_files(root) {
+        if let Some(drift) = graph::drifted_files(root) {
             if drift.is_empty() {
                 return Ok(false); // cache fresh — nothing to do
             }
@@ -456,116 +380,49 @@ pub fn refresh_scip(root: &Path) -> Result<()> {
     // The fingerprint is what lets a later session TRUST this cache (and pinpoint which files
     // drifted). Without one the graph falls back to mod edges, so failing to write it is an
     // error, not a shrug.
-    usegraph::store_fingerprint(root)
+    graph::store_fingerprint(root)
         .map_err(|e| Error::Driver(format!("storing the scip cache fingerprint: {e}")))?;
     Ok(())
 }
 
 impl LanguageProvider for RustProvider {
     fn granularity(&self) -> Granularity {
-        Granularity::Ast // tree-sitter sub-nodes (params / return / body)
+        self.inner.granularity()
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        let rel = self.rel(file);
-        let content = match std::fs::read_to_string(self.root.join(&rel)) {
-            Ok(c) => c,
-            Err(_) => return Ok(vec![]),
-        };
-        let Some(tree) = Self::parse(&content) else { return Ok(vec![]) };
-        let bytes = content.as_bytes();
-        let mut out = Vec::new();
-        let prefix = format!("{rel}#");
-        collect_items(tree.root_node(), bytes, &prefix, SymbolKind::Function, &mut out);
-        Ok(out)
+        self.inner.structure(file)
     }
 
     fn import_graph(&self) -> Result<ImportGraph> {
-        // OPT-IN (`use_scip`, from config/env): a compiler-accurate `use`/reference graph from a
-        // cached `rust-analyzer scip` index — far richer than `mod` edges. Read-only here
-        // (generation is `refresh_scip`, run at index time), and we fall back to the instant
-        // tree-sitter `mod` graph whenever the cache is absent, so this never blocks the live path.
-        if self.use_scip {
-            if let Some(g) = self.scip_graph() {
-                return Ok(g);
-            }
-        }
-        Ok(self.syntactic_graph())
+        self.inner.import_graph()
     }
 
     /// Start rust-analyzer and load the cargo workspace NOW, on a background thread, so the
     /// first `apply_edits` finds it warm instead of paying the cold `cargo metadata` + analysis
-    /// inline. No-op-safe if rust-analyzer can't start (apply_edits then surfaces the error).
+    /// inline. The recipe is [`prewarm_engine`]; the lock/wait/no-double-start discipline
+    /// lives in `ci_edit::spawn_prewarm`, driven by the glue.
     fn prewarm(&self) {
-        let slot = self.engine.clone();
-        let root = self.root.clone();
-        let warm = rust_files(&root)
-            .into_iter()
-            .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
-        std::thread::spawn(move || {
-            let Ok(mut guard) = slot.lock() else { return };
-            if guard.is_some() {
-                return;
-            }
-            if let Ok(mut client) = LspClient::start(&root, rust_analyzer_command()) {
-                if let Some((f, content)) = warm {
-                    let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
-                }
-                *guard = Some(RustEngine { root: root.clone(), lsp: client });
-            }
-        });
+        self.inner.prewarm()
     }
 
+    /// The write path is [`Composed`]: persistent rust-analyzer engine (reuse from prewarm),
+    /// the same VFS + baseline-diff + blast-radius spine as TypeScript, radius policy from
+    /// the read half's edge semantics, post-commit graph freshness from the live summarizer.
+    /// The one Rust-specific step happens HERE, before the glue sees the batch:
+    /// create_file of an UNDECLARED module file synthesizes its `pub mod x;` declaration
+    /// right after the create (movefix::declare_module_edit) — an orphan .rs file never
+    /// compiles, so every agent hand-writes this edit; server-side it is deterministic.
+    /// Skipped when any batch op already touches the parent decl file (the agent is
+    /// handling membership itself — synthesizing too would DUPLICATE the declaration).
     fn apply_edits(&self, ops: &[EditOp], opts: &EditOpts) -> Result<CommitResult> {
-        // Gate via the PERSISTENT rust-analyzer LSP (reuse from prewarm; lock blocks until an
-        // in-flight warm finishes, so we never start a second cold server). Same VFS +
-        // baseline-diff + blast-radius path as TypeScript, through the GateEngine seam.
-        let mut guard = self.engine.lock().map_err(|_| Error::Driver("engine lock poisoned".into()))?;
-        if guard.is_none() {
-            let lsp = LspClient::start(&self.root, rust_analyzer_command()).map_err(|e| {
-                // When the toolchain itself is the problem, say THAT (with the install hint)
-                // instead of a raw spawn error — reads worked fine, so this is the user's first
-                // signal that the WRITE path has a missing dependency.
-                match toolchain().describe_missing() {
-                    Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
-                    None => e,
-                }
-            })?;
-            *guard = Some(RustEngine { root: self.root.clone(), lsp });
-        }
-        let engine: &mut dyn GateEngine = guard.as_mut().unwrap();
-
-        let structure_of = |f: &str| self.structure(Path::new(f)).unwrap_or_default();
-
-        // Blast-radius policy follows the graph's edge semantics (the ReadIndex rule, bench
-        // T9): the compiler-accurate scip `use` graph flattens re-exports, so ONE reverse hop
-        // is sound; the syntactic fallback does not, so its radius must expand TRANSITIVELY
-        // or a `pub use` chain hides consumers from the gate.
-        let (graph, semantic) = match self.use_scip.then(|| self.scip_graph()).flatten() {
-            Some(g) => (g, true),
-            None => (self.syntactic_graph(), false),
-        };
-        let reverse = ci_core::reverse_import_map(&graph);
-        let reverse_imports = |file: &str| {
-            if semantic {
-                reverse.get(file).cloned().unwrap_or_default()
-            } else {
-                ci_core::transitive_reverse_imports(&reverse, file)
-            }
-        };
-
-        // create_file of an UNDECLARED module file synthesizes its `pub mod x;` declaration
-        // right after the create (movefix::declare_module_edit) — an orphan .rs file never
-        // compiles, so every agent hand-writes this edit; server-side it is deterministic.
-        // Skipped when any batch op already touches the parent decl file (the agent is
-        // handling membership itself — synthesizing too would DUPLICATE the declaration).
-        let mut expanded: Vec<ci_core::EditOp> = Vec::with_capacity(ops.len() + 1);
+        let mut expanded: Vec<EditOp> = Vec::with_capacity(ops.len() + 1);
         for op in ops {
-            let synth = if let ci_core::EditOp::CreateFile { path, .. } = op {
+            let synth = if let EditOp::CreateFile { path, .. } = op {
                 let rel = path.to_string_lossy().replace('\\', "/");
                 movefix::declare_module_edit(&self.root, &rel).filter(|(parent, _, _)| {
                     !ops.iter().any(|o| {
-                        ci_edit::op_touches_file(o, parent) && !matches!(o, ci_core::EditOp::CreateFile { .. })
+                        ci_edit::op_touches_file(o, parent) && !matches!(o, EditOp::CreateFile { .. })
                     })
                 })
             } else {
@@ -573,257 +430,11 @@ impl LanguageProvider for RustProvider {
             };
             expanded.push(op.clone());
             if let Some((parent, old_text, new_text)) = synth {
-                expanded.push(ci_core::EditOp::ReplaceInFile { path: parent.into(), old_text, new_text });
+                expanded.push(EditOp::ReplaceInFile { path: parent.into(), old_text, new_text });
             }
         }
-        let r = ci_edit::commit_edits(&self.root, &expanded, &structure_of, engine, opts, &reverse_imports);
-        // Keep the scip-backed graph true in-session: re-describe each committed file's edges
-        // from its new content (tree-sitter, in-process — cheap and can't fail the edit). The
-        // live mod graph and structure() read disk directly, so they need no help.
-        if self.use_scip {
-            if let Ok(CommitResult::Ok { changed_files, .. }) = &r {
-                if opts.write && !opts.dry_run {
-                    if let Ok(mut m) = self.fresh_edges.lock() {
-                        for f in changed_files {
-                            let rel = f.to_string_lossy().replace('\\', "/");
-                            if rel.ends_with(".rs") {
-                                m.insert(rel.clone(), self.edges_from_disk(&rel));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        r
+        self.inner.apply_edits(&expanded, opts)
     }
-}
-
-// ── structure ──────────────────────────────────────────────────────────────
-
-/// Walk an item list, emitting a `Node` per named declaration. `fn_kind` is the kind for
-/// `function_item`s found here (Function at top level, Method inside an `impl`). `prefix` is
-/// the id stem (`"file.rs#"`, or `"file.rs#Type."` inside an impl).
-fn collect_items(node: TsNode, bytes: &[u8], prefix: &str, fn_kind: SymbolKind, out: &mut Vec<Node>) {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        match child.kind() {
-            "function_item" => {
-                if let Some(mut n) = named_node(&child, bytes, prefix, fn_kind) {
-                    add_fn_subnodes(&mut n, &child, bytes);
-                    out.push(n);
-                }
-            }
-            // Structs and enums expose their members the way lang-ts exposes class/interface
-            // fields: the container gets a `:body` sub-node (the member-list insertion anchor)
-            // and each field/variant is a TOP-LEVEL dotted symbol (`Type.field`) — that is
-            // what feeds field-level addressing (replace_text name=Type.field), the index
-            // (fields are searchable symbols), and retrieval's inline one-line pointers.
-            // Without them a Rust struct was an opaque block the agent had to read whole.
-            "struct_item" | "union_item" => {
-                if let Some(n) = named_node(&child, bytes, prefix, SymbolKind::Struct) {
-                    let type_prefix = format!("{}.", n.id);
-                    out.push(n);
-                    let parent_idx = out.len() - 1;
-                    if let Some(body) = child.child_by_field_name("body") {
-                        if body.kind() == "field_declaration_list" {
-                            let body_id = format!("{}:body", out[parent_idx].id);
-                            out[parent_idx].children.push(syntax_node(&body_id, None, "body", &body));
-                            let mut c2 = body.walk();
-                            for f in body.named_children(&mut c2) {
-                                if f.kind() == "field_declaration" {
-                                    push_member(&f, bytes, &type_prefix, out);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            "enum_item" => {
-                if let Some(n) = named_node(&child, bytes, prefix, SymbolKind::Enum) {
-                    let type_prefix = format!("{}.", n.id);
-                    out.push(n);
-                    let parent_idx = out.len() - 1;
-                    if let Some(body) = child.child_by_field_name("body") {
-                        let body_id = format!("{}:body", out[parent_idx].id);
-                        out[parent_idx].children.push(syntax_node(&body_id, None, "body", &body));
-                        let mut c2 = body.walk();
-                        for v in body.named_children(&mut c2) {
-                            if v.kind() == "enum_variant" {
-                                push_member(&v, bytes, &type_prefix, out);
-                            }
-                        }
-                    }
-                }
-            }
-            "trait_item" => push(&child, bytes, prefix, SymbolKind::Interface, out),
-            "type_item" => push(&child, bytes, prefix, SymbolKind::TypeAlias, out),
-            "const_item" | "static_item" => push(&child, bytes, prefix, SymbolKind::Variable, out),
-            "macro_definition" => push(&child, bytes, prefix, SymbolKind::Function, out),
-            "impl_item" => {
-                let ty = child
-                    .child_by_field_name("type")
-                    .and_then(|t| type_text(&t, bytes))
-                    .unwrap_or_else(|| "impl".to_string());
-                if let Some(body) = child.child_by_field_name("body") {
-                    let inner = format!("{prefix}{ty}.");
-                    collect_items(body, bytes, &inner, SymbolKind::Method, out);
-                }
-            }
-            "mod_item" => {
-                if let Some(body) = child.child_by_field_name("body") {
-                    collect_items(body, bytes, prefix, SymbolKind::Function, out);
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-fn push(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind, out: &mut Vec<Node>) {
-    if let Some(n) = named_node(item, bytes, prefix, kind) {
-        out.push(n);
-    }
-}
-
-/// One struct field / enum variant as a top-level dotted symbol (`Type.member`), mirroring
-/// lang-ts's class-field shape (kind `var`, single line — which is what lets retrieval inline
-/// its source). Fields with doc comments get a `:doc` sub-node like any other declaration.
-fn push_member(item: &TsNode, bytes: &[u8], type_prefix: &str, out: &mut Vec<Node>) {
-    // named_node's doc_range skips attributes, so #[serde(...)]-decorated fields keep docs.
-    if let Some(n) = named_node(item, bytes, type_prefix, SymbolKind::Variable) {
-        out.push(n);
-    }
-}
-
-/// Build a declaration `Node` from an item with a `name` field. Attaches a `:doc` sub-node for
-/// the item's leading doc comments (`///` / `//!` / `/** */`) so they're editable like any anchor.
-fn named_node(item: &TsNode, bytes: &[u8], prefix: &str, kind: SymbolKind) -> Option<Node> {
-    let name_node = item.child_by_field_name("name")?;
-    let name = name_node.utf8_text(bytes).ok()?.to_string();
-    let id = format!("{prefix}{name}");
-    let mut children = Vec::new();
-    if let Some(r) = doc_range(item) {
-        children.push(Node {
-            id: format!("{id}:doc"),
-            name: None,
-            kind: NodeKind::Syntax("doc".to_string()),
-            range: r,
-            name_range: None,
-            children: vec![],
-        });
-    }
-    Some(Node {
-        id,
-        name: Some(name),
-        kind: NodeKind::Symbol(kind),
-        range: ts_range(item),
-        name_range: Some(ts_range(&name_node)),
-        children,
-    })
-}
-
-/// Range spanning the contiguous leading comment lines above `item` (Rust doc comments
-/// `///` / `//!` are `line_comment`s; `/** */` is a `block_comment`). Attributes between the
-/// docs and the item are SKIPPED, not counted: `/// docs` + `#[derive(Clone)]` + `struct X`
-/// is the dominant real-world shape, and treating the attribute as a doc-breaker silently
-/// dropped the `:doc` anchor from nearly every derive-decorated type.
-fn doc_range(item: &TsNode) -> Option<Range> {
-    let mut anchor = *item;
-    while let Some(prev) = anchor.prev_sibling() {
-        if prev.kind() == "attribute_item" {
-            anchor = prev;
-        } else {
-            break;
-        }
-    }
-    ci_treesitter::leading_comment_range(&anchor, |n| {
-        matches!(n.kind(), "line_comment" | "block_comment")
-    })
-}
-
-/// Attach params / return type / body as `Syntax` sub-nodes of a function/method.
-fn add_fn_subnodes(n: &mut Node, item: &TsNode, bytes: &[u8]) {
-    if let Some(params) = item.child_by_field_name("parameters") {
-        // The whole `(...)` list — the insertion anchor for `add_parameter` / a missing return type.
-        n.children.push(syntax_node(&format!("{}:params", n.id), None, "params", &params));
-        let mut cursor = params.walk();
-        for (i, p) in params.named_children(&mut cursor).enumerate() {
-            let name = p.utf8_text(bytes).ok().map(str::to_string);
-            n.children.push(syntax_node(&format!("{}:param.{i}", n.id), name, "parameter", &p));
-        }
-    }
-    if let Some(rt) = item.child_by_field_name("return_type") {
-        n.children.push(syntax_node(&format!("{}:return", n.id), None, "returnType", &rt));
-    }
-    if let Some(body) = item.child_by_field_name("body") {
-        n.children.push(syntax_node(&format!("{}:body", n.id), None, "body", &body));
-    }
-}
-
-/// First `type_identifier` inside an impl's `type` node (the base type being implemented).
-fn type_text(t: &TsNode, bytes: &[u8]) -> Option<String> {
-    if t.kind() == "type_identifier" {
-        return t.utf8_text(bytes).ok().map(str::to_string);
-    }
-    let mut cursor = t.walk();
-    for c in t.named_children(&mut cursor) {
-        if c.kind() == "type_identifier" {
-            return c.utf8_text(bytes).ok().map(str::to_string);
-        }
-    }
-    t.utf8_text(bytes).ok().map(str::to_string)
-}
-
-// ── import graph (mod resolution) ────────────────────────────────────────────
-
-/// `mod foo;` declarations (file modules only — inline `mod foo { … }` has no file edge).
-fn mod_decls(root: TsNode, bytes: &[u8]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if child.kind() == "mod_item" && child.child_by_field_name("body").is_none() {
-            if let Some(name) = child.child_by_field_name("name").and_then(|n| n.utf8_text(bytes).ok()) {
-                out.push(name.to_string());
-            }
-        }
-    }
-    out
-}
-
-/// Resolve `mod <module>;` declared in `from` (repo-relative) to a repo-relative file.
-/// A directory module (`mod.rs`, `lib.rs`, `main.rs`) resolves submodules in its own dir;
-/// a file module `foo.rs` resolves them under `foo/`.
-fn resolve_mod(root: &Path, from: &str, module: &str) -> Option<PathBuf> {
-    let from_path = Path::new(from);
-    let parent = from_path.parent().unwrap_or(Path::new(""));
-    let stem = from_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let base = if matches!(stem, "mod" | "lib" | "main") {
-        parent.to_path_buf()
-    } else {
-        parent.join(stem)
-    };
-    // Resolve `mod module;` to either `<base>/module.rs` or `<base>/module/mod.rs`.
-    [base.join(format!("{module}.rs")), base.join(module).join("mod.rs")]
-        .into_iter()
-        .find(|cand| root.join(cand).is_file())
-}
-
-/// Repo-relative `.rs` files, gitignore-aware, skipping `target/`.
-fn rust_files(root: &Path) -> Vec<String> {
-    let mut out = Vec::new();
-    for entry in ignore::WalkBuilder::new(root).build().flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-            continue;
-        }
-        if let Ok(rel) = path.strip_prefix(root) {
-            let rel = rel.to_string_lossy().replace('\\', "/");
-            if !rel.starts_with("target/") {
-                out.push(rel);
-            }
-        }
-    }
-    out
 }
 
 // ── skeletal context ─────────────────────────────────────────────────────────
@@ -831,15 +442,14 @@ fn rust_files(root: &Path) -> Vec<String> {
 /// Return `content` with Rust function/method bodies (`block`) elided, keeping signatures.
 /// Best-effort: returns the original on a parse failure.
 pub fn outline(content: &str) -> String {
-    let Some(tree) = RustProvider::parse(content) else { return content.to_string() };
     // Fold each `function_item`'s `block` body; keep everything else (signatures, types).
-    let bodies = ci_treesitter::body_ranges(tree.root_node(), &["function_item"], &["block"]);
-    ci_core::elide_bodies(content, bodies)
+    ci_treesitter::outline(&tree_sitter_rust::LANGUAGE.into(), content, &["function_item"], &["block"])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ci_core::NodeKind;
     use std::fs;
 
     #[test]

@@ -21,6 +21,9 @@ ci-proto = { path = "../ci-proto" }
 lang-ts = { path = "../langs/lang-ts" }
 lang-rust = { path = "../langs/lang-rust" }
 lang-fallback = { path = "../langs/lang-fallback" }
+lang-java = { path = "../langs/lang-java" }
+lang-php = { path = "../langs/lang-php" }
+lang-swift = { path = "../langs/lang-swift" }
 serde_json.workspace = true
 toml.workspace = true
 ignore = "0.4"

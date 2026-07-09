@@ -73,6 +73,14 @@ pub trait ReadIndex: Send + Sync {
     fn live(&self) -> bool {
         false
     }
+    /// True when [`import_graph`](ReadIndex::import_graph) reads current disk. Defaults to
+    /// [`live`](ReadIndex::live); a HYBRID reader — live parse for structure, a cached
+    /// semantic artifact for edges (lang-rust's scip configuration) — overrides this to
+    /// `false` so the glue keeps only the graph fresh after commits while structure stays
+    /// a re-parse of disk.
+    fn live_graph(&self) -> bool {
+        self.live()
+    }
     /// True when graph edges are compiler-accurate (a one-hop blast radius is sound).
     fn semantic_edges(&self) -> bool {
         false

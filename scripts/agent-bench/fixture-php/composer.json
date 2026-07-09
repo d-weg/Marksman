@@ -1,0 +1,13 @@
+{
+    "name": "corpus/corpus",
+    "description": "Reference corpus search library (benchmark fixture).",
+    "type": "library",
+    "require": {
+        "php": ">=8.1"
+    },
+    "autoload": {
+        "psr-4": {
+            "Corpus\\": "src/"
+        }
+    }
+}

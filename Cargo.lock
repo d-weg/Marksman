@@ -99,6 +99,7 @@ dependencies = [
  "ci-retrieve",
  "ci-walk",
  "lang-fallback",
+ "lang-java",
  "lang-rust",
  "lang-ts",
  "serde_json",
@@ -110,7 +111,10 @@ version = "0.1.0"
 dependencies = [
  "ci-core",
  "lang-fallback",
+ "lang-java",
+ "lang-php",
  "lang-rust",
+ "lang-swift",
  "lang-template",
  "lang-ts",
  "tempfile",
@@ -120,8 +124,10 @@ dependencies = [
 name = "ci-core"
 version = "0.1.0"
 dependencies = [
+ "ignore",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
 ]
 
@@ -129,9 +135,11 @@ dependencies = [
 name = "ci-edit"
 version = "0.1.0"
 dependencies = [
+ "ci-build",
  "ci-core",
  "ci-lsp",
  "ci-vfs",
+ "ignore",
  "serde_json",
  "tempfile",
 ]
@@ -192,7 +200,10 @@ dependencies = [
  "ci-retrieve",
  "ignore",
  "lang-fallback",
+ "lang-java",
+ "lang-php",
  "lang-rust",
+ "lang-swift",
  "lang-ts",
  "serde_json",
  "tempfile",
@@ -575,9 +586,40 @@ dependencies = [
  "tree-sitter-go",
  "tree-sitter-java",
  "tree-sitter-javascript",
+ "tree-sitter-php",
  "tree-sitter-python",
  "tree-sitter-ruby",
+ "tree-sitter-swift",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "lang-java"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "ci-edit",
+ "ci-lsp",
+ "ci-proto",
+ "lang-fallback",
+ "lang-template",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "lang-php"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "ci-edit",
+ "ci-lsp",
+ "ci-proto",
+ "ignore",
+ "lang-fallback",
+ "lang-template",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -595,6 +637,21 @@ dependencies = [
  "tempfile",
  "tree-sitter",
  "tree-sitter-rust",
+]
+
+[[package]]
+name = "lang-swift"
+version = "0.1.0"
+dependencies = [
+ "ci-core",
+ "ci-edit",
+ "ci-lsp",
+ "ci-proto",
+ "ignore",
+ "lang-fallback",
+ "lang-template",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -1286,6 +1343,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
 
 [[package]]
+name = "tree-sitter-php"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d8c17c3ab69052c5eeaa7ff5cd972dd1bc25d1b97ee779fec391ad3b5df5592"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-python"
 version = "0.23.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1310,6 +1377,16 @@ name = "tree-sitter-rust"
 version = "0.24.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-swift"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe36052155b9dd69ca82b3b8f1b4ccfb2d867125ac1a4db1dd7331829242668c"
 dependencies = [
  "cc",
  "tree-sitter-language",

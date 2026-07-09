@@ -1,0 +1,24 @@
+[package]
+name = "lang-php"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PHP LanguageProvider at the gated tier: tree-sitter reads (lang-fallback) + a PHPStan edit gate; phpactor for cross-file rename/move (real LSP willRenameFiles)."
+
+[dependencies]
+ci-core = { path = "../../ci-core" }
+ignore = "0.4"
+ci-edit = { path = "../../ci-edit" }
+ci-lsp = { path = "../../ci-lsp" }
+ci-proto = { path = "../../ci-proto" }
+lang-fallback = { path = "../lang-fallback" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+
+[[bin]]
+name = "marksman-provider-php"
+path = "src/sidecar.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
+lang-template = { path = "../lang-template" }

@@ -9,6 +9,8 @@ description = "Atomic gated edits: SCIP node ranges + VFS overlay + LSP baseline
 ci-core = { path = "../ci-core" }
 ci-vfs = { path = "../ci-vfs" }
 ci-lsp = { path = "../ci-lsp" }
+ci-build = { path = "../ci-build" }
+ignore = "0.4"
 serde_json.workspace = true
 
 [dev-dependencies]

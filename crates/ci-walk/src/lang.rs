@@ -11,9 +11,11 @@ pub enum Lang {
     Js,
     Go,
     Java,
+    Php,
     Ruby,
     C,
     Cpp,
+    Swift,
     Other,
 }
 
@@ -31,9 +33,11 @@ impl Lang {
             Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => Lang::Js,
             Some("go") => Lang::Go,
             Some("java") => Lang::Java,
+            Some("php") => Lang::Php,
             Some("rb") => Lang::Ruby,
             Some("c") | Some("h") => Lang::C,
             Some("cpp") | Some("cc") | Some("cxx") | Some("hpp") | Some("hh") => Lang::Cpp,
+            Some("swift") => Lang::Swift,
             _ => Lang::Other,
         }
     }

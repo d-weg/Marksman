@@ -1,0 +1,25 @@
+[package]
+name = "lang-swift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Swift LanguageProvider at the gated tier: tree-sitter reads (lang-fallback) + a `swift build` edit gate; sourcekit-lsp for cross-file rename (production-quality since Swift 6)."
+
+[dependencies]
+ci-core = { path = "../../ci-core" }
+ci-edit = { path = "../../ci-edit" }
+ci-lsp = { path = "../../ci-lsp" }
+ci-proto = { path = "../../ci-proto" }
+lang-fallback = { path = "../lang-fallback" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+# The `swift build` gate mirrors the package tree (gitignore-aware walk) before compiling.
+ignore = "0.4"
+
+[[bin]]
+name = "marksman-provider-swift"
+path = "src/sidecar.rs"
+
+[dev-dependencies]
+tempfile.workspace = true
+lang-template = { path = "../lang-template" }
