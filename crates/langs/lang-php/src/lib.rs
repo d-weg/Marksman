@@ -87,7 +87,7 @@ fn engine_factory(root: &Path) -> EngineFactory {
             root: engine_root.to_path_buf(),
             phpstan,
             lsp: None,
-            sandbox: ci_core::resolve_sandbox(engine_root),
+            sandbox: ci_core::resolve_sandbox(engine_root, "marksman-php"),
         }) as Box<dyn GateEngine + Send>)
     })
 }

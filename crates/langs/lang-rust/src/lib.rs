@@ -143,7 +143,7 @@ impl RustProvider {
 /// missing dependency.
 fn engine_factory() -> ci_edit::EngineFactory {
     Arc::new(|root: &Path| {
-        let sandbox = ci_core::resolve_sandbox(root);
+        let sandbox = ci_core::resolve_sandbox(root, "marksman-rust");
         let lsp = LspClient::start_in(root, rust_analyzer_command(), &*sandbox).map_err(|e| {
             match toolchain().describe_missing() {
                 Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
@@ -163,7 +163,7 @@ fn prewarm_engine(root: &Path) -> Option<Box<dyn GateEngine + Send>> {
     let warm = graph::rust_files(root)
         .into_iter()
         .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
-    let sandbox = ci_core::resolve_sandbox(root);
+    let sandbox = ci_core::resolve_sandbox(root, "marksman-rust");
     let mut client = LspClient::start_in(root, rust_analyzer_command(), &*sandbox).ok()?;
     if let Some((f, content)) = warm {
         let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load

@@ -10,8 +10,8 @@
 use crate::CappedOutput;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
-use std::sync::Arc;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Where a toolchain process runs. Implementations must be cheap to share across the engines that
@@ -57,10 +57,12 @@ impl Sandbox for HostSandbox {
 /// for container mode:** every gate engine resolves its sandbox here, so no engine is edited to
 /// turn containers on. Opt-in via `$CI_SANDBOX=oci` AND an OCI runtime on PATH; anything else — the
 /// default, and everywhere without a runtime — stays on the host, behavior-identical to M1.
-pub fn resolve_sandbox(root: &Path) -> Arc<dyn Sandbox> {
+pub fn resolve_sandbox(root: &Path, image: &str) -> Arc<dyn Sandbox> {
     if std::env::var("CI_SANDBOX").ok().as_deref() == Some("oci") {
         match oci_runtime() {
-            Some(runtime) => return Arc::new(OciSandbox::new(root.to_path_buf(), runtime)),
+            Some(runtime) => {
+                return Arc::new(OciSandbox::new(root.to_path_buf(), runtime, image.to_string()))
+            }
             None => eprintln!(
                 "[ci-core] CI_SANDBOX=oci but no OCI runtime (container/docker/podman/nerdctl) \
                  found on PATH — running the toolchain on the host"
@@ -95,46 +97,110 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 }
 
 /// Runs a toolchain inside a warm OCI container via a runtime CLI (Apple `container`, docker,
-/// podman, …) so a device needs the runtime instead of every language's toolchain. The
-/// warm-container start / exec / teardown and the identical-path mounts land in **M2.2** (see
-/// `docs/container-gate-spec.md` §9b) — this skeleton carries the `runtime` + `root` that exec
-/// will mount and target. Reachable only when `$CI_SANDBOX=oci` and a runtime is present, so the
-/// Unsupported errors below never fire on the default host path.
+/// podman, …) so a device needs the runtime instead of every language's toolchain. One detached
+/// container is started lazily per sandbox and reused, with the repo AND the system temp dir
+/// bind-mounted at their SAME host paths — so `current_dir`, java's `-sourcepath`, the sidecar's
+/// materialized-source tempdir, and phpstan's overlay tree all resolve inside the container
+/// unchanged (§9b's identical-path trick). Reachable only when `$CI_SANDBOX=oci` and a runtime is
+/// present.
 pub struct OciSandbox {
     root: PathBuf,
     runtime: PathBuf,
+    image: String,
+    /// The warm container's id — started on the first op, reused after, killed on drop. `&self`
+    /// trait methods need interior mutability; the container is per-sandbox state, so a Mutex fits.
+    container: Mutex<Option<String>>,
 }
 
 impl OciSandbox {
-    pub fn new(root: PathBuf, runtime: PathBuf) -> Self {
-        Self { root, runtime }
+    pub fn new(root: PathBuf, runtime: PathBuf, image: String) -> Self {
+        Self { root, runtime, image, container: Mutex::new(None) }
     }
 
-    /// Until M2.2 wires the container exec, every op is honestly Unsupported (never a silent
-    /// host fallback — that would change the verdict environment mid-session).
-    fn unsupported(&self) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!(
-                "OciSandbox (runtime {}, root {}) — container exec is wired in M2.2",
+    /// The warm container's id, starting it on first use: a detached container idling on
+    /// `sleep infinity` with the repo + system temp dir mounted at their host paths. `--rm` clears
+    /// it once [`Drop`] kills it.
+    fn container(&self) -> io::Result<String> {
+        let mut guard = self.container.lock().unwrap();
+        if let Some(id) = guard.as_deref() {
+            return Ok(id.to_string());
+        }
+        let tmp = std::env::temp_dir();
+        let out = Command::new(&self.runtime)
+            .args(["run", "-d", "--rm"])
+            .arg("-v")
+            .arg(same_path_mount(&self.root))
+            .arg("-v")
+            .arg(same_path_mount(&tmp))
+            .arg(&self.image)
+            .args(["sleep", "infinity"])
+            .output()?;
+        if !out.status.success() {
+            return Err(io::Error::other(format!(
+                "{} run ({}) failed: {}",
                 self.runtime.display(),
-                self.root.display()
-            ),
-        )
+                self.image,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        *guard = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Rewrite a host `Command` as `<runtime> exec [-i] [--workdir CWD] <container> <program>
+    /// <args…>`. Host paths are valid in the container (identical-path mounts), so program, args,
+    /// and cwd carry over verbatim; the image supplies the environment (host env such as
+    /// `JAVA_HOME` would name host-only paths, so it is deliberately NOT forwarded).
+    fn exec(&self, container: &str, cmd: &Command, interactive: bool) -> Command {
+        let mut d = Command::new(&self.runtime);
+        d.arg("exec");
+        if interactive {
+            d.arg("-i");
+        }
+        if let Some(cwd) = cmd.get_current_dir() {
+            d.arg("--workdir").arg(cwd);
+        }
+        d.arg(container).arg(cmd.get_program()).args(cmd.get_args());
+        d
     }
 }
 
+/// A bind-mount spec that maps a host path to the SAME path inside the container (`/x:/x`).
+fn same_path_mount(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    let s = s.trim_end_matches('/');
+    format!("{s}:{s}")
+}
+
 impl Sandbox for OciSandbox {
-    fn run_capped(&self, _cmd: &mut Command, _timeout: Duration, _cap: usize) -> io::Result<CappedOutput> {
-        Err(self.unsupported())
+    fn run_capped(&self, cmd: &mut Command, timeout: Duration, cap: usize) -> io::Result<CappedOutput> {
+        let container = self.container()?;
+        crate::run_capped(&mut self.exec(&container, cmd, false), timeout, cap)
     }
 
-    fn spawn(&self, _cmd: &mut Command) -> io::Result<Child> {
-        Err(self.unsupported())
+    fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
+        let container = self.container()?;
+        // Resident-process stdio convention (LSP / gate sidecar): the caller drives stdin/stdout,
+        // stderr dropped — `-i` keeps stdin open through `exec` so the JSON-RPC channel works.
+        self.exec(&container, cmd, true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
     }
 
-    fn output(&self, _cmd: &mut Command) -> io::Result<Output> {
-        Err(self.unsupported())
+    fn output(&self, cmd: &mut Command) -> io::Result<Output> {
+        let container = self.container()?;
+        self.exec(&container, cmd, false).output()
+    }
+}
+
+impl Drop for OciSandbox {
+    fn drop(&mut self) {
+        if let Some(id) = self.container.get_mut().unwrap().take() {
+            let _ = Command::new(&self.runtime).arg("kill").arg(id).output();
+        }
     }
 }
 
@@ -176,14 +242,45 @@ mod tests {
     }
 
     #[test]
-    fn oci_sandbox_skeleton_is_unsupported_until_m2_2() {
-        // The skeleton never silently falls back to the host — it errors loudly (M2.2 fills it in).
-        let s = OciSandbox::new(PathBuf::from("/repo"), PathBuf::from("/usr/bin/container"));
-        let mut cmd = Command::new("true");
-        assert_eq!(s.spawn(&mut cmd).unwrap_err().kind(), io::ErrorKind::Unsupported);
-        assert_eq!(
-            s.output(&mut cmd).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
+    fn oci_sandbox_errors_when_the_runtime_is_missing() {
+        // A bogus runtime can't start the container, so ops error loudly — never a silent host
+        // fallback (that would change the verdict environment mid-session).
+        let s = OciSandbox::new(
+            PathBuf::from("/repo"),
+            PathBuf::from("/nonexistent/oci-runtime"),
+            "marksman-java".into(),
         );
+        let mut cmd = Command::new("true");
+        assert!(s.output(&mut cmd).is_err());
+    }
+
+    #[test]
+    fn same_path_mount_maps_a_path_to_itself() {
+        assert_eq!(same_path_mount(Path::new("/a/b")), "/a/b:/a/b");
+        assert_eq!(same_path_mount(Path::new("/a/b/")), "/a/b:/a/b", "trailing slash trimmed");
+    }
+
+    // Needs docker (or another OCI runtime) up AND the java image built:
+    //   docker build -f docker/marksman-java.Dockerfile -t marksman-java docker/
+    // Proves the whole M2.2 path: warm container start, identical-path mount, exec, teardown.
+    #[test]
+    #[ignore]
+    fn oci_sandbox_runs_java_in_the_container() {
+        let Some(runtime) = oci_runtime() else {
+            eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
+            return;
+        };
+        let sb = OciSandbox::new(std::env::temp_dir(), runtime, "marksman-java".into());
+        let mut cmd = Command::new("java");
+        cmd.arg("-version");
+        let out = sb.output(&mut cmd).expect("java -version inside the container");
+        // `java -version` prints to stderr by convention.
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "java ran in the container: {text}");
+        assert!(text.contains("21"), "the image's Java 21: {text}");
     }
 }

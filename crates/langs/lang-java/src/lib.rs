@@ -80,7 +80,7 @@ impl LanguageProvider for JavaProvider {
 /// a dependency.
 fn engine_factory() -> EngineFactory {
     Arc::new(|root: &Path| {
-        let sandbox = ci_core::resolve_sandbox(root);
+        let sandbox = ci_core::resolve_sandbox(root, "marksman-java");
         let sidecar = gate::JavacSidecar::start(root, &*sandbox).map_err(|e| match gate_missing() {
             Some(missing) => {
                 ci_core::Error::Driver(format!("java edit engine failed to start ({e}).\n{missing}"))

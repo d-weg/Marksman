@@ -92,7 +92,7 @@ fn engine_factory() -> EngineFactory {
             root: root.to_path_buf(),
             lsp: None,
             target_dirs: None,
-            sandbox: ci_core::resolve_sandbox(root),
+            sandbox: ci_core::resolve_sandbox(root, "marksman-swift"),
         }) as Box<dyn GateEngine + Send>)
     })
 }
