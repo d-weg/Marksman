@@ -24,21 +24,20 @@ On a 10-task agent benchmark (Claude Sonnet, end-to-end, objectively checked), a
 
 ## Capabilities (MCP tools)
 
+The surface is **two tools** — one to read, one to write. (The earlier six read/edit tools were
+consolidated: `inspect`'s modes subsume `retrieve_context`/`find_symbols`/`list_anchors`/`read_node`/`describe_architecture`.)
+
 | tool | what it does |
 |---|---|
-| `retrieve_context` | A line-ranged manifest of the code relevant to a task. Hybrid index (BM25 + Model2Vec embeddings + symbol match) fused with RRF and expanded along the import graph. No API calls. |
-| `describe_architecture` | A per-directory file-kind / module map of the repo. |
-| `find_symbols` | Exact/substring search over indexed symbol names → self-locating node-id handles that feed straight into `read_node` / `apply_edits`. |
-| `list_anchors` | A file's symbols and sub-nodes (params / return / body) — the anchors you target with `apply_edits`. |
-| `read_node` | The full source of one anchor (a symbol or its `:body` / `:param.N` / `:return` / `:doc` sub-node). |
-| `apply_edits` | Structured edits (`rename`, `move_file`, `replace_text`, `replace_node`, `set_body`, `insert_member`, `insert_in_body`, `add_parameter`, …), applied atomically and **type-checked over the blast radius** — nothing lands if it introduces a new type error, including in files that import what changed. Symbols are addressed by name (ambiguity auto-resolves from the edit's own text where possible). For wide changes, a rejection lists **every** affected site with its source and a ready-to-copy fix — the type-checker is the site-finder. |
+| `inspect` | Read/locate code — one tool, `mode`-dispatched: **`search`** (find code by concept/task text — hybrid BM25 + Model2Vec embeddings + symbol match, RRF-fused and expanded along the import graph; `detailLevel` pointers\|outline\|full), **`symbol`** (exact/substring name → self-locating node-id handles), **`file`** (a file's anchors + its import/module lines), **`node`** (one anchor's full source, or a `:body`/`:param.N`/`:return`/`:doc` sub-node), **`map`** (per-directory file-kind / module overview). Handles/ids feed `apply_edits` directly. No API calls. |
+| `apply_edits` | Structured edits (`rename`, `move_file`, `replace_text`, `replace_node`, `set_body`, `insert_member`, `insert_in_body`, `add_parameter`, `add_symbol`, …), applied atomically and **type-checked over the blast radius** — nothing lands if it introduces a new type error, including in files that import what changed. Symbols are addressed by name (ambiguity auto-resolves from the edit's own text where possible), so a named target needs no `inspect` first. For wide changes, a rejection lists **every** affected site with its source and a ready-to-copy fix — the type-checker is the site-finder. |
 
 ## How it works
 
 - **Read:** `scip-typescript` (compiler-accurate symbols + cross-file references) merged with in-process **tree-sitter** (sub-symbol AST), embedded by a native **Model2Vec** (`potion-code-16M`) embedder — no GPU, no embedding server — then indexed (BM25 + flat vector store + import graph, persisted as protobuf) and retrieved with **Reciprocal Rank Fusion** + graph expansion.
 - **Write:** a persistent, warmed gate engine applies edits behind an in-memory VFS, gated by a baseline-diff of type diagnostics over the **blast radius** (the changed files + their importers). TypeScript's engine tiers are **tsgo → ts-morph → tsls**: the TS7 native LSP gates ~138× faster warm with identical verdicts and is auto-picked when locally present (`CI_TSGO`, or `tsgo` on PATH — never a surprise download); the ts-morph sidecar and `typescript-language-server` are the fallbacks. The LSP path prefers **LSP 3.17 pull diagnostics** (request/response — a slow server can never be mistaken for a clean file), which is also how the Rust gate drives rust-analyzer.
 - **Fast startup:** the SCIP index is cached and validated by a content-hash fingerprint of the source (plus pinned tool versions) — a warm start on an unchanged repo is **~0.1s instead of ~26s**; any doubt reindexes, never a stale load.
-- **Reads stay true in-session:** symbol ranges are re-anchored against the current file content on every read, and after a committed edit the write engine **re-describes the changed files** (new symbols, new import edges) back into the read path — a function you just added is immediately visible to `list_anchors`/`find_symbols`, no reindex. The Rust scip graph gets the same treatment: fingerprinted at build, with drifted/edited files served fresh tree-sitter edges.
+- **Reads stay true in-session:** symbol ranges are re-anchored against the current file content on every read, and after a committed edit the write engine **re-describes the changed files** (new symbols, new import edges) back into the read path — a function you just added is immediately visible to `inspect` (`file`/`symbol` modes), no reindex. The Rust scip graph gets the same treatment: fingerprinted at build, with drifted/edited files served fresh tree-sitter edges.
 
 ## Install
 
