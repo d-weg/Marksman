@@ -8,8 +8,8 @@ use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::Arc;
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{mpsc, Arc};
 
 use crate::jdtls;
 
@@ -22,7 +22,11 @@ const GATE_SIDECAR_SRC: &str = include_str!("GateSidecar.java");
 pub(crate) struct JavacSidecar {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Reply lines from a reader thread owning the child's stdout — so `diagnostics` can
+    /// `recv_timeout` instead of blocking forever on a wedged compiler (the gate-timeout
+    /// discipline every verdict path follows). The thread ends at EOF; a dropped sender then
+    /// reads as "sidecar exited".
+    replies: mpsc::Receiver<String>,
     root: PathBuf,
     classpath: String,
     sourcepath: String,
@@ -55,11 +59,27 @@ impl JavacSidecar {
             .map_err(|e| Error::Driver(format!("spawn java gate sidecar: {e}")))?;
         let stdin = child.stdin.take().ok_or_else(|| Error::Driver("no sidecar stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| Error::Driver("no sidecar stdout".into()))?;
+        let (tx, replies) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break, // EOF/error: drop the sender; recv reads as exit
+                    Ok(_) => {
+                        if tx.send(line.clone()).is_err() {
+                            break; // the sidecar was dropped; nobody is listening
+                        }
+                    }
+                }
+            }
+        });
         let (classpath, sourcepath) = derive_paths(root);
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            replies,
             root: root.to_path_buf(),
             classpath,
             sourcepath,
@@ -78,10 +98,28 @@ impl JavacSidecar {
         });
         writeln!(self.stdin, "{req}")
             .map_err(|e| Error::Driver(format!("java gate sidecar write: {e}")))?;
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .map_err(|e| Error::Driver(format!("java gate sidecar read: {e}")))?;
+        let line = match self.replies.recv_timeout(ci_core::gate_timeout()) {
+            Ok(line) => line,
+            // A wedged compiler: kill the child (the request/response stream is desynced past
+            // this point — the next edit respawns a fresh sidecar via the EOF path below) and
+            // REFUSE the edit. GateTimeout, not Driver: a hang must never read as clean or
+            // route into a weaker verdict.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                return Err(Error::GateTimeout(format!(
+                    "java gate sidecar exceeded the gate timeout ({}s) — killed; the next edit \
+                     respawns it (set CI_GATE_TIMEOUT_SECS higher if this project legitimately \
+                     compiles slower)",
+                    ci_core::gate_timeout().as_secs()
+                )));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Driver(
+                    "java gate sidecar exited (EOF) — restart the edit to respawn it".into(),
+                ))
+            }
+        };
         if line.trim().is_empty() {
             return Err(Error::Driver("java gate sidecar exited (EOF) — restart the edit to respawn it".into()));
         }
@@ -183,16 +221,15 @@ fn tool_present(bin: &str) -> bool {
 /// documented single-command derivation Maven has.
 pub(crate) fn maven_classpath(root: &Path) -> Option<String> {
     let out = tempfile::NamedTempFile::new().ok()?;
-    let status = Command::new("mvn")
-        .args(["-q", "-B", "dependency:build-classpath"])
+    let mut cmd = Command::new("mvn");
+    cmd.args(["-q", "-B", "dependency:build-classpath"])
         .arg(format!("-Dmdep.outputFile={}", out.path().display()))
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?;
-    if !status.success() {
+        .current_dir(root);
+    // Time-bounded: Maven resolving over a dead network can hang indefinitely. A timeout maps to
+    // `None` — this is classpath DERIVATION, not the verdict, and `None`'s failure mode is the
+    // documented honest degrade above (warn + dependency types read as baseline errors).
+    let run = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
+    if run.timed_out || !run.status.is_some_and(|s| s.success()) {
         return None;
     }
     let cp = std::fs::read_to_string(out.path()).ok()?.trim().to_string();
@@ -209,16 +246,11 @@ pub(crate) fn gradle_classpath(root: &Path) -> Option<String> {
         "allprojects { p ->\n  p.tasks.register('marksmanClasspath') {\n    doLast {\n      def c = p.configurations.findByName('testRuntimeClasspath') ?: p.configurations.findByName('runtimeClasspath') ?: p.configurations.findByName('compileClasspath')\n      if (c != null) { c.files.each { println it } }\n    }\n  }\n}\n",
     )
     .ok()?;
-    let out = Command::new("gradle")
-        .args(["-q", "--init-script"])
-        .arg(init.path())
-        .arg("marksmanClasspath")
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let mut cmd = Command::new("gradle");
+    cmd.args(["-q", "--init-script"]).arg(init.path()).arg("marksmanClasspath").current_dir(root);
+    // Same discipline as maven_classpath: time-bounded, timeout ⇒ None (honest degrade).
+    let out = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
+    if out.timed_out || !out.status.is_some_and(|s| s.success()) {
         return None;
     }
     let jars: Vec<&str> = std::str::from_utf8(&out.stdout)
