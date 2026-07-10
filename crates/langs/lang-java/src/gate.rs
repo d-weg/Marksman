@@ -4,7 +4,6 @@
 //! file — while javax.tools IS javac, answering request/response with structured diagnostics.
 use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
-use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -264,22 +263,22 @@ pub(crate) fn gradle_classpath(root: &Path) -> Option<String> {
 
 /// The Java write engine behind `Composed`: javax.tools verdicts, jdtls rewrites.
 pub(crate) struct JavaEngine {
-    pub(crate) root: PathBuf,
-    pub(crate) sidecar: JavacSidecar,
-    /// jdtls, started on the FIRST rename/move only — diagnostics never wait on it, and a
-    /// missing jdtls costs nothing until an op actually needs cross-file rewrites.
-    pub(crate) lsp: Option<LspClient>,
-    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
-    /// container backend swaps in — see `docs/container-gate-spec.md`.
-    pub(crate) sandbox: Arc<dyn Sandbox>,
+    root: PathBuf,
+    sidecar: JavacSidecar,
+    /// jdtls, started on the FIRST rename/move only (`ci_edit::LazyLsp`) — diagnostics never
+    /// wait on it, and a missing jdtls costs nothing until an op needs cross-file rewrites.
+    lsp: ci_edit::LazyLsp,
 }
 
 impl JavaEngine {
-    fn jdtls(&mut self) -> Result<&mut LspClient> {
-        if self.lsp.is_none() {
-            self.lsp = Some(jdtls::start(&self.root, &*self.sandbox)?);
-        }
-        Ok(self.lsp.as_mut().expect("just set"))
+    /// `sandbox` (from `ci_core::resolve_sandbox`) is where the toolchain runs — the closure
+    /// keeps it for jdtls's lazy launch; the sidecar was already started through it.
+    pub(crate) fn new(root: &Path, sidecar: JavacSidecar, sandbox: Arc<dyn Sandbox>) -> Self {
+        let lsp = ci_edit::LazyLsp::new({
+            let root = root.to_path_buf();
+            move || jdtls::start(&root, &*sandbox)
+        });
+        Self { root: root.to_path_buf(), sidecar, lsp }
     }
 }
 
@@ -300,7 +299,7 @@ impl GateEngine for JavaEngine {
     }
 
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
-        GateEngine::rename(self.jdtls()?, file, line, character, new_name)
+        GateEngine::rename(self.lsp.get()?, file, line, character, new_name)
     }
 
     fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
@@ -313,30 +312,19 @@ impl GateEngine for JavaEngine {
         // it wins. jdtls is absent on many machines and minutes-cold; when it's unavailable or
         // declines (empty edit), the movefix hooks are the runnable fallback, and the javac gate
         // judges whichever rewrite lands.
-        if let Ok(lsp) = self.jdtls() {
-            if let Ok(we) = GateEngine::will_rename(lsp, from, to) {
-                if !ci_edit::workspace_edit_is_empty(&we) {
-                    return Ok(we);
-                }
-            }
-        }
-        Ok(crate::movefix::move_workspace_edit(&self.root, from, to).unwrap_or_else(|| json!({})))
+        self.lsp.will_rename_or(from, to, || {
+            crate::movefix::move_workspace_edit(&self.root, from, to).unwrap_or_else(|| json!({}))
+        })
     }
 
     fn sync_disk(&mut self) -> Result<()> {
         // The sidecar holds no cross-call buffers (each request restates the full overlay);
         // only a started jdtls has state to resync.
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.sync_disk(),
-            None => Ok(()),
-        }
+        self.lsp.sync_disk()
     }
 
     fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.fs_events(created, deleted),
-            None => Ok(()),
-        }
+        self.lsp.fs_events(created, deleted)
     }
 }
 

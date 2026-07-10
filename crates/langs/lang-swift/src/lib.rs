@@ -88,12 +88,8 @@ fn engine_factory() -> EngineFactory {
         if let Some(missing) = gate_missing() {
             return Err(ci_core::Error::Driver(format!("swift edit engine unavailable.\n{missing}")));
         }
-        Ok(Box::new(gate::SwiftEngine {
-            root: root.to_path_buf(),
-            lsp: None,
-            target_dirs: None,
-            sandbox: ci_core::resolve_sandbox(root, "marksman-swift"),
-        }) as Box<dyn GateEngine + Send>)
+        Ok(Box::new(gate::SwiftEngine::new(root, ci_core::resolve_sandbox(root, "marksman-swift")))
+            as Box<dyn GateEngine + Send>)
     })
 }
 
@@ -509,7 +505,7 @@ mod tests {
                 ci_core::oci_runtime().expect("an OCI runtime on PATH"),
                 "marksman-swift".into(),
             ));
-            Ok(Box::new(gate::SwiftEngine { root: root.to_path_buf(), lsp: None, target_dirs: None, sandbox })
+            Ok(Box::new(gate::SwiftEngine::new(root, sandbox))
                 as Box<dyn GateEngine + Send>)
         })
     }

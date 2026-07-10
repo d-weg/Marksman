@@ -12,7 +12,6 @@
 //! file:line:col.
 use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
-use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -225,27 +224,29 @@ fn prime_index(root: &Path, sandbox: &dyn Sandbox) {
 
 /// The Swift write engine behind `Composed`: `swift build` verdicts, sourcekit-lsp rewrites.
 pub(crate) struct SwiftEngine {
-    pub(crate) root: PathBuf,
-    /// sourcekit-lsp, started on the FIRST rename only — diagnostics never wait on it, and a
-    /// missing LSP costs nothing until an op actually needs cross-file rewrites.
-    pub(crate) lsp: Option<LspClient>,
+    root: PathBuf,
+    /// sourcekit-lsp, started on the FIRST rename only (`ci_edit::LazyLsp`) — diagnostics never
+    /// wait on it, and a missing LSP costs nothing until an op needs cross-file rewrites.
+    lsp: ci_edit::LazyLsp,
     /// Cached SwiftPM target source dirs (repo-relative), from `swift package describe`. Outer
     /// `None` = not probed yet; inner `None` = no Package.swift (not a SwiftPM package — the only
     /// case the G4 target check legitimately skips). A describe FAILURE on a real package is an
     /// `Err` (fail closed) and is NOT cached, so a fixed toolchain recovers on the next edit.
     /// Populated lazily on the first `diagnostics` call.
-    pub(crate) target_dirs: Option<Option<Vec<String>>>,
-    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
-    /// container backend swaps in — see `docs/container-gate-spec.md`.
-    pub(crate) sandbox: Arc<dyn Sandbox>,
+    target_dirs: Option<Option<Vec<String>>>,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`) — the `swift build` verdict, the
+    /// describe probe, and index priming all use it; the container backend swaps in here.
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl SwiftEngine {
-    fn sourcekit(&mut self) -> Result<&mut LspClient> {
-        if self.lsp.is_none() {
-            self.lsp = Some(sourcekit::start(&self.root, &*self.sandbox)?);
-        }
-        Ok(self.lsp.as_mut().expect("just set"))
+    pub(crate) fn new(root: &Path, sandbox: Arc<dyn Sandbox>) -> Self {
+        let lsp = ci_edit::LazyLsp::new({
+            let root = root.to_path_buf();
+            let sandbox = sandbox.clone();
+            move || sourcekit::start(&root, &*sandbox)
+        });
+        Self { root: root.to_path_buf(), lsp, target_dirs: None, sandbox }
     }
 
     /// G4 honesty check: `swift build` only type-checks files that belong to a SwiftPM target, so
@@ -350,7 +351,7 @@ impl GateEngine for SwiftEngine {
         //   2. drain sourcekit's index queue with `workspace/_pollIndex` so the rename sees every
         //      reference, not just the definition.
         prime_index(&self.root, &*self.sandbox);
-        let lsp = self.sourcekit()?;
+        let lsp = self.lsp.get()?;
         // `_pollIndex` blocks until the index is up to date; ignore its (empty) result. Best-effort
         // — an older sourcekit without the request just falls through to whatever freshness it has.
         let _ = lsp.request("workspace/_pollIndex", json!({}));
@@ -368,17 +369,11 @@ impl GateEngine for SwiftEngine {
     fn sync_disk(&mut self) -> Result<()> {
         // `swift build` holds no cross-call buffers (each build materializes its own mirror); only
         // a started sourcekit-lsp has state to resync.
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.sync_disk(),
-            None => Ok(()),
-        }
+        self.lsp.sync_disk()
     }
 
     fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.fs_events(created, deleted),
-            None => Ok(()),
-        }
+        self.lsp.fs_events(created, deleted)
     }
 }
 

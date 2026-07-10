@@ -4,7 +4,6 @@
 //! server — answers the type-check verdict from a materialized overlay.
 use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
-use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -200,22 +199,24 @@ fn parse_phpstan_json(stdout: &str, overlay_root: &Path) -> Result<Vec<Diag>> {
 
 /// The PHP write engine behind `Composed`: PHPStan verdicts, phpactor rewrites.
 pub(crate) struct PhpEngine {
-    pub(crate) root: PathBuf,
-    pub(crate) phpstan: PathBuf,
-    /// phpactor, started on the FIRST rename/move only — diagnostics never wait on it, and a
-    /// missing phpactor costs nothing until an op actually needs cross-file rewrites.
-    pub(crate) lsp: Option<LspClient>,
-    /// Where the toolchain runs (`ci_core::resolve_sandbox`). `HostSandbox` today; the one seam a
-    /// container backend swaps in — see `docs/container-gate-spec.md`.
-    pub(crate) sandbox: Arc<dyn Sandbox>,
+    root: PathBuf,
+    phpstan: PathBuf,
+    /// phpactor, started on the FIRST rename/move only (`ci_edit::LazyLsp`) — diagnostics never
+    /// wait on it, and a missing phpactor costs nothing until an op needs cross-file rewrites.
+    lsp: ci_edit::LazyLsp,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`) — the PHPStan verdict path uses it
+    /// per call; the container backend swaps in here (docs/container-gate-spec.md).
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl PhpEngine {
-    fn phpactor(&mut self) -> Result<&mut LspClient> {
-        if self.lsp.is_none() {
-            self.lsp = Some(phpactor::start(&self.root, &*self.sandbox)?);
-        }
-        Ok(self.lsp.as_mut().expect("just set"))
+    pub(crate) fn new(root: &Path, phpstan: PathBuf, sandbox: Arc<dyn Sandbox>) -> Self {
+        let lsp = ci_edit::LazyLsp::new({
+            let root = root.to_path_buf();
+            let sandbox = sandbox.clone();
+            move || phpactor::start(&root, &*sandbox)
+        });
+        Self { root: root.to_path_buf(), phpstan, lsp, sandbox }
     }
 }
 
@@ -236,7 +237,7 @@ impl GateEngine for PhpEngine {
     }
 
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
-        GateEngine::rename(self.phpactor()?, file, line, character, new_name)
+        GateEngine::rename(self.lsp.get()?, file, line, character, new_name)
     }
 
     fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
@@ -245,30 +246,19 @@ impl GateEngine for PhpEngine {
         // rewrite the syntactic model only approximates. This mirrors lang-java's jdtls ordering
         // (engine-native where it exists, the movefix hooks as the runnable fallback), and the
         // PHPStan gate judges whichever rewrite lands.
-        if let Ok(lsp) = self.phpactor() {
-            if let Ok(we) = GateEngine::will_rename(lsp, from, to) {
-                if !ci_edit::workspace_edit_is_empty(&we) {
-                    return Ok(we);
-                }
-            }
-        }
-        Ok(crate::movefix::move_workspace_edit(&self.root, from, to).unwrap_or_else(|| json!({})))
+        self.lsp.will_rename_or(from, to, || {
+            crate::movefix::move_workspace_edit(&self.root, from, to).unwrap_or_else(|| json!({}))
+        })
     }
 
     fn sync_disk(&mut self) -> Result<()> {
         // PHPStan holds no cross-call buffers (each analyse materializes its own overlay); only
         // a started phpactor has state to resync.
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.sync_disk(),
-            None => Ok(()),
-        }
+        self.lsp.sync_disk()
     }
 
     fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.fs_events(created, deleted),
-            None => Ok(()),
-        }
+        self.lsp.fs_events(created, deleted)
     }
 }
 

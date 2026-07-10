@@ -83,12 +83,11 @@ fn engine_factory(root: &Path) -> EngineFactory {
             let hint = gate_missing(&root).unwrap_or_else(|| "php/phpstan required for the gate".into());
             return Err(ci_core::Error::Driver(format!("php edit engine unavailable.\n{hint}")));
         };
-        Ok(Box::new(gate::PhpEngine {
-            root: engine_root.to_path_buf(),
+        Ok(Box::new(gate::PhpEngine::new(
+            engine_root,
             phpstan,
-            lsp: None,
-            sandbox: ci_core::resolve_sandbox(engine_root, "marksman-php"),
-        }) as Box<dyn GateEngine + Send>)
+            ci_core::resolve_sandbox(engine_root, "marksman-php"),
+        )) as Box<dyn GateEngine + Send>)
     })
 }
 
@@ -558,12 +557,11 @@ mod tests {
                 ci_core::oci_runtime().expect("an OCI runtime on PATH"),
                 "marksman-php".into(),
             ));
-            Ok(Box::new(gate::PhpEngine {
-                root: engine_root.to_path_buf(),
-                phpstan: std::path::PathBuf::from("phpstan"),
-                lsp: None,
+            Ok(Box::new(gate::PhpEngine::new(
+                engine_root,
+                std::path::PathBuf::from("phpstan"),
                 sandbox,
-            }) as Box<dyn GateEngine + Send>)
+            )) as Box<dyn GateEngine + Send>)
         })
     }
 

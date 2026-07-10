@@ -87,8 +87,7 @@ fn engine_factory() -> EngineFactory {
             }
             None => e,
         })?;
-        Ok(Box::new(gate::JavaEngine { root: root.to_path_buf(), sidecar, lsp: None, sandbox })
-            as Box<dyn GateEngine + Send>)
+        Ok(Box::new(gate::JavaEngine::new(root, sidecar, sandbox)) as Box<dyn GateEngine + Send>)
     })
 }
 
@@ -559,8 +558,7 @@ mod tests {
                 "marksman-java".into(),
             ));
             let sidecar = gate::JavacSidecar::start(root, &*sandbox)?;
-            Ok(Box::new(gate::JavaEngine { root: root.to_path_buf(), sidecar, lsp: None, sandbox })
-                as Box<dyn GateEngine + Send>)
+            Ok(Box::new(gate::JavaEngine::new(root, sidecar, sandbox)) as Box<dyn GateEngine + Send>)
         })
     }
 

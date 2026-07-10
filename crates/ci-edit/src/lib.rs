@@ -15,11 +15,13 @@ use std::sync::{Arc, Mutex};
 mod actions;
 mod apply;
 mod composed;
+mod lazy_lsp;
 pub mod moves;
 
 pub use actions::{action_to_op, Action};
 pub use apply::{apply_delete, apply_structural, leading_symbol_name, workspace_edit_is_empty};
 pub use composed::{Composed, EngineFactory, FreshDeepener, LiveSummarizer, Prewarmer};
+pub use lazy_lsp::LazyLsp;
 
 use apply::{apply_move, apply_rename};
 
