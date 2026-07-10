@@ -77,6 +77,14 @@ pub struct LspClient {
     /// only the open file and returns a definition-only edit (cross-file references unrewritten).
     saw_jdtls_status: bool,
     jdtls_ready: bool,
+    /// sourcekit-lsp readiness. Its cross-file rename reads an IndexStoreDB that background-indexing
+    /// builds asynchronously (reported via work-done `$/progress`); before it settles a rename sees
+    /// only the open file. `expects_index_progress` is set by the sourcekit launcher (only that
+    /// server background-indexes — so no other server pays the wait); `active_progress` counts
+    /// begun-but-not-ended progress tokens, and `saw_progress` marks that indexing has started.
+    expects_index_progress: bool,
+    active_progress: u32,
+    saw_progress: bool,
 }
 
 impl LspClient {
@@ -122,6 +130,9 @@ impl LspClient {
             status_since_demand: false,
             saw_jdtls_status: false,
             jdtls_ready: false,
+            expects_index_progress: false,
+            active_progress: 0,
+            saw_progress: false,
         };
 
         let init = json!({
@@ -138,6 +149,9 @@ impl LspClient {
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                 },
                 "workspace": { "fileOperations": { "willRename": true } },
+                // sourcekit-lsp reports its background index build via work-done progress ONLY when
+                // the client advertises support — the readiness signal a rename must wait on.
+                "window": { "workDoneProgress": true },
                 "experimental": { "serverStatusNotification": true },
             },
             "workspaceFolders": [ { "uri": file_uri(root), "name": "root" } ],
@@ -423,6 +437,16 @@ impl LspClient {
                     self.jdtls_ready = true;
                 }
             }
+            // Work-done progress (sourcekit's background index build): count begun-but-unended
+            // tokens so `ensure_ready` can wait for the index to settle before a rename.
+            Some("$/progress") => match msg.pointer("/params/value/kind").and_then(|k| k.as_str()) {
+                Some("begin") => {
+                    self.active_progress += 1;
+                    self.saw_progress = true;
+                }
+                Some("end") => self.active_progress = self.active_progress.saturating_sub(1),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -455,7 +479,27 @@ impl LspClient {
         while self.saw_jdtls_status && !self.jdtls_ready && Instant::now() < deadline {
             self.pump_one(Duration::from_millis(200))?;
         }
+        // sourcekit-lsp only: wait for the background index build. Give it a grace window to BEGIN
+        // (it starts after the SwiftPM package loads), then drain until every progress token ends.
+        // If it already finished during warm-up, `saw_progress` is set and `active_progress` is 0,
+        // so both loops fall straight through. Gated by `expects_index_progress`, so no other server
+        // (rust-analyzer waits via serverStatus; tsls, jdtls) pays any latency here.
+        if self.expects_index_progress {
+            let grace = Instant::now() + Duration::from_secs(10);
+            while !self.saw_progress && Instant::now() < grace {
+                self.pump_one(Duration::from_millis(100))?;
+            }
+            while self.active_progress > 0 && Instant::now() < deadline {
+                self.pump_one(Duration::from_millis(100))?;
+            }
+        }
         Ok(())
+    }
+
+    /// Mark this server as one whose rename waits on a background index build (sourcekit-lsp with
+    /// `--experimental-feature background-indexing`) — its launcher calls this after `start`.
+    pub fn set_expects_index_progress(&mut self) {
+        self.expects_index_progress = true;
     }
 
     /// Block until a status-reporting server (rust-analyzer) is quiescent. No-op for servers

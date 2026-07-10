@@ -541,25 +541,12 @@ mod tests {
                 &OPTS,
             )
             .unwrap();
-        // Proof the swift toolchain ran end to end in the container: sourcekit-lsp produced a rename
-        // AND the `swift build` gate type-checked it inside the image — no host swift consulted.
-        match &res {
-            // sourcekit readiness fixed ⇒ the full cross-file rename lands.
-            CommitResult::Ok { .. } => assert!(
-                fs::read_to_string(root.join("Sources/App/main.swift")).unwrap().contains("Util.fetchBase()"),
-                "cross-file reference rewritten by the container's sourcekit-lsp"
-            ),
-            // TODO(sourcekit-readiness): today sourcekit returns a DEFINITION-ONLY rename before its
-            // index finishes building in the cold container; the whole-package `swift build` gate
-            // then correctly rejects the break (main.swift still calls the old name). Same class as
-            // the jdtls readiness gap (already fixed for jdtls). The rejection naming a Swift type
-            // error PROVES the container's swift build ran — the mechanism works; the wait is the gap.
-            CommitResult::Rejected { feedback, .. } => assert!(
-                feedback.contains("Util") && feedback.contains("main.swift"),
-                "the container swift-build gate ran and produced a Swift verdict: {feedback}"
-            ),
-            other => panic!("unexpected result from the container engine: {other:?}"),
-        }
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename commits through the CONTAINER gate: {res:?}");
+        assert!(fs::read_to_string(root.join("Sources/App/Util.swift")).unwrap().contains("fetchBase"), "definition renamed");
+        assert!(
+            fs::read_to_string(root.join("Sources/App/main.swift")).unwrap().contains("Util.fetchBase()"),
+            "cross-file reference rewritten by the CONTAINER's sourcekit-lsp — no host swift consulted"
+        );
     }
 
     // The degenerate §8 case PROVEN end-to-end (the JSON-shape unit test only pins the hooks;

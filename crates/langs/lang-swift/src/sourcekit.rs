@@ -64,6 +64,19 @@ pub(crate) fn start(root: &std::path::Path, sandbox: &dyn ci_core::Sandbox) -> R
         };
         Ok(Command::new(bin))
     })?;
+    // Cross-file rename reads the IndexStoreDB. In a CONTAINER there is no prior indexed build, so
+    // sourcekit must build the index itself (`background-indexing`) and the rename must wait for it
+    // (ensure_ready via `set_expects_index_progress`) — otherwise it rewrites only the definition. A
+    // host has an existing/fast index and already renames cross-file, so it pays neither (host path
+    // unchanged).
+    let containerized = sandbox.containerized();
+    if containerized {
+        cmd.arg("--experimental-feature").arg("background-indexing");
+    }
     cmd.current_dir(root);
-    LspClient::start_in(root, cmd, sandbox)
+    let mut client = LspClient::start_in(root, cmd, sandbox)?;
+    if containerized {
+        client.set_expects_index_progress();
+    }
+    Ok(client)
 }
