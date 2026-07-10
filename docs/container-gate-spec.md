@@ -13,7 +13,7 @@ known toolchain version. Opt-in via `CI_SANDBOX=oci`; the host path is byte-iden
 | java | `marksman-java` (905MB) | ✅ javac sidecar | ✅ jdtls | needed a jdtls readiness fix (done) |
 | php | `marksman-php` (~450MB) | ✅ phpstan (tree gate) | ✅ phpactor | full, first try |
 | rust | `marksman-rust` | ✅ cargo check | ✅ rust-analyzer | full — serverStatus already waited on |
-| swift | `marksman-swift` (~2.5GB) | ✅ swift build | ⚠️ sourcekit | mechanism works; sourcekit needs a readiness wait (task) |
+| swift | `marksman-swift` (~2.5GB) | ✅ swift build | ✅ sourcekit | full — needed `--experimental-feature background-indexing` + a `$/progress` index-settle wait (containerized-only) |
 
 Adding a language is now **plug-and-play**: an image + declaring the tool via `ci_core::tool_command`
 (the single host-vs-container resolver) + `resolve_sandbox(root, "marksman-<lang>")`. No per-launcher
