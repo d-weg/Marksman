@@ -1,13 +1,25 @@
 # Containerized gate — spec for review
 
-**Status: DRAFT (2026-07-09, branch `container-gate`).** Motivated by the java/php/swift
-bench review ([the lang-suite run](benchmarks.md) surfaced that the worst cells were toolchain
-*availability*, not logic: java rename fell back to fully manual editing because jdtls was
-absent). The idea: run a language's gate/rename toolchain inside a sandboxed root filesystem, so
-a device running Marksman needs a container runtime instead of N language toolchains, and the
-gate's verdict is pinned to a known toolchain version. This document fixes the goal, picks the
-mechanism, names the seam in the current code, and phases the work with acceptance criteria.
-Nothing here is implemented yet.
+**Status: IMPLEMENTED M1–M2.4 (2026-07-09, branch `container-gate`).** Motivated by the
+java/php/swift bench review ([the lang-suite run](benchmarks.md) surfaced that the worst cells
+were toolchain *availability*, not logic: java rename fell back to fully manual editing because
+jdtls was absent). Run a language's gate/rename toolchain inside a sandboxed root filesystem, so a
+device needs a container runtime instead of N language toolchains, with the verdict pinned to a
+known toolchain version. Opt-in via `CI_SANDBOX=oci`; the host path is byte-identical otherwise.
+
+**Coverage — all four gated languages have an image + run their toolchain in-container:**
+| lang | image | gate in-container | rename in-container | notes |
+|---|---|:--:|:--:|---|
+| java | `marksman-java` (905MB) | ✅ javac sidecar | ✅ jdtls | needed a jdtls readiness fix (done) |
+| php | `marksman-php` (~450MB) | ✅ phpstan (tree gate) | ✅ phpactor | full, first try |
+| rust | `marksman-rust` | ✅ cargo check | ✅ rust-analyzer | full — serverStatus already waited on |
+| swift | `marksman-swift` (~2.5GB) | ✅ swift build | ⚠️ sourcekit | mechanism works; sourcekit needs a readiness wait (task) |
+
+Adding a language is now **plug-and-play**: an image + declaring the tool via `ci_core::tool_command`
+(the single host-vs-container resolver) + `resolve_sandbox(root, "marksman-<lang>")`. No per-launcher
+`if containerized` branches — that choice lives in one place. Measured perf (§7): mount I/O is a
+non-issue (+7%). Deferred: TS (Node toolchain, not a single LSP), the pure-Rust youki `libcontainer`
+backend (M5), and image slimming.
 
 ## Terms
 

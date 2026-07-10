@@ -91,12 +91,9 @@ fn java_major(home: &Path) -> Option<u32> {
 /// (`.marksman/jdtls-workspace`): first import of a real Maven/Gradle repo can take minutes,
 /// warm restarts don't — persisting it is load-bearing, not an optimization.
 pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
-    // Containerized: the image ships jdtls (Java 21 + the server on PATH), so resolve it by bare
-    // name in the container and let the image's JAVA_HOME stand — a host probe/path would be
-    // meaningless there, and its absence is exactly what the container is here to fix.
-    let mut cmd = if sandbox.containerized() {
-        Command::new("jdtls")
-    } else {
+    // The image ships jdtls (Java 21 + the server on PATH); `tool_command` resolves it by bare name
+    // there and falls to the host probe otherwise (its absence is exactly what the container fixes).
+    let mut cmd = ci_core::tool_command(sandbox, "jdtls", || {
         let Some(bin) = jdtls_binary() else {
             return Err(ci_core::Error::Driver(format!(
                 "java rename/move needs jdtls to rewrite references safely — Install: {INSTALL_HINT}. \
@@ -110,8 +107,8 @@ pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspCl
             // The brew launcher resolves its runtime through JAVA_HOME first — pin the 21+ one.
             c.env("JAVA_HOME", &home);
         }
-        c
-    };
+        Ok(c)
+    })?;
     cmd.arg("-data").arg(workspace_dir(root));
     LspClient::start_in(root, cmd, sandbox)
 }

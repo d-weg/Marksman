@@ -116,10 +116,10 @@ fn phpstan_diagnostics(bin: &Path, root: &Path, sandbox: &dyn Sandbox, files: &[
     );
     let neon_path = dir.path().join("phpstan-gate.neon");
     std::fs::write(&neon_path, neon).map_err(|e| Error::Driver(format!("phpstan overlay write: {e}")))?;
-    // Containerized: the image ships phpstan as a bare launcher on PATH; resolve it by name in the
-    // container. The overlay tree + neon live under $TMPDIR, which the sandbox mounts, so the
-    // analyse targets and `current_dir` resolve unchanged inside.
-    let mut cmd = if sandbox.containerized() { Command::new("phpstan") } else { Command::new(bin) };
+    // The image ships phpstan as a bare launcher on PATH; `tool_command` resolves it by name there,
+    // else the host binary. The overlay tree + neon live under $TMPDIR, which the sandbox mounts, so
+    // the analyse targets and `current_dir` resolve unchanged inside.
+    let mut cmd = ci_core::tool_command(sandbox, "phpstan", || Ok(Command::new(bin)))?;
     cmd.args(["analyse", "--error-format=json", "--no-progress", "--no-ansi"])
         .arg("-c")
         .arg(&neon_path)

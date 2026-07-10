@@ -79,6 +79,24 @@ pub fn resolve_sandbox(root: &Path, image: &str) -> Arc<dyn Sandbox> {
     Arc::new(HostSandbox)
 }
 
+/// Resolve a tool's launch command. Inside a container it is the bare `name` (the image provides
+/// it on PATH, with the image's own environment); on the host it is the caller's own resolution —
+/// a probe plus any host-specific env (`JAVA_HOME`, a PHAR launcher, …). THE single place the
+/// host-vs-container choice lives, so an engine calls this instead of branching on
+/// `containerized()` — adding a language is then "declare the tool name + host resolver," not a new
+/// `if` in every launcher (docs/container-gate-spec.md §9b).
+pub fn tool_command(
+    sandbox: &dyn Sandbox,
+    name: &str,
+    host: impl FnOnce() -> crate::Result<Command>,
+) -> crate::Result<Command> {
+    if sandbox.containerized() {
+        Ok(Command::new(name))
+    } else {
+        host()
+    }
+}
+
 /// The OCI runtime CLI an [`OciSandbox`] drives: `$CI_SANDBOX_RUNTIME` (a bare name or an absolute
 /// path), else the first found on `PATH` of `container` (Apple's native macOS runtime — a
 /// per-container VM on Virtualization.framework, no daemon), `docker`, `podman`, `nerdctl`. `None`

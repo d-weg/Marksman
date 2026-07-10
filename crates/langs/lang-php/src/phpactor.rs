@@ -45,13 +45,9 @@ pub(crate) fn phpactor_phar() -> Option<PathBuf> {
 /// Start phpactor's language server for `root`. A bare `phpactor` binary is launched directly;
 /// a `.phar` is run through the `php` runtime (`php phpactor.phar language-server`).
 pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
-    let mut cmd = if sandbox.containerized() {
-        // The image exposes phpactor as a bare `phpactor` launcher on PATH (php + the PHAR); resolve
-        // it by name in the container, no host probe/path (its absence is what the container fixes).
-        let mut c = Command::new("phpactor");
-        c.arg("language-server");
-        c
-    } else {
+    // The image exposes phpactor as a bare `phpactor` launcher on PATH; `tool_command` resolves it
+    // by name there, else the host PHAR (its absence is what the container fixes).
+    let mut cmd = ci_core::tool_command(sandbox, "phpactor", || {
         let Some(phar) = phpactor_phar() else {
             return Err(ci_core::Error::Driver(format!(
                 "php rename/move needs phpactor to rewrite references safely — Install: {INSTALL_HINT}. \
@@ -60,16 +56,15 @@ pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspCl
                  wrong site rejects rather than lands."
             )));
         };
-        if phar.extension().and_then(|e| e.to_str()) == Some("phar") {
+        // A `.phar` runs through the `php` runtime; a bare binary launches directly.
+        Ok(if phar.extension().and_then(|e| e.to_str()) == Some("phar") {
             let mut c = Command::new("php");
-            c.arg(&phar).arg("language-server");
+            c.arg(&phar);
             c
         } else {
-            let mut c = Command::new(&phar);
-            c.arg("language-server");
-            c
-        }
-    };
-    cmd.current_dir(root);
+            Command::new(&phar)
+        })
+    })?;
+    cmd.arg("language-server").current_dir(root);
     LspClient::start_in(root, cmd, sandbox)
 }

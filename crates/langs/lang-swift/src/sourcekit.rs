@@ -54,12 +54,16 @@ pub(crate) fn sourcekit_binary() -> Option<PathBuf> {
 /// Start sourcekit-lsp for `root`. Launched directly (it discovers the SwiftPM package from the
 /// workspace root); background indexing warms the IndexStoreDB the rename reads from.
 pub(crate) fn start(root: &std::path::Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
-    let Some(bin) = sourcekit_binary() else {
-        return Err(ci_core::Error::Driver(format!(
-            "swift rename needs sourcekit-lsp — Install: {INSTALL_HINT}"
-        )));
-    };
-    let mut cmd = Command::new(bin);
+    // The image ships sourcekit-lsp on PATH; `tool_command` resolves it by bare name there, else the
+    // host binary.
+    let mut cmd = ci_core::tool_command(sandbox, "sourcekit-lsp", || {
+        let Some(bin) = sourcekit_binary() else {
+            return Err(ci_core::Error::Driver(format!(
+                "swift rename needs sourcekit-lsp — Install: {INSTALL_HINT}"
+            )));
+        };
+        Ok(Command::new(bin))
+    })?;
     cmd.current_dir(root);
     LspClient::start_in(root, cmd, sandbox)
 }

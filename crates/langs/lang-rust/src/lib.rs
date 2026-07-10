@@ -144,7 +144,8 @@ impl RustProvider {
 fn engine_factory() -> ci_edit::EngineFactory {
     Arc::new(|root: &Path| {
         let sandbox = ci_core::resolve_sandbox(root, "marksman-rust");
-        let lsp = LspClient::start_in(root, rust_analyzer_command(), &*sandbox).map_err(|e| {
+        let ra = ci_core::tool_command(&*sandbox, "rust-analyzer", || Ok(rust_analyzer_command()))?;
+        let lsp = LspClient::start_in(root, ra, &*sandbox).map_err(|e| {
             match toolchain().describe_missing() {
                 Some(missing) => Error::Driver(format!("rust edit engine failed to start ({e}).\n{missing}")),
                 None => e,
@@ -164,7 +165,8 @@ fn prewarm_engine(root: &Path) -> Option<Box<dyn GateEngine + Send>> {
         .into_iter()
         .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
     let sandbox = ci_core::resolve_sandbox(root, "marksman-rust");
-    let mut client = LspClient::start_in(root, rust_analyzer_command(), &*sandbox).ok()?;
+    let ra = ci_core::tool_command(&*sandbox, "rust-analyzer", || Ok(rust_analyzer_command())).ok()?;
+    let mut client = LspClient::start_in(root, ra, &*sandbox).ok()?;
     if let Some((f, content)) = warm {
         let _ = client.diagnostics(&[(f, content)]); // forces the workspace to load
     }
@@ -674,6 +676,42 @@ mod tests {
         assert!(after.contains("pub fn sum"), "definition renamed: {after}");
         assert!(after.contains("sum(1, 2)"), "call site renamed by rust-analyzer: {after}");
         assert!(!after.contains("add"), "no 'add' should remain: {after}");
+    }
+
+    // Requires docker (or another OCI runtime) up AND the rust image:
+    //   docker build -f docker/marksman-rust.Dockerfile -t marksman-rust docker/
+    // The `cargo check` gate AND the rust-analyzer rename both run in the container, so this passes
+    // with NO host cargo/rustc/rust-analyzer. rust-analyzer sends experimental/serverStatus, which
+    // marksman already waits on (wait_quiescent) — so no readiness gotcha, unlike jdtls/sourcekit.
+    // RUN ALONE (it sets $CI_SANDBOX): `cargo test -p lang-rust oci_rust -- --ignored --test-threads=1`.
+    #[test]
+    #[ignore]
+    fn oci_rust_gate_and_rename_without_host_tools() {
+        if ci_core::oci_runtime().is_none() {
+            eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
+            return;
+        }
+        std::env::set_var("CI_SANDBOX", "oci");
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"t\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\npub fn run() -> i32 {\n    add(1, 2)\n}\n",
+        )
+        .unwrap();
+        let p = RustProvider::open(root, false);
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+        let res = p
+            .apply_edits(&[EditOp::Rename { node_id: "src/lib.rs#add".into(), new_name: "sum".into() }], &opts)
+            .unwrap();
+        std::env::remove_var("CI_SANDBOX");
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename commits through the CONTAINER gate: {res:?}");
+        let after = fs::read_to_string(root.join("src/lib.rs")).unwrap();
+        assert!(after.contains("pub fn sum"), "definition renamed in the container: {after}");
+        assert!(after.contains("sum(1, 2)"), "call site renamed by the container's rust-analyzer: {after}");
+        assert!(!after.contains("add"), "no 'add' remains: {after}");
     }
 
     // Surgical sub-node edits, gated by rust-analyzer. #[ignore]; run with `--ignored`.
