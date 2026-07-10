@@ -10,7 +10,7 @@
 use crate::CappedOutput;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,10 +34,11 @@ pub trait Sandbox: Send + Sync {
     /// container impl execs the argv inside the running container with the same pipes.
     fn spawn(&self, cmd: &mut Command) -> io::Result<Child>;
 
-    /// Run a one-shot command to completion, returning its full output UNCAPPED and UNTIMED — for a
-    /// gate whose output must not be truncated (`cargo check --message-format=json` emits one JSON
-    /// object per diagnostic and can legitimately be large). The host impl is `Command::output`.
-    fn output(&self, cmd: &mut Command) -> io::Result<Output>;
+    // Deliberately NO uncapped/untimed variant: every one-shot gate command goes through
+    // `run_capped` (usually via `run_gate_capped`), so an unbounded gate is unrepresentable.
+    // The old `output` escape hatch existed for `cargo check`'s large JSON stream — the cap
+    // (GATE_OUTPUT_CAP) gives that stream orders-of-magnitude headroom, and truncation can only
+    // under-report on an already-failing exit, which `silent_tool_failure_diag` still rejects.
 }
 
 /// The default backend: no isolation. Runs every toolchain on the host exactly as the code did
@@ -53,10 +54,6 @@ impl Sandbox for HostSandbox {
 
     fn spawn(&self, cmd: &mut Command) -> io::Result<Child> {
         cmd.spawn()
-    }
-
-    fn output(&self, cmd: &mut Command) -> io::Result<Output> {
-        cmd.output()
     }
 }
 
@@ -218,11 +215,6 @@ impl Sandbox for OciSandbox {
             .stderr(Stdio::null())
             .spawn()
     }
-
-    fn output(&self, cmd: &mut Command) -> io::Result<Output> {
-        let container = self.container()?;
-        self.exec(&container, cmd, false).output()
-    }
 }
 
 impl Drop for OciSandbox {
@@ -254,15 +246,6 @@ mod tests {
     }
 
     #[test]
-    fn host_sandbox_output_returns_full_uncapped_output() {
-        let mut cmd = Command::new("printf");
-        cmd.arg("diag");
-        let out = HostSandbox.output(&mut cmd).unwrap();
-        assert!(out.status.success());
-        assert_eq!(out.stdout, b"diag");
-    }
-
-    #[test]
     fn find_on_path_resolves_absolute_and_bare_and_rejects_missing() {
         assert_eq!(find_on_path("/bin/sh").as_deref(), Some(Path::new("/bin/sh")));
         assert!(find_on_path("sh").is_some(), "a bare name resolves via PATH");
@@ -280,7 +263,7 @@ mod tests {
             "marksman-java".into(),
         );
         let mut cmd = Command::new("true");
-        assert!(s.output(&mut cmd).is_err());
+        assert!(s.run_capped(&mut cmd, Duration::from_secs(5), 4096).is_err());
     }
 
     #[test]
@@ -302,14 +285,16 @@ mod tests {
         let sb = OciSandbox::new(std::env::temp_dir(), runtime, "marksman-java".into());
         let mut cmd = Command::new("java");
         cmd.arg("-version");
-        let out = sb.output(&mut cmd).expect("java -version inside the container");
+        let out = sb
+            .run_capped(&mut cmd, Duration::from_secs(120), 1024 * 1024)
+            .expect("java -version inside the container");
         // `java -version` prints to stderr by convention.
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        assert!(out.status.success(), "java ran in the container: {text}");
+        assert!(out.status.is_some_and(|s| s.success()) && !out.timed_out, "java ran in the container: {text}");
         assert!(text.contains("21"), "the image's Java 21: {text}");
     }
 }

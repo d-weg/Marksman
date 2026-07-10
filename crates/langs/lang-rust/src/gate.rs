@@ -75,9 +75,12 @@ fn cargo_check_diags(root: &Path, sandbox: &dyn Sandbox, files: &[(String, Strin
     cmd.args(["check", "--message-format=json", "-q"])
         .current_dir(root)
         .env("CARGO_TERM_COLOR", "never");
-    let out = sandbox
-        .output(&mut cmd)
-        .map_err(|e| ci_core::Error::Driver(format!("spawn cargo check: {e}")))?;
+    // Capped + time-bounded (run_gate_capped): a hung `cargo check` can't hang the edit — and,
+    // since the MCP server loop is single-threaded, the whole server — forever; a timeout REFUSES
+    // the edit (Error::GateTimeout propagates; see `diagnostics` below). Truncation at the cap is
+    // sound: a dropped diagnostic can only under-report on an already-failing exit code, and the
+    // silent-tool-failure invariant below still rejects that.
+    let out = ci_core::run_gate_capped(sandbox, &mut cmd, "cargo check")?;
     let mut diags = Vec::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
@@ -107,12 +110,18 @@ fn cargo_check_diags(root: &Path, sandbox: &dyn Sandbox, files: &[(String, Strin
             line: span["line_start"].as_u64().unwrap_or(0) as u32,
         });
     }
-    // Errors but none parsed (a broken Cargo.toml aborts before compiler-messages): surface
-    // the failure as a diagnostic so the gate REJECTS instead of reading silence as clean.
-    if !out.status.success() && diags.is_empty() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let first = err.lines().find(|l| !l.trim().is_empty()).unwrap_or("cargo check failed");
-        diags.push(ci_core::Diag { file: "Cargo.toml".into(), code: 0, message: first.to_string(), line: 0 });
+    // Reject-on-failed-tool: errors but none parsed (a broken Cargo.toml aborts before
+    // compiler-messages) surfaces as a diagnostic so the gate REJECTS, never reads silence as clean.
+    if let Some(d) = ci_core::silent_tool_failure_diag(
+        out.status.is_some_and(|s| s.success()),
+        &diags,
+        "Cargo.toml",
+        || {
+            let err = String::from_utf8_lossy(&out.stderr);
+            err.lines().find(|l| !l.trim().is_empty()).unwrap_or("cargo check failed").to_string()
+        },
+    ) {
+        diags.push(d);
     }
     if std::env::var("CI_TIMING").is_ok() {
         eprintln!("[timing]   cargo check gate {:?} ({} staged, {} errors)", t0.elapsed(), guard.0.len(), diags.len());
@@ -138,6 +147,13 @@ impl GateEngine for RustEngine {
         }
         match cargo_check_diags(&self.root, &*self.sandbox, files) {
             Ok(diags) => Ok(diags),
+            // A TIMEOUT is not "cargo unavailable" — the tool exists and hung. It must REFUSE
+            // the edit (disk already restored by the drop-guard), never swap in rust-analyzer:
+            // silently trading the rustc verdict for ra's weaker one on a hang is exactly the
+            // gate degrade CONTRIBUTING forbids. (Emitting the timeout as a Diag would be just
+            // as wrong: baseline and after passes would both carry it and the baseline diff
+            // would excuse it — a false pass.)
+            Err(e @ ci_core::Error::GateTimeout(_)) => Err(e),
             Err(e) => {
                 // cargo unavailable (unusual: ra requires a toolchain) — degrade to ra +
                 // gap-fill rather than blocking every edit, but say so.
@@ -173,6 +189,43 @@ impl GateEngine for RustEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The no-degrade pin: a hung `cargo check` (run_capped reports timed_out) must surface as
+    // Error::GateTimeout — the distinguished variant `RustEngine::diagnostics` PROPAGATES instead
+    // of taking the rust-analyzer fallback. If this ever becomes a plain Driver error, a hang
+    // silently swaps the verdict engine.
+    #[test]
+    fn cargo_check_timeout_is_gate_timeout_not_driver() {
+        struct HungSandbox;
+        impl Sandbox for HungSandbox {
+            fn run_capped(
+                &self,
+                _cmd: &mut std::process::Command,
+                _timeout: std::time::Duration,
+                _cap: usize,
+            ) -> std::io::Result<ci_core::CappedOutput> {
+                Ok(ci_core::CappedOutput {
+                    status: None,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                    timed_out: true,
+                })
+            }
+            fn spawn(&self, _cmd: &mut std::process::Command) -> std::io::Result<std::process::Child> {
+                unreachable!("the verdict path never spawns a resident process")
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let files = vec![("src/lib.rs".to_string(), "pub fn x() {}\n".to_string())];
+        let err = cargo_check_diags(dir.path(), &HungSandbox, &files).unwrap_err();
+        assert!(
+            matches!(err, ci_core::Error::GateTimeout(_)),
+            "a timed-out gate is GateTimeout (refuse), never Driver (which would take the ra fallback): {err:?}"
+        );
+        // The drop-guard restored the transient staging: nothing left on disk.
+        assert!(!dir.path().join("src/lib.rs").exists(), "staged buffer restored on the error path");
+    }
 
     // The extraction insurance: the rustc-shaped E0432/E0583 messages (and their sites) are
     // reply surface the delete-refusal / move flows depend on, so the generic §8 form over
