@@ -1,25 +1,17 @@
 [package]
-name = "ci-cli"
+name = "ci-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Marksman CLI: index / retrieve / doctor."
-
-[[bin]]
-name = "marksman"
-path = "src/main.rs"
+description = "The one make_provider: language name -> constructed provider, for every Marksman binary."
 
 [dependencies]
 ci-core = { path = "../ci-core" }
-ci-embed = { path = "../ci-embed" }
-ci-index = { path = "../ci-index" }
-ci-retrieve = { path = "../ci-retrieve" }
 ci-build = { path = "../ci-build" }
-ci-providers = { path = "../ci-providers" }
-ci-walk = { path = "../ci-walk" }
 ci-proto = { path = "../ci-proto" }
 lang-ts = { path = "../langs/lang-ts" }
 lang-rust = { path = "../langs/lang-rust" }
 lang-fallback = { path = "../langs/lang-fallback" }
 lang-java = { path = "../langs/lang-java" }
-serde_json.workspace = true
+lang-php = { path = "../langs/lang-php" }
+lang-swift = { path = "../langs/lang-swift" }

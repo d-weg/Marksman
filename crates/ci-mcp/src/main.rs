@@ -6,179 +6,17 @@
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
-use ci_build::{build_registry, ProviderBuild, ProviderRegistry};
+use ci_build::{build_registry, ProviderRegistry};
 use ci_core::{Config, EditOpts, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_all_in, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_dir, index_exists, load_index, save_index, IndexData};
 use ci_retrieve::{retrieve, RetrieveOptions};
-use ci_proto::ProcessProvider;
-use lang_fallback::{FallbackProvider, FbLang};
-use lang_rust::RustProvider;
-use lang_ts::TsProvider;
+use lang_fallback::FbLang;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-/// Construct the provider for one language, honoring the manifest's vendored binary and
-/// `CI_PROVIDER=sidecar`. Called once per active language by [`build_registry`], so a language's
-/// toolchain is never probed, fetched, or run unless the repo actually has its files (a
-/// Rust-only repo never touches Node). Each language's TOOLCHAIN is checked before any of it
-/// runs: a missing dependency becomes `Unavailable` with the install instructions (permanent,
-/// carried on the registry), not a cryptic spawn error or a retry loop.
-fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
-    if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
-        if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
-            eprintln!("[marksman-mcp] language: {lang} (sidecar process — protobuf wire)");
-            match ProcessProvider::spawn(cmd) {
-                Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
-                Err(e) => {
-                    eprintln!("[marksman-mcp] sidecar {lang} failed to start ({e}); skipping");
-                    return ProviderBuild::Failed(e.to_string());
-                }
-            }
-        }
-        eprintln!("[marksman-mcp] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
-    }
-    match lang {
-        "rust" => {
-            // Reads are in-process tree-sitter (no external deps) — the provider always comes
-            // up. rust-analyzer gates only WRITES: warn now if missing, and apply_edits repeats
-            // the same install hint if actually invoked.
-            if let Some(missing) = lang_rust::toolchain().describe_missing() {
-                eprintln!("[marksman-mcp] warning: {missing}\n  (rust reads work; type-checked edits will fail until installed)");
-            }
-            eprintln!("[marksman-mcp] language: rust (tree-sitter reads + rust-analyzer scip graph; gate: cargo check, renames: rust-analyzer)");
-            ProviderBuild::Ready(Arc::new(RustProvider::open(root, config.scip_enabled("rust"))))
-        }
-        "ts" => {
-            // CI_TS_MODE ablation arms (docs/benchmarks.md): serve TS from tree-sitter instead
-            // of SCIP — "treesitter" is the generic UNGATED provider (needs nothing external),
-            // "treesitter-gated" keeps the warm ts-morph gate on a tree-sitter read path.
-            match std::env::var("CI_TS_MODE").as_deref() {
-                Ok("treesitter") => {
-                    eprintln!("[marksman-mcp] language: typescript (ABLATION: generic tree-sitter, UNGATED — CI_TS_MODE=treesitter)");
-                    return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Ts)));
-                }
-                Ok("treesitter-gated") => {
-                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                        eprintln!("[marksman-mcp] typescript DISABLED (gated ablation still needs the gate's toolchain):\n{missing}");
-                        return ProviderBuild::Unavailable(missing);
-                    }
-                    eprintln!("[marksman-mcp] language: typescript (ABLATION: tree-sitter read + ts-morph gate — CI_TS_MODE=treesitter-gated)");
-                    return ProviderBuild::Ready(Arc::new(lang_ts::TsTreeGated::new(root)));
-                }
-                Ok("lsp") => {
-                    // COMPARISON arm: index by sweeping the tsgo language server (ci-lsp-index)
-                    // instead of scip-typescript; same SCIP read path, different producer.
-                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                        eprintln!("[marksman-mcp] typescript DISABLED (the LSP sweep still needs Node for tsgo via npx):\n{missing}");
-                        return ProviderBuild::Unavailable(missing);
-                    }
-                    eprintln!("[marksman-mcp] language: typescript (COMPARISON: tsgo LSP-sweep index — CI_TS_MODE=lsp)");
-                    return match TsProvider::index_with_lsp_sweep(root) {
-                        Ok(p) => ProviderBuild::Ready(Arc::new(p)),
-                        Err(e) => {
-                            eprintln!("[marksman-mcp] tsgo LSP-sweep indexing failed ({e}); skipping TS files");
-                            ProviderBuild::Failed(e.to_string())
-                        }
-                    };
-                }
-                _ => {}
-            }
-            // TypeScript needs Node for BOTH paths (scip-typescript index + the gate). Missing
-            // toolchain = the language is off, loudly and actionably — never a half-working
-            // provider or an ungated fallback.
-            if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                eprintln!("[marksman-mcp] typescript DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            // `open` loads the cached .codeindex/index.scip when the source fingerprint still
-            // matches (ms), and re-runs scip-typescript only when it doesn't (~20s).
-            eprintln!("[marksman-mcp] language: typescript — opening scip index for {} …", root.display());
-            match TsProvider::open(root) {
-                Ok(p) => ProviderBuild::Ready(Arc::new(p)),
-                Err(e) => {
-                    eprintln!("[marksman-mcp] typescript indexing failed ({e}); skipping TS files");
-                    ProviderBuild::Failed(e.to_string())
-                }
-            }
-        }
-        "java" => {
-            // The ungated ABLATION arm (mirrors CI_TS_MODE=treesitter): the generic fallback
-            // provider, reachable for measurement — never the silent degradation path.
-            if std::env::var("CI_JAVA_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman-mcp] language: java (ABLATION: generic tree-sitter, UNGATED — CI_JAVA_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Java)));
-            }
-            // Gated tier: reads are in-process tree-sitter, the WRITE gate is the resident
-            // javax.tools sidecar — so a missing JDK disables the language with the install
-            // hint (contract §6), it never falls back to ungated edits silently.
-            if let Some(missing) = lang_java::gate_missing() {
-                eprintln!("[marksman-mcp] java DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            if let Some(t) = lang_java::toolchain().tools.iter().find(|t| t.tool == "jdtls" && t.found.is_none()) {
-                eprintln!("[marksman-mcp] warning: java rename/move needs {} — Install: {}\n  (reads and the javac gate work without it)", t.tool, t.install);
-            }
-            eprintln!("[marksman-mcp] language: java (tree-sitter reads; gate: resident javax.tools sidecar, renames: jdtls)");
-            ProviderBuild::Ready(Arc::new(lang_java::JavaProvider::new(root)))
-        }
-        "php" => {
-            // The ungated ABLATION arm (mirrors CI_JAVA_MODE=treesitter): the generic fallback
-            // provider, reachable for measurement — never the silent degradation path.
-            if std::env::var("CI_PHP_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman-mcp] language: php (ABLATION: generic tree-sitter, UNGATED — CI_PHP_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Php)));
-            }
-            // Gated tier: reads are in-process tree-sitter, the WRITE gate is PHPStan — so a
-            // missing php/phpstan disables the language with the install hint (contract §6), it
-            // never falls back to ungated edits silently.
-            if let Some(missing) = lang_php::gate_missing(root) {
-                eprintln!("[marksman-mcp] php DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            if let Some(t) = lang_php::toolchain(root).tools.iter().find(|t| t.tool == "phpactor" && t.found.is_none()) {
-                eprintln!("[marksman-mcp] warning: php rename/move needs {} — Install: {}\n  (reads and the phpstan gate work without it)", t.tool, t.install);
-            }
-            eprintln!("[marksman-mcp] language: php (tree-sitter reads; gate: phpstan analyse, renames: phpactor)");
-            ProviderBuild::Ready(Arc::new(lang_php::PhpProvider::new(root)))
-        }
-        "swift" => {
-            // The ungated ABLATION arm (mirrors CI_JAVA_MODE=treesitter): the generic fallback
-            // provider, reachable for measurement — never the silent degradation path.
-            if std::env::var("CI_SWIFT_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman-mcp] language: swift (ABLATION: generic tree-sitter, UNGATED — CI_SWIFT_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Swift)));
-            }
-            // Gated tier: reads are in-process tree-sitter, the WRITE gate is `swift build` — so a
-            // missing Swift toolchain disables the language with the install hint (contract §6), it
-            // never falls back to ungated edits silently.
-            if let Some(missing) = lang_swift::gate_missing() {
-                eprintln!("[marksman-mcp] swift DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            if let Some(t) = lang_swift::toolchain().tools.iter().find(|t| t.tool == "sourcekit-lsp" && t.found.is_none()) {
-                eprintln!("[marksman-mcp] warning: swift rename needs {} — Install: {}\n  (reads and the `swift build` gate work without it)", t.tool, t.install);
-            }
-            eprintln!("[marksman-mcp] language: swift (tree-sitter reads; gate: `swift build`, renames: sourcekit-lsp)");
-            ProviderBuild::Ready(Arc::new(lang_swift::SwiftProvider::new(root)))
-        }
-        // Every other supported language rides the generic tree-sitter fallback: full read
-        // path, ungated edits, zero external dependencies.
-        other => match FbLang::from_name(other) {
-            Some(fb) => {
-                eprintln!(
-                    "[marksman-mcp] language: {} (generic tree-sitter fallback, in-process — edits are ungated)",
-                    fb.label()
-                );
-                ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
-            }
-            None => ProviderBuild::Failed(format!("unknown language '{other}'")),
-        },
-    }
-}
 
 /// The extension → provider registry for `root`, dispatching each file to its language's provider
 /// so a mixed repo reads/edits fully. Absent/disabled languages register nothing.
@@ -186,7 +24,7 @@ fn build_registry_for(root: &Path) -> Result<ProviderRegistry, String> {
     let mut config = Config::load(root).unwrap_or_default();
     config.index_dir = ".marksman".into();
     let cfg = config.clone();
-    let built = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg)).map_err(|e| e.to_string())?;
+    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[marksman-mcp]")).map_err(|e| e.to_string())?;
     // A language that's present + enabled but whose provider failed to construct (e.g.
     // scip-typescript lost an npx-cache race and exited non-zero) yields an INCOMPLETE registry:
     // its files would silently have no provider, so every read/edit on them degrades to "symbol
