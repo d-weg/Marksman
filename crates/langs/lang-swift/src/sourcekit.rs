@@ -27,28 +27,15 @@ pub(crate) const INSTALL_HINT: &str =
 /// The sourcekit-lsp binary: `$CI_SOURCEKIT_LSP`, else `sourcekit-lsp` on PATH, else the common
 /// toolchain locations. `None` = rename is unavailable (a rename op then explains itself).
 pub(crate) fn sourcekit_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CI_SOURCEKIT_LSP") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("sourcekit-lsp");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    [
-        "/usr/bin/sourcekit-lsp",
-        "/usr/local/bin/sourcekit-lsp",
-        "/Library/Developer/CommandLineTools/usr/bin/sourcekit-lsp",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
+    ci_core::discover_tool(
+        "CI_SOURCEKIT_LSP",
+        &["sourcekit-lsp"],
+        &[
+            "/usr/bin/sourcekit-lsp",
+            "/usr/local/bin/sourcekit-lsp",
+            "/Library/Developer/CommandLineTools/usr/bin/sourcekit-lsp",
+        ],
+    )
 }
 
 /// Start sourcekit-lsp for `root`. Launched directly (it discovers the SwiftPM package from the

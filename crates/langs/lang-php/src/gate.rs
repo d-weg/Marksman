@@ -20,8 +20,10 @@ fn phpstan_level() -> String {
     std::env::var("CI_PHPSTAN_LEVEL").unwrap_or_else(|_| "5".to_string())
 }
 
-/// The PHPStan binary: `$CI_PHPSTAN`, else `phpstan`/`vendor/bin/phpstan` on/near the repo,
-/// else a PATH `phpstan`. `None` = no gate available.
+/// The PHPStan binary: `$CI_PHPSTAN`, else `vendor/bin/phpstan` in the repo, else a PATH
+/// `phpstan`. `None` = no gate available. The vendored middle step is per-repo, so it sits
+/// inline between `discover_tool`'s env and PATH halves (the env recheck inside is harmless —
+/// a set-but-missing `$CI_PHPSTAN` already fell through above).
 pub(crate) fn phpstan_binary(root: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CI_PHPSTAN") {
         let p = PathBuf::from(p);
@@ -33,15 +35,7 @@ pub(crate) fn phpstan_binary(root: &Path) -> Option<PathBuf> {
     if vendored.is_file() {
         return Some(vendored);
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("phpstan");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
+    ci_core::discover_tool("CI_PHPSTAN", &["phpstan"], &[])
 }
 
 /// Materialize `rel` with `content` under `base`, creating parent dirs. Returns the absolute path.

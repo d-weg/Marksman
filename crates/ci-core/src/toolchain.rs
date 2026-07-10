@@ -66,6 +66,29 @@ pub fn probe_tool(cmd: &mut Command) -> Option<String> {
     Some(if first.is_empty() { "present".into() } else { first })
 }
 
+/// Resolve an external tool binary the conventional way: `$<env>` when it names an existing
+/// file, else the first of `names` found on `$PATH`, else the first existing path in
+/// `fallbacks`. `None` = not installed (the caller's toolchain report says how to get it).
+///
+/// Env semantics: a set-but-missing `$<env>` falls through to the PATH scan (matching the
+/// historical per-provider lookups this replaces). Providers whose env var is
+/// unconditional-trust — `CI_RUST_ANALYZER`, `CI_TSGO`, where an explicitly-set-but-wrong path
+/// should fail loudly later instead of silently falling through — deliberately do NOT use this.
+pub fn discover_tool(env: &str, names: &[&str], fallbacks: &[&str]) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var(env) {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for name in names {
+        if let Some(p) = crate::sandbox::find_on_path(name) {
+            return Some(p);
+        }
+    }
+    fallbacks.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
+}
+
 /// The outcome of [`run_capped`].
 pub struct CappedOutput {
     /// The child's exit status, or `None` when the deadline killed it (`timed_out`).

@@ -20,26 +20,11 @@ pub(crate) const INSTALL_HINT: &str =
 /// The phpactor PHAR path: `$CI_PHPACTOR`, else a `phpactor`/`phpactor.phar` on PATH, else the
 /// Homebrew prefixes. `None` = rename/move falls back to the movefix hooks.
 pub(crate) fn phpactor_phar() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CI_PHPACTOR") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            for name in ["phpactor", "phpactor.phar"] {
-                let cand = dir.join(name);
-                if cand.is_file() {
-                    return Some(cand);
-                }
-            }
-        }
-    }
-    ["/opt/homebrew/bin/phpactor", "/usr/local/bin/phpactor"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    ci_core::discover_tool(
+        "CI_PHPACTOR",
+        &["phpactor", "phpactor.phar"],
+        &["/opt/homebrew/bin/phpactor", "/usr/local/bin/phpactor"],
+    )
 }
 
 /// Start phpactor's language server for `root`. A bare `phpactor` binary is launched directly;

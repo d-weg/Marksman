@@ -30,24 +30,7 @@ pub(crate) const INSTALL_HINT: &str =
 
 /// The jdtls launcher: `$CI_JDTLS`, else PATH, else the Homebrew prefixes.
 pub(crate) fn jdtls_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CI_JDTLS") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("jdtls");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    ["/opt/homebrew/bin/jdtls", "/usr/local/bin/jdtls"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    ci_core::discover_tool("CI_JDTLS", &["jdtls"], &["/opt/homebrew/bin/jdtls", "/usr/local/bin/jdtls"])
 }
 
 /// A Java 21+ home for jdtls's own runtime: `$JAVA_HOME` when new enough, else the newest

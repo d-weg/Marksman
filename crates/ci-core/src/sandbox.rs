@@ -108,7 +108,7 @@ pub fn oci_runtime() -> Option<PathBuf> {
 
 /// Resolve `name` — an absolute path or a bare command — to an existing executable, honoring
 /// `$PATH` for the bare form. Read-only (never mutates the environment).
-fn find_on_path(name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
     let direct = Path::new(name);
     if direct.is_absolute() {
         return direct.is_file().then(|| direct.to_path_buf());
