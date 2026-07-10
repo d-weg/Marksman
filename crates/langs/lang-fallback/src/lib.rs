@@ -322,12 +322,10 @@ pub fn string_comment_spans(lang: FbLang, content: &str) -> Vec<(usize, usize)> 
     out
 }
 
-/// Byte offset where each line begins (line 0 at 0, then just past each `\n`) — maps a movefix
-/// `(line, column)` reference span to an absolute content offset for [`string_comment_spans`]
-/// masking. CRLF-safe: only line STARTS are recorded, and a column is start-relative either way.
-pub fn line_start_offsets(content: &str) -> Vec<usize> {
-    std::iter::once(0).chain(content.match_indices('\n').map(|(i, _)| i + 1)).collect()
-}
+/// Byte offset where each line begins — moved to `ci_core::text` (the shared §8 dotted-name
+/// move engine in ci-edit needs it, and ci-edit cannot depend on this crate); re-exported here
+/// so existing callers keep their path.
+pub use ci_core::text::line_start_offsets;
 
 fn collect_string_comment(node: tree_sitter::Node, out: &mut Vec<(usize, usize)>) {
     if is_string_or_comment(node.kind()) {

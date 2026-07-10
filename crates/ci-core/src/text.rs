@@ -37,6 +37,14 @@ pub fn byte_offset(content: &str, line_1: u32, col_0: u32) -> Option<usize> {
     }
 }
 
+/// Byte offset where each line begins (line 0 at 0, then just past each `\n`) — maps a
+/// `(line, column)` span to an absolute content offset (movefix uses it to test spans against
+/// string/comment masking extents). CRLF-safe: only line STARTS are recorded, and a column is
+/// start-relative either way.
+pub fn line_start_offsets(content: &str) -> Vec<usize> {
+    std::iter::once(0).chain(content.match_indices('\n').map(|(i, _)| i + 1)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

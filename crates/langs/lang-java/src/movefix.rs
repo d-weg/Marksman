@@ -1,217 +1,114 @@
-//! movefix — the Java §8 hooks ([`ci_edit::moves::MoveModel`]) behind the shared move engine.
+//! movefix — the Java §8 hooks behind the shared move engine, as a
+//! [`ci_edit::moves::dotted`] instance (the generic dotted-name engine owns the control flow;
+//! what is JAVA about a move is the [`DottedSyntax`] scalars + the hooks below).
 //!
 //! jdtls's `willRenameFiles` IS engine-native for Java moves (it rewrites the package decl AND
 //! importers) and is preferred WHERE AVAILABLE — the exact ordering lang-rust settled for
 //! rust-analyzer (engine-native first, the syntactic fallback second, the gate over both). But
 //! jdtls is push-diagnostics-only, minutes-cold, and often absent; these hooks are the runnable
-//! fallback that gives Java complete one-call moves without it. What is Java about a move lives
-//! HERE; the file walking / span splicing / WorkspaceEdit assembly is `ci_edit::moves`.
+//! fallback that gives Java complete one-call moves without it.
 //!
 //! The three concerns, Java edition:
-//! - **`file_to_ref`**: path → fully-qualified name (`src/main/java/com/x/A.java` → `com.x.A`),
-//!   inverting the source-root resolution the import graph already uses (one resolver, via
-//!   `lang_fallback::java`).
-//! - **`ref_occurrences`**: `import a.b.C;` declarations (span-rewritable, noted for deletion
-//!   diagnostics) plus fully-qualified `a.b.C` mentions in code (rewrite-only — the compiler
-//!   gate catches a stranded FQN the imports don't cover). Each resolves through the shared
-//!   Java import resolver so a reference to a batch-deleted class is a diagnostic.
-//! - **`membership_edits`**: rewrite the `package` declaration line to match the new directory.
-//!   Java has NO per-file membership file like Rust's `mod.rs`/parent `mod x;` — a class is a
-//!   member of its package by living in the matching directory — so this hook is
-//!   package-line-only by design, never a create/delete of a declaration file.
+//! - **file↔name**: `src/main/java/com/x/A.java` ↔ `com.x.A`, inverting the source-root
+//!   resolution the import graph already uses (one resolver, via `lang_fallback::java`).
+//! - **references**: `import a.b.C;` declarations + fully-qualified `a.b.C` code mentions.
+//!   Java's trailing `.` IS a reference (`com.x.A.f()` — member access), unlike PHP's `\`.
+//! - **membership**: the `package p;` line only — Java has NO per-file membership file like
+//!   Rust's `mod.rs`; a class is a member of its package by living in the matching directory.
 //!
 //! Best-effort BY DESIGN, exactly like the reference (`lang-rust::movefix`): a shape the model
 //! doesn't understand returns `None`, the caller falls through to jdtls, and the javac gate
 //! rejects any rewrite that comes out wrong — the fallback can be incomplete, never silently
 //! wrong.
+use ci_edit::moves::dotted::{self, DottedLang, DottedSyntax};
 use ci_edit::moves::{MembershipEdit, MoveModel, RefOccurrence};
 use lang_fallback::java;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The Java [`MoveModel`]: FQN references and package-declaration membership.
 pub(crate) struct JavaMoveModel<'a>(pub(crate) &'a Path);
 
-/// Byte spans of the exact FQN token `fqn` in `line`, bounded so `com.x.A` never matches inside
-/// `com.x.Abc` or `xcom.x.A`. The boundary rule is ASYMMETRIC: a LEADING identifier char or `.`
-/// means we sit inside a longer, more-qualified name (`zcom.x.A`, `a.com.x.A`) — not this class.
-/// A TRAILING identifier char means a longer simple name (`com.x.Abc`), but a trailing `.` is
-/// member access on the class (`com.x.A.f()`) or a nested type (`com.x.A.B`) — both DO reference
-/// `com.x.A`, so a trailing `.` is a valid boundary.
-fn fqn_spans(line: &str, fqn: &str) -> Vec<(usize, usize)> {
-    let before_ext = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
-    let after_ext = |c: char| c.is_alphanumeric() || c == '_';
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(pos) = line[from..].find(fqn) {
-        let at = from + pos;
-        let end = at + fqn.len();
-        let before_ok = at == 0 || !line[..at].chars().next_back().is_some_and(before_ext);
-        let after_ok = line[end..].chars().next().is_none_or(|c| !after_ext(c));
-        if before_ok && after_ok {
-            out.push((at, end));
-        }
-        from = end;
+static JAVA_SYNTAX: DottedSyntax = DottedSyntax {
+    sep: '.',
+    import_kw: "import ",
+    import_modifiers: &["static "],
+    import_stops: &[';'],
+    import_alias_kw: None,
+    // On-demand `import a.b.*;` resolves to the package dir, not one file — only single-type
+    // imports name a file to retarget.
+    reject_import_suffix: Some('*'),
+    reject_import_containing: None,
+    // A trailing `.` is member access on the class (`com.x.A.f()`) or a nested type
+    // (`com.x.A.B`) — both DO reference `com.x.A`.
+    trailing_sep_refs_target: true,
+    run_may_start_with_sep: false,
+    source_ext: ".java",
+};
+
+impl DottedLang for JavaMoveModel<'_> {
+    fn syntax(&self) -> &'static DottedSyntax {
+        &JAVA_SYNTAX
     }
-    out
+
+    fn root(&self) -> &Path {
+        self.0
+    }
+
+    fn path_to_name(&self, rel: &str) -> Option<String> {
+        java::file_to_fqn(self.0, rel)
+    }
+
+    fn resolve_name(&self, from_rel: &str, name: &str) -> Option<PathBuf> {
+        java::resolve_import(self.0, from_rel, name)
+    }
+
+    /// Finding the EXISTING declaration is `java::package_decl` — one shared scanner, §7.
+    fn decl_line(&self, content: &str) -> Option<usize> {
+        java::package_decl(content).map(|(idx, _)| idx)
+    }
+
+    fn render_decl(&self, pkg: &str) -> String {
+        format!("package {pkg};")
+    }
+
+    /// Before the first real statement (skipping a leading license comment / blank lines).
+    fn insert_line(&self, content: &str) -> usize {
+        for (i, line) in content.lines().enumerate() {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
+                continue;
+            }
+            return i;
+        }
+        0
+    }
+
+    /// Mask via tree-sitter (exact for block comments, text blocks, escaped strings) — M1.
+    fn masked_spans(&self, content: &str) -> Vec<(usize, usize)> {
+        lang_fallback::string_comment_spans(lang_fallback::FbLang::Java, content)
+    }
+
+    fn deletion_note(&self, fqn: &str, target: &str) -> String {
+        format!("unresolved import `{fqn}` — {target} is deleted/moved by this batch; update the import")
+    }
 }
 
 impl MoveModel for JavaMoveModel<'_> {
     fn file_to_ref(&self, rel: &str) -> Option<String> {
-        java::file_to_fqn(self.0, rel)
+        self.path_to_name(rel)
     }
 
-    /// Two occurrence kinds per line:
-    /// - `import a.b.C;` declarations: the FQN is a span-rewritable reference resolving to a
-    ///   file (noted for the deletion pass — an import of a deleted class is the unresolved
-    ///   symbol javac's own diagnostics report, but the anchored reject-recipe wants it too).
-    /// - fully-qualified `a.b.C` mentions elsewhere (`new com.x.A()`, `com.x.A.field`): the
-    ///   longest dotted prefix resolving to a source file is a rewrite span (`note: None` — the
-    ///   compiler catches a stranded expression FQN; this just keeps a move complete).
     fn ref_occurrences(&self, rel: &str, content: &str) -> Vec<RefOccurrence> {
-        let mut out = Vec::new();
-        // A fully-qualified name inside a STRING or COMMENT is not a reference to rewrite: a
-        // rewrite there still compiles, so the type-check gate can't catch it. Mask those extents
-        // via tree-sitter (exact for block comments, text blocks, escaped strings) and skip any
-        // code-mention run that starts inside one (M1). Imports never sit in strings, so the
-        // import branch below stays unmasked.
-        let masked = lang_fallback::string_comment_spans(lang_fallback::FbLang::Java, content);
-        let line_starts = lang_fallback::line_start_offsets(content);
-        let in_string_or_comment = |abs: usize| masked.iter().any(|&(s, e)| abs >= s && abs < e);
-        for (i, line) in content.lines().enumerate() {
-            let t = line.trim_start();
-            let import_fqn = t
-                .strip_prefix("import ")
-                .map(|r| r.trim_start().strip_prefix("static ").map(str::trim_start).unwrap_or(r.trim_start()))
-                .and_then(|r| r.split(';').next())
-                .map(str::trim);
-            if let Some(fqn) = import_fqn {
-                // On-demand `import a.b.*;` resolves to the package dir, not one file — the move
-                // rewriter leaves those to the moved file's package staying importable by
-                // directory; only single-type imports name a file to retarget.
-                if !fqn.ends_with('*') && !fqn.is_empty() {
-                    if let Some(target) = java::resolve_import(self.0, rel, fqn) {
-                        let target = target.to_string_lossy().replace('\\', "/");
-                        let note = format!(
-                            "unresolved import `{fqn}` — {target} is deleted/moved by this batch; update the import"
-                        );
-                        for span in fqn_spans(line, fqn) {
-                            out.push(RefOccurrence { line: i, span: Some(span), target: target.clone(), note: Some(note.clone()) });
-                        }
-                    }
-                }
-                continue; // an import line carries no other FQN references worth scanning
-            }
-            // Fully-qualified references in code: walk dotted identifiers, resolve the longest
-            // prefix that lands on a source file. Rewrite-only (the gate owns correctness).
-            for (start, dotted) in dotted_runs(line) {
-                if in_string_or_comment(line_starts[i] + start) {
-                    continue; // a name inside a string/comment is never a rewrite target (M1)
-                }
-                let segs: Vec<&str> = dotted.split('.').collect();
-                for n in (1..=segs.len()).rev() {
-                    let prefix = segs[..n].join(".");
-                    if let Some(target) = java::resolve_import(self.0, rel, &prefix) {
-                        let target = target.to_string_lossy().replace('\\', "/");
-                        let span = (start, start + prefix.len());
-                        out.push(RefOccurrence { line: i, span: Some(span), target, note: None });
-                        break; // longest resolving prefix wins; don't also emit its parents
-                    }
-                }
-            }
-        }
-        out
+        dotted::ref_occurrences(self, rel, content)
     }
 
-    /// Package-line-only membership (Java has no `mod.rs`): moving `from`→`to` across packages
-    /// rewrites the moved file's own `package p;` line to the destination package. Same-package
-    /// moves (a pure rename, same directory) need no package edit — an empty vec, not `None`, so
-    /// the engine still rewrites importers. `None` only when either path isn't a resolvable
-    /// `.java` FQN (the engine declines and the caller falls through to jdtls).
     fn membership_edits(&self, from: &str, to: &str) -> Option<Vec<MembershipEdit>> {
-        let from_fqn = java::file_to_fqn(self.0, from)?;
-        let to_fqn = java::file_to_fqn(self.0, to)?;
-        let from_pkg = fqn_package(&from_fqn);
-        let to_pkg = fqn_package(&to_fqn);
-        if from_pkg == to_pkg {
-            return Some(Vec::new()); // same package: importers rewrite, the package line stays
-        }
-        // The moved file's own `package` declaration must name the destination package. The
-        // engine renders membership edits against the file's CURRENT content and skips those
-        // lines from the reference pass — but the moved file travels as-is (the engine never
-        // scans `from`), so the edit rides on the moved file, which the engine renders against
-        // `from`'s content BEFORE the file moves. One shared scanner (`java::package_decl`), §7.
-        let content = std::fs::read_to_string(self.0.join(from)).ok()?;
-        match java::package_decl(&content) {
-            Some((idx, _)) => {
-                // Moved into the default package → drop the declaration (empty replacement line).
-                let new_line = if to_pkg.is_empty() { String::new() } else { format!("package {to_pkg};") };
-                Some(vec![MembershipEdit::ReplaceLine { file: from.to_string(), line: idx, new_text: new_line }])
-            }
-            None if to_pkg.is_empty() => Some(Vec::new()), // default → default: nothing to declare
-            None => {
-                // No package today (default package), moving INTO one: ADD the declaration before
-                // the first real statement. A missing InsertAt used to decline the whole move (M3).
-                let at = java_insert_line(&content);
-                Some(vec![MembershipEdit::InsertAt {
-                    file: from.to_string(),
-                    line: at,
-                    text: format!("package {to_pkg};\n"),
-                }])
-            }
-        }
+        dotted::membership_edits(self, from, to)
     }
 
     fn is_source(&self, rel: &str) -> bool {
-        rel.ends_with(".java")
+        rel.ends_with(JAVA_SYNTAX.source_ext)
     }
-}
-
-/// The package part of an FQN (`com.x.A` → `com.x`; a top-level `A` → `""`).
-fn fqn_package(fqn: &str) -> String {
-    match fqn.rfind('.') {
-        Some(i) => fqn[..i].to_string(),
-        None => String::new(),
-    }
-}
-
-/// The line to insert a `package` declaration at: before the first real statement (skipping a
-/// leading license comment / blank lines), else line 0. (Finding the EXISTING declaration is
-/// `java::package_decl` — one shared scanner, §7.)
-fn java_insert_line(content: &str) -> usize {
-    for (i, line) in content.lines().enumerate() {
-        let t = line.trim_start();
-        if t.is_empty() || t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') {
-            continue;
-        }
-        return i;
-    }
-    0
-}
-
-/// Maximal `[A-Za-z0-9_.]` runs in `line` that contain a `.` and start on an identifier char —
-/// the candidate dotted references (`com.x.A`, `a.b.c()` gives `a.b.c`). Each is `(start byte,
-/// text)`; a leading/trailing dot is trimmed off the run.
-fn dotted_runs(line: &str) -> Vec<(usize, String)> {
-    let ext = |c: char| c.is_alphanumeric() || c == '_' || c == '.';
-    let bytes = line.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c.is_alphabetic() || c == '_' {
-            let start = i;
-            while i < line.len() && line[i..].chars().next().is_some_and(ext) {
-                i += line[i..].chars().next().unwrap().len_utf8();
-            }
-            let run = line[start..i].trim_end_matches('.');
-            if run.contains('.') {
-                out.push((start, run.to_string()));
-            }
-        } else {
-            i += c.len_utf8();
-        }
-    }
-    out
 }
 
 /// The move's `WorkspaceEdit` over [`JavaMoveModel`], or `None` when the move shape is outside
@@ -224,6 +121,12 @@ pub(crate) fn move_workspace_edit(root: &Path, from: &str, to: &str) -> Option<s
 mod tests {
     use super::*;
     use ci_edit::moves::splice_spans;
+
+    /// The historical local fn, now the generic engine's boundary checker over Java syntax —
+    /// kept so the pinned span tests read (and assert) exactly what they always did.
+    fn fqn_spans(line: &str, fqn: &str) -> Vec<(usize, usize)> {
+        dotted::name_spans(line, fqn, &JAVA_SYNTAX)
+    }
 
     #[test]
     fn fqn_spans_are_token_bounded() {
