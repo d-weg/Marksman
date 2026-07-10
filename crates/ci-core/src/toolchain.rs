@@ -87,6 +87,55 @@ pub fn gate_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Byte cap for a gate verdict tool's captured stdout/stderr. 32 MiB — a warm compiler pass
+/// emits error messages only, so this is orders of magnitude of headroom; its job is bounding a
+/// pathologically chatty tool, not trimming a normal one. Truncation is SOUND for a gate: a
+/// capped stream can only DROP diagnostics on an already-failing exit code, and
+/// [`silent_tool_failure_diag`] turns "failed with nothing parsed" into a reject — so no drop
+/// path reaches a false clean.
+pub const GATE_OUTPUT_CAP: usize = 32 * 1024 * 1024;
+
+/// Run a one-shot gate VERDICT tool through `sandbox`: output capped at [`GATE_OUTPUT_CAP`],
+/// killed at [`gate_timeout`]. A timeout is [`Error::GateTimeout`](crate::Error::GateTimeout) —
+/// the caller MUST propagate it (the edit is refused, disk untouched), never map it into a
+/// weaker verdict or a fallback engine. Spawn failures are `Driver` (those MAY have a fallback:
+/// "tool absent" is honest degrade territory, "tool hung" never is).
+pub fn run_gate_capped(
+    sandbox: &dyn crate::Sandbox,
+    cmd: &mut Command,
+    tool: &str,
+) -> crate::Result<CappedOutput> {
+    let out = sandbox
+        .run_capped(cmd, gate_timeout(), GATE_OUTPUT_CAP)
+        .map_err(|e| crate::Error::Driver(format!("{tool} spawn: {e}")))?;
+    if out.timed_out {
+        return Err(crate::Error::GateTimeout(format!(
+            "{tool} exceeded the gate timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher if this \
+             project legitimately takes longer",
+            gate_timeout().as_secs()
+        )));
+    }
+    Ok(out)
+}
+
+/// The reject-on-failed-tool invariant, in one place: a gate tool that exits non-zero having
+/// produced ZERO parsed diagnostics died before reporting (segfault, OOM-kill, bad config, no
+/// runtime) — and the spine reads an empty diagnostic set as clean-commit. Return the one `Diag`
+/// that makes the spine REJECT instead of reading silence as clean. `first_line` extracts the
+/// per-tool failure message (stderr first line, a `contains("error:")` scan, …) — the only part
+/// that is legitimately per-language.
+pub fn silent_tool_failure_diag(
+    exited_ok: bool,
+    parsed: &[crate::Diag],
+    anchor_file: &str,
+    first_line: impl FnOnce() -> String,
+) -> Option<crate::Diag> {
+    if exited_ok || !parsed.is_empty() {
+        return None;
+    }
+    Some(crate::Diag { file: anchor_file.into(), code: 0, message: first_line(), line: 0 })
+}
+
 /// Run `cmd` capturing stdout/stderr, each capped at `cap` bytes (excess is drained but dropped, so
 /// a pathologically chatty tool can't OOM us — B3), and killed after `timeout` (so a hung tool
 /// can't hang the edit forever — B4). Two reader threads drain the pipes CONCURRENTLY so a full

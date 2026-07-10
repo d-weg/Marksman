@@ -126,34 +126,28 @@ fn phpstan_diagnostics(bin: &Path, root: &Path, sandbox: &dyn Sandbox, files: &[
         .arg(format!("--level={}", phpstan_level()))
         .args(&targets)
         .current_dir(dir.path());
-    // Capped + time-bounded like the swift gate: a chatty analyser can't OOM us, and a wedged one
-    // can't hang the edit forever (generous timeout — a legit slow analysis is never killed).
-    let out = sandbox
-        .run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
-        .map_err(|e| Error::Driver(format!("phpstan spawn: {e}")))?;
-    if out.timed_out {
-        return Err(Error::Driver(format!(
-            "phpstan exceeded the gate timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher if this project legitimately analyses slower",
-            ci_core::gate_timeout().as_secs()
-        )));
-    }
+    // Capped + time-bounded (run_gate_capped): a chatty analyser can't OOM us, and a wedged one
+    // can't hang the edit forever; a timeout REFUSES the edit (Error::GateTimeout propagates).
+    let out = ci_core::run_gate_capped(sandbox, &mut cmd, "phpstan")?;
     // PHPStan exits non-zero WHEN it finds errors — that is the normal reporting path, not a
     // tool failure. Parse stdout regardless.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let diags = parse_phpstan_json(&stdout, dir.path())?;
-    // Reject-on-failed-tool (the invariant lang-rust's gate encodes): if PHPStan exits non-zero
-    // but we parsed NO diagnostics, it crashed before emitting JSON (segfault, OOM-kill, a fatal
-    // in a rule/extension, a bad --level, no PHP runtime) — the message is on stderr and stdout is
-    // empty. The spine reads an empty diagnostic set as clean-commit, so surface the failure as a
-    // reject rather than let a broken analyser pass silently.
-    if !out.status.is_some_and(|s| s.success()) && diags.is_empty() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let first = stderr
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("phpstan failed with no diagnostic output");
-        return Ok(vec![Diag { file: "phpstan".into(), code: 0, message: first.to_string(), line: 0 }]);
+    // Reject-on-failed-tool: PHPStan exiting non-zero with NO diagnostics parsed means it crashed
+    // before emitting JSON (segfault, OOM-kill, a fatal in a rule/extension, a bad --level, no PHP
+    // runtime) — the message is on stderr and stdout is empty.
+    if let Some(d) =
+        ci_core::silent_tool_failure_diag(out.status.is_some_and(|s| s.success()), &diags, "phpstan", || {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("phpstan failed with no diagnostic output")
+                .to_string()
+        })
+    {
+        return Ok(vec![d]);
     }
     Ok(diags)
 }

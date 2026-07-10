@@ -24,5 +24,8 @@ pub use outline::{elide_bodies, elide_bodies_with};
 pub use paths::rel_path;
 pub use sandbox::{oci_runtime, resolve_sandbox, tool_command, HostSandbox, OciSandbox, Sandbox};
 pub use text::byte_offset;
-pub use toolchain::{gate_timeout, probe_tool, run_capped, CappedOutput, ToolStatus, ToolchainReport};
+pub use toolchain::{
+    gate_timeout, probe_tool, run_capped, run_gate_capped, silent_tool_failure_diag, CappedOutput,
+    ToolStatus, ToolchainReport, GATE_OUTPUT_CAP,
+};
 pub use types::*;

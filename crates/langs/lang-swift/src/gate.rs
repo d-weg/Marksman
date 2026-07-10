@@ -51,17 +51,9 @@ fn swift_build_diagnostics(
     }
     let mut cmd = Command::new("swift");
     cmd.arg("build").current_dir(mirror.path());
-    // Capped + time-bounded: a chatty build can't OOM us, and a hung one can't hang the edit
-    // forever (the timeout is generous so a legitimately slow cold build is never killed).
-    let out = sandbox
-        .run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
-        .map_err(|e| Error::Driver(format!("swift build spawn: {e}")))?;
-    if out.timed_out {
-        return Err(Error::Driver(format!(
-            "swift build exceeded the gate timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher if this package legitimately builds slower",
-            ci_core::gate_timeout().as_secs()
-        )));
-    }
+    // Capped + time-bounded (run_gate_capped): a chatty build can't OOM us, and a hung one can't
+    // hang the edit forever; a timeout REFUSES the edit (Error::GateTimeout propagates).
+    let out = ci_core::run_gate_capped(sandbox, &mut cmd, "swift build")?;
     // `swift build` exits non-zero WHEN the build fails — the normal reporting path, not a tool
     // failure. The compiler prints its GCC-style diagnostics to STDOUT (the driver's progress log
     // rides there too); stderr carries SwiftPM-level manifest/toolchain failures. Parse both so a
@@ -72,18 +64,23 @@ fn swift_build_diagnostics(
         String::from_utf8_lossy(&out.stderr)
     );
     let mut diags = parse_swift_diagnostics(&combined, mirror.path());
-    // Reject-on-failed-tool (the invariant lang-rust's gate encodes at gate.rs `!success &&
-    // diags.is_empty()`): a nonzero exit with NO parsed diagnostic means the build failed in a
+    // Reject-on-failed-tool: a nonzero exit with NO parsed diagnostic means the build failed in a
     // way that carries no `PATH:LINE:COL: error:` line — a link error (`ld: symbol(s) not
-    // found`), an invalid manifest, a toolchain fault. The spine reads an empty diagnostic set
-    // as clean-commit, so surface the failure as a reject rather than let a broken build pass.
-    if !out.status.is_some_and(|s| s.success()) && diags.is_empty() {
-        let first = combined
-            .lines()
-            .map(str::trim)
-            .find(|l| l.contains("error:"))
-            .unwrap_or("swift build failed with no source-anchored diagnostic");
-        diags.push(Diag { file: "Package.swift".into(), code: 0, message: first.to_string(), line: 0 });
+    // found`), an invalid manifest, a toolchain fault.
+    if let Some(d) = ci_core::silent_tool_failure_diag(
+        out.status.is_some_and(|s| s.success()),
+        &diags,
+        "Package.swift",
+        || {
+            combined
+                .lines()
+                .map(str::trim)
+                .find(|l| l.contains("error:"))
+                .unwrap_or("swift build failed with no source-anchored diagnostic")
+                .to_string()
+        },
+    ) {
+        diags.push(d);
     }
     Ok(diags)
 }

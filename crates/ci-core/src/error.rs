@@ -11,6 +11,12 @@ pub enum Error {
     Config(String),
     #[error("driver: {0}")]
     Driver(String),
+    /// A gate verdict tool exceeded its wall-clock ceiling. Distinguished from `Driver` so a
+    /// caller can tell "hung tool" from "tool absent/broken": a timeout must PROPAGATE (the edit
+    /// is refused, disk untouched) and must never route into a weaker-fallback path — swapping
+    /// verdict engines on a hang is the silent gate degrade CONTRIBUTING forbids.
+    #[error("gate timeout: {0}")]
+    GateTimeout(String),
     #[error("anchor not found: {0}")]
     Anchor(String),
     #[error("{0}")]
