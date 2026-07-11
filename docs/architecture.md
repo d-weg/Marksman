@@ -227,11 +227,15 @@ GATE — engine diagnostics over the radius, baseline-diffed (only NEW errors co
 | `ci-vfs` | in-memory overlay transaction | ✅ |
 | `ci-lsp` | **generic** LSP transport (provider supplies the command) | ✅ |
 | `ci-lsp-index` | SCIP emitter over any LSP (documentSymbol + references sweep) | ✅ |
-| `ci-edit` | gated atomic edits + anchored repair, split by capability: `actions` (op vocabulary) · `apply` (op handlers) · `composed` (ReadIndex × GateEngine glue) · the `commit_edits` spine | ✅ |
+| `ci-edit` | gated atomic edits + anchored repair, split by capability: `actions` (op vocabulary) · `apply` (op handlers) · `composed` (ReadIndex × GateEngine glue) · `moves` (§8 engine, incl. the generic dotted-name model) · `lazy_lsp` (the lazily-started rename LSP) · the `commit_edits` spine | ✅ |
 | `lang-ts` | TS provider = `Composed<TsRead>`: SCIP + tree-sitter read half; gate tiers tsgo → ts-morph → tsls | ✅ |
 | `lang-rust` | Rust provider = `Composed<RustRead>`: live tree-sitter structure + `rust-analyzer scip` use-graph (fingerprinted, drift-seeded) read half; cargo-check gated write | ✅ |
-| `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Java, Ruby, C, C++): read path + ungated edits; the `ReadIndex` reference impl | ✅ |
+| `lang-java` | gated Step-1 provider = `Composed<FallbackProvider>`: tree-sitter reads; gate = resident javax.tools sidecar, renames jdtls | ✅ |
+| `lang-php` | gated Step-1 provider = `Composed<FallbackProvider>`: tree-sitter reads; gate = PHPStan over a project mirror, renames phpactor | ✅ |
+| `lang-swift` | gated Step-1 provider = `Composed<FallbackProvider>`: tree-sitter reads; gate = `swift build` over a package mirror (G4 target check), renames sourcekit-lsp | ✅ |
+| `lang-fallback` | GENERIC tree-sitter provider (Python, Go, Ruby, C, C++, JS): read path + ungated edits; the `ReadIndex` reference impl — also the read half the gated Step-1 providers compose over | ✅ |
 | `lang-template` | copyable Step-1 skeleton: `Composed` over tree-sitter reads + your checker | ✅ |
+| `ci-providers` | the one `make_provider` (language → constructed provider) both binaries share | ✅ |
 | `ci-cli` | `index` / `retrieve` binaries | ✅ |
 | `ci-arch` | zero-API architecture map (detects module templates) | ✅ |
 | `ci-mcp` | Rust MCP server (stdio): the two-tool facade — `apply_edits` + `inspect` (search/symbol/file/node/map) — pinned by a surface test | ✅ |

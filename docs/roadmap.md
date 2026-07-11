@@ -212,7 +212,11 @@ new language does NOT wait for a scip indexer:
 - [x] Go / Ruby / Java / C / C++ / JS fallback: data additions to `FbLang` (grammar + classify
       rows); provider, dispatch, outline, syntax-gated edits, and the rename verification scan
       are language-generic.
-- [ ] **Step 1 — tree-sitter + gate** per language: keep the generic tree-sitter read + the
+- [x] **Step 1 — tree-sitter + gate**, shipped for **Java / PHP / Swift** as dedicated gated
+      crates copied from `lang-template` (javac sidecar / PHPStan / `swift build` gates;
+      jdtls / phpactor / sourcekit-lsp renames; §8 move hooks; containerizable per
+      `container-gate-spec.md`) — see `lang-rollout-swift-php-java-spec.md` + its audit spec.
+- [ ] **Step 1, remaining languages**: keep the generic tree-sitter read + the
       syntactic import graph (served TRANSITIVELY to the gate — `transitive_reverse_imports`,
       the T9 fix) and swap `NoGate` for the language's real checker as `GateEngine`: pyright
       (Python), gopls (Go), and JS through tsc (only honest with `allowJs`+`checkJs` handling —
@@ -339,7 +343,8 @@ Don't ship a read-only language without a path to its edit gate.
 - [ ] Manifest/extension detection in the provider registry (+ `CI_LANG`); a `.ext → outline` arm
       in the MCP `outline_for`.
 
-Per-language status: **TS ✅ · Rust ✅ · Python** (read + outline + ungated edits ✅; gated path
+Per-language status: **TS ✅ · Rust ✅ · Java ✅ · PHP ✅ · Swift ✅** (the last three: gated
+Step-1 crates, containerizable) · **Python** (read + outline + ungated edits ✅; gated path
 pending — Batch 8) · **Go/Ruby/…** (fallback is a data addition to `FbLang` — Batch 8).
 
 ## Done = every open box above checked, suite green, clippy clean, and this file's notes updated.

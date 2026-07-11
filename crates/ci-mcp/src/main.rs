@@ -1914,12 +1914,14 @@ fn resp(id: Value, result: Value) -> Value {
 /// two-tool facade is the whole surface: retrieval handlers (`retrieve_context`,
 /// `find_symbols`, `list_anchors`, `read_node`, `describe_architecture`) are reachable
 /// only through `inspect`'s mode dispatch, never by tool name.
-const TOOL_HANDLERS: &[(&str, fn(&mut Server, &Value) -> Result<String, String>)] = &[
+type ToolHandler = fn(&mut Server, &Value) -> Result<String, String>;
+
+const TOOL_HANDLERS: &[(&str, ToolHandler)] = &[
     ("apply_edits", |server, args| server.apply_edits(args)),
     ("inspect", |server, args| server.inspect(args)),
 ];
 
-fn tool_handler(name: &str) -> Option<fn(&mut Server, &Value) -> Result<String, String>> {
+fn tool_handler(name: &str) -> Option<ToolHandler> {
     TOOL_HANDLERS.iter().find(|(n, _)| *n == name).map(|(_, h)| *h)
 }
 

@@ -176,7 +176,6 @@ pub fn drifted_files(
 mod tests {
     use super::*;
     use std::fs;
-    use std::path::PathBuf;
 
     fn write(root: &Path, rel: &str, content: &str) {
         let p = root.join(rel);
@@ -290,6 +289,6 @@ mod tests {
 
         // The tmp file from the atomic write never lingers.
         store_fingerprint(&fp_path, 1, &fp).unwrap();
-        assert!(!PathBuf::from(fp_path.with_extension("json.tmp")).exists());
+        assert!(!fp_path.with_extension("json.tmp").exists());
     }
 }

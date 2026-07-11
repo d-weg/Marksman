@@ -370,15 +370,10 @@ impl LspClient {
                 self.quiescent = false;
                 self.fresh_demand = Some(Instant::now() + Duration::from_millis(2000));
                 self.status_since_demand = false;
-                loop {
-                    match self.rx.try_recv() {
-                        Ok(msg) => {
-                            self.observe(&msg);
-                            if msg.get("id").is_some() && msg.get("method").is_some() {
-                                self.reply_server_request(&msg)?;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(msg) = self.rx.try_recv() {
+                    self.observe(&msg);
+                    if msg.get("id").is_some() && msg.get("method").is_some() {
+                        self.reply_server_request(&msg)?;
                     }
                 }
             }

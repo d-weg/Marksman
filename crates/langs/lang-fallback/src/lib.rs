@@ -178,7 +178,7 @@ impl FallbackProvider {
         match self.lang {
             FbLang::Python => imports::collect_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
             FbLang::Java => imports::collect_java_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
-            FbLang::Php => imports::collect_php_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
+            FbLang::Php => imports::collect_php_imports(tree.root_node(), content.as_bytes(), &self.root, &mut edges),
             _ => imports::collect_js_imports(tree.root_node(), content.as_bytes(), rel, &self.root, &mut edges),
         }
         edges.sort();

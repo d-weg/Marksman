@@ -93,7 +93,7 @@ fn swift_build_diagnostics(
 /// `swiftc -typecheck`); bounding the COPY is the only safe lever.
 fn copy_package_tree(src: &Path, dst: &Path, target_dirs: Option<&[String]>) -> Result<()> {
     let under_target = |rel: &str| {
-        target_dirs.map_or(true, |dirs| {
+        target_dirs.is_none_or(|dirs| {
             dirs.iter().any(|d| d.is_empty() || rel == d || rel.starts_with(&format!("{d}/")))
         })
     };
