@@ -1,6 +1,42 @@
 # Implementation consolidation — spec for review
 
-**Status: DRAFT — nothing in this document is implemented. It is a design spec for review.**
+**Status: EXECUTED (2026-07-11, branch `consistency-audit` off `container-gate`) — all of
+P1–P13 landed, one proposal per commit, verified green.** The record:
+
+- **Soundness (P1–P4):** `run_gate_capped` + `silent_tool_failure_diag` + `Error::GateTimeout`
+  in ci-core; rust verdict timed/capped with timeout PROPAGATING past the ra fallback
+  (`Sandbox::output` deleted from the trait — an untimed gate is now unrepresentable, pinned
+  by a stub-sandbox unit test); java sidecar `recv_timeout` + kill-on-hang, mvn/gradle capped;
+  swift `describe`/`prime_index` through the sandbox, **G4 fail-closed** (a describe failure on
+  a real package refuses the edit; not cached, so a fixed toolchain recovers).
+- **Dedup (P5–P8):** `ci_core::discover_tool` (4 lookups); `ci_edit::LazyLsp` (the java/php/swift
+  LSP-rewrite half); `ci_edit::moves::dotted` — the generic dotted-name move engine, java/php as
+  `DottedSyntax`+`DottedLang` instances with every pinned span test passing unchanged; new
+  `ci-providers` crate hosting the one `make_provider` (the CLI gains the php/swift gated arms —
+  the F8 drift, closed). Recorded LEAVEs stand (provider lib.rs delegation, sidecar bins,
+  CI_TIMING).
+- **Consistency (P9–P12):** serverInfo `"marksman"`; all agent-facing text rewritten in
+  `inspect`-mode vocabulary; `MOVE_COVERAGE` for java/php/swift wired + pin test extended to
+  five languages; `CI_PARITY_REPO` override. **Bonus:** clippy is now 0-warning across
+  `--all-targets` (the tree never was; all 31 pre-existing findings fixed — type aliases,
+  `while let`, `repeat_n`, `is_none_or`, a dead recursion param).
+- **Docs (P13):** architecture.md crate table += the three rollout crates + ci-providers, Java
+  out of the ungated examples; provider-contract.md Tiers current, §8 present-tense, **new §9**
+  (sandbox seam + gate-timeout semantics); roadmap.md Batch 8 records the rollout.
+
+**Verification:** `cargo test --workspace` 257/257 · `cargo clippy --workspace --all-targets`
+0 warnings · conformance real-tool battery 6/6 (java/php×2/swift/ts-scip/ts-lsp-sweep) ·
+per-crate `#[ignore]` tiers: rust 18/18, java 10/10, php 6/6, swift 8/8 — **including all four
+`oci_*_without_host_tools` container e2es** (docker + images present on this host). Not run
+here (tools absent, tests self-skip loudly): mvn/gradle classpath derivation, host-jdtls and
+host-phpactor rename e2es — the container e2es exercise those renames in-image. Pre-existing
+failure, NOT from this branch (fails identically at base `5ba01dc`): ci-edit's two tsls-gate
+e2es false-clean after an npx cache refresh pulled a newer typescript-language-server —
+flagged as a follow-up task (gate-soundness class, tsls fallback tier).
+
+The original audit follows unchanged.
+
+---
 
 This document does for the implementation what `op-surface-consolidation-spec.md` did for the op
 surface and `test-surface-consolidation-spec.md` did for the tests: a full audit (three parallel
