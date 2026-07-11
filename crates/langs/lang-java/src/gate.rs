@@ -9,6 +9,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Arc};
+use std::time::Duration;
 
 use crate::jdtls;
 
@@ -74,7 +75,7 @@ impl JavacSidecar {
                 }
             }
         });
-        let (classpath, sourcepath) = derive_paths(root);
+        let (classpath, sourcepath) = derive_paths(root, sandbox);
         Ok(Self {
             child,
             stdin,
@@ -183,14 +184,19 @@ fn path_sep() -> &'static str {
 /// classpath. A failed derivation degrades HONESTLY: it warns, and dependency-typed code then
 /// carries unresolved-symbol errors in baseline and after alike — excused by the diff, never
 /// a false reject; the gate still catches everything the overlay itself breaks.
-pub(crate) fn derive_paths(root: &Path) -> (String, String) {
+///
+/// Derivation runs WHERE THE GATE RUNS (`sandbox`): under `CI_SANDBOX=oci` the image's
+/// mvn/gradle answer the probe and the derivation — never the host's, which may be a
+/// different toolchain than the verdict compiles with (producer-surface spec F2). An image
+/// without them degrades exactly like a host without them: the flat tier.
+pub(crate) fn derive_paths(root: &Path, sandbox: &dyn Sandbox) -> (String, String) {
     let sourcepath = source_roots(root)
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect::<Vec<_>>()
         .join(path_sep());
-    if root.join("pom.xml").is_file() && tool_present("mvn") {
-        match maven_classpath(root) {
+    if root.join("pom.xml").is_file() && tool_available(sandbox, "mvn") {
+        match maven_classpath(root, sandbox) {
             Some(cp) => return (cp, sourcepath),
             None => eprintln!(
                 "[lang-java] mvn dependency:build-classpath failed — gating with the flat \
@@ -199,9 +205,9 @@ pub(crate) fn derive_paths(root: &Path) -> (String, String) {
         }
     }
     if (root.join("build.gradle").is_file() || root.join("build.gradle.kts").is_file())
-        && tool_present("gradle")
+        && tool_available(sandbox, "gradle")
     {
-        match gradle_classpath(root) {
+        match gradle_classpath(root, sandbox) {
             Some(cp) => return (cp, sourcepath),
             None => eprintln!(
                 "[lang-java] gradle classpath derivation failed — gating with the flat \
@@ -212,22 +218,32 @@ pub(crate) fn derive_paths(root: &Path) -> (String, String) {
     (sourcepath.clone(), sourcepath)
 }
 
-fn tool_present(bin: &str) -> bool {
-    ci_core::probe_tool(Command::new(bin).arg("--version")).is_some()
+/// Is `bin` runnable in the environment the gate runs in? A `--version` probe THROUGH the
+/// sandbox — the image's PATH answers in a container, the host's otherwise (matching
+/// `probe_tool`'s behavior there, time-bounded either way).
+fn tool_available(sandbox: &dyn Sandbox, bin: &str) -> bool {
+    let mut cmd = Command::new(bin);
+    cmd.arg("--version");
+    sandbox
+        .run_capped(&mut cmd, Duration::from_secs(30), 64 * 1024)
+        .map(|o| !o.timed_out && o.status.is_some_and(|s| s.success()))
+        .unwrap_or(false)
 }
 
 /// `mvn dependency:build-classpath` writes the resolved dependency jars to a file — the one
 /// documented single-command derivation Maven has.
-pub(crate) fn maven_classpath(root: &Path) -> Option<String> {
+pub(crate) fn maven_classpath(root: &Path, sandbox: &dyn Sandbox) -> Option<String> {
+    // The output file lives under the system temp dir, which the OCI sandbox bind-mounts at the
+    // same path — mvn writes it in-container, this process reads it back on the host.
     let out = tempfile::NamedTempFile::new().ok()?;
-    let mut cmd = Command::new("mvn");
+    let mut cmd = ci_core::tool_command(sandbox, "mvn", || Ok(Command::new("mvn"))).ok()?;
     cmd.args(["-q", "-B", "dependency:build-classpath"])
         .arg(format!("-Dmdep.outputFile={}", out.path().display()))
         .current_dir(root);
     // Time-bounded: Maven resolving over a dead network can hang indefinitely. A timeout maps to
     // `None` — this is classpath DERIVATION, not the verdict, and `None`'s failure mode is the
     // documented honest degrade above (warn + dependency types read as baseline errors).
-    let run = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
+    let run = sandbox.run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
     if run.timed_out || !run.status.is_some_and(|s| s.success()) {
         return None;
     }
@@ -238,17 +254,17 @@ pub(crate) fn maven_classpath(root: &Path) -> Option<String> {
 /// Gradle has no single built-in equivalent; an injected init-script task printing the
 /// resolved runtime classpath (test scope preferred, mirroring Maven's default) is the
 /// standard one-command shape.
-pub(crate) fn gradle_classpath(root: &Path) -> Option<String> {
+pub(crate) fn gradle_classpath(root: &Path, sandbox: &dyn Sandbox) -> Option<String> {
     let init = tempfile::NamedTempFile::with_suffix(".gradle").ok()?;
     std::fs::write(
         init.path(),
         "allprojects { p ->\n  p.tasks.register('marksmanClasspath') {\n    doLast {\n      def c = p.configurations.findByName('testRuntimeClasspath') ?: p.configurations.findByName('runtimeClasspath') ?: p.configurations.findByName('compileClasspath')\n      if (c != null) { c.files.each { println it } }\n    }\n  }\n}\n",
     )
     .ok()?;
-    let mut cmd = Command::new("gradle");
+    let mut cmd = ci_core::tool_command(sandbox, "gradle", || Ok(Command::new("gradle"))).ok()?;
     cmd.args(["-q", "--init-script"]).arg(init.path()).arg("marksmanClasspath").current_dir(root);
     // Same discipline as maven_classpath: time-bounded, timeout ⇒ None (honest degrade).
-    let out = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
+    let out = sandbox.run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
     if out.timed_out || !out.status.is_some_and(|s| s.success()) {
         return None;
     }
@@ -338,13 +354,13 @@ mod tests {
     fn flat_classpath_prefers_conventional_source_roots() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let (cp, sp) = derive_paths(root);
+        let (cp, sp) = derive_paths(root, &ci_core::HostSandbox);
         assert_eq!(cp, root.to_string_lossy(), "flat layout: the repo root is the classpath");
         assert_eq!(cp, sp, "flat tier: classpath == sourcepath");
 
         std::fs::create_dir_all(root.join("src/main/java")).unwrap();
         std::fs::create_dir_all(root.join("src/test/java")).unwrap();
-        let (_, sp) = derive_paths(root);
+        let (_, sp) = derive_paths(root, &ci_core::HostSandbox);
         assert_eq!(
             sp,
             format!(

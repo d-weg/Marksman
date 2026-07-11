@@ -14,6 +14,10 @@ use std::process::Command;
 pub(crate) const SCIP_TS_VERSION: &str = "0.4.0";
 const TS_LSP_VERSION: &str = "5.3.0";
 const TYPESCRIPT_VERSION: &str = "6.0.3";
+/// `@typescript/native-preview` publishes DATED DEV BUILDS on a moving stream — the one TS
+/// tool that was still fetched unpinned (producer-surface spec F1). The pin is a dated build;
+/// bump deliberately. Local tsgo (`CI_TSGO` / PATH) is unconditional-trust and unaffected.
+const TSGO_VERSION: &str = "7.0.0-dev.20260707.2";
 
 /// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`. Shared with the
 /// ts-morph sidecar (`tsmorph.rs`) so both TS tooling paths use the same cache location.
@@ -135,7 +139,7 @@ pub(crate) fn tsgo_lsp_command() -> Command {
     let mut c = Command::new("npx");
     c.arg("--yes")
         .arg("-p")
-        .arg("@typescript/native-preview")
+        .arg(format!("@typescript/native-preview@{TSGO_VERSION}"))
         .args(["tsgo", "--lsp", "-stdio"])
         .env("npm_config_cache", npm_cache());
     c

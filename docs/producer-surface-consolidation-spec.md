@@ -1,6 +1,14 @@
 # Producer-surface consolidation — spec for review
 
-**Status: DRAFT — nothing in this document is implemented. It is a design spec for review.**
+**Status: EXECUTED (2026-07-11, branch `consistency-audit`) — P1–P3 landed, verified green.**
+P1: `TSGO_VERSION = "7.0.0-dev.20260707.2"` pins both npx tsgo paths (the forced tier and the
+lsp-sweep launcher); local `CI_TSGO`/PATH untouched. P2: `derive_paths(root, sandbox)` — the
+mvn/gradle presence probe (`tool_available`) and both derivations run through `tool_command` +
+`sandbox.run_capped`; host behavior identical, container mode now probes/derives in the image.
+P3: contract §10 (producers), the §5 deletion-convention clause, and the §3 honest-empty-graph
+sentence added. Verification: `lang-ts` + `lang-java` `#[ignore]` tiers 17/17 (incl. the OCI
+java e2e and the scip/tsgo/ts-morph paths), workspace 257/257, clippy 0 across all targets.
+LEAVEs recorded below stand.
 
 The per-language inconsistency audit (follow-up to `implementation-consolidation-spec.md`,
 whose scope was the gate/edit surface) inventoried the READ-ARTIFACT side: what produces each

@@ -623,7 +623,7 @@ mod tests {
             "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>t</groupId>\n  <artifactId>t</artifactId>\n  <version>0</version>\n</project>\n",
         )]);
         assert!(
-            gate::maven_classpath(dir.path()).is_some(),
+            gate::maven_classpath(dir.path(), &ci_core::HostSandbox).is_some(),
             "mvn present + pom.xml => the build tool answers the classpath question"
         );
     }
@@ -638,7 +638,7 @@ mod tests {
         }
         let dir = write_repo(&[("build.gradle", "plugins { id 'java' }\n")]);
         assert!(
-            gate::gradle_classpath(dir.path()).is_some(),
+            gate::gradle_classpath(dir.path(), &ci_core::HostSandbox).is_some(),
             "gradle present + build.gradle => the init-script task answers the classpath question"
         );
     }

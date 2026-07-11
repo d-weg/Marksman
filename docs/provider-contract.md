@@ -53,7 +53,9 @@ language without a usable checker stays ungated — honestly.
 - Keys and edges are repo-relative paths; the graph is deterministic.
 - Edges are the language's REAL dependency edges or nothing: a language without a resolver
   returns an **empty** graph — an invented edge is worse than none (it feeds delete-safety and
-  the blast radius).
+  the blast radius). An honestly-empty graph is legitimate per language (Swift by module
+  design; Go/Ruby/C/C++ until a resolver lands) — its consequence is that the gate's radius is
+  exactly the edited files, and the tier's reply wording must not claim wider verification.
 - **A syntactic graph must be served to the edit gate transitively**
   (`ci_core::transitive_reverse_imports`): syntactic edges do not flatten re-exports, so a
   one-hop radius lets a barrel hide its consumers — measured as a false "clean"
@@ -84,6 +86,13 @@ language without a usable checker stays ungated — honestly.
 - The blast radius is sound for the graph being used (clause 3). Files a batch *creates* are
   materialized transiently for the check — a didOpen overlay at a not-on-disk path is
   invisible to a language server's project assignment.
+- **The deletion convention**: an EMPTY buffer in the gate's `files` set is a deletion
+  stand-in, and every materialization strategy must make that file *absent to the checker* so
+  a surviving consumer's reference is the introduced break the gate catches. The four current
+  spellings, each forced by its tool: rust never re-creates it during in-place staging; php
+  withholds it from the analysis mirror; swift removes it from the package mirror; java's
+  sidecar keeps it as an empty valid unit (javac's equivalent of absent). A new gate picks
+  whichever spelling its tool forces — the convention itself is not optional.
 - A rejection is **self-sufficient**: every new diagnostic carries the offending site's
   current source and, where derivable, a ready-to-copy `fix:` action anchored to the
   *post-edit* symbol. A response that tells the agent to "check it yourself" or re-derive
@@ -164,6 +173,27 @@ uses, string/comment masking).
 - Non-verdict derivations (java's mvn/gradle classpath) may degrade honestly on
   timeout/failure — warn and fall back to the documented weaker behavior — because their
   failure mode is baseline-excused errors, not a false clean.
+
+## 10. Read-artifact producers
+
+An external tool that emits a read artifact consumed at open time (`scip-typescript`,
+`rust-analyzer scip`) is a **producer**. Producers are adopted only at the rollout ladder's
+maturity step — where their semantic edges are measured load-bearing (barrels, bare
+specifiers, large-repo radius) — never as a new language's entry requirement. A producer
+must:
+
+- **Pin its version, and the pin participates in the source fingerprint** — bumping the tool
+  reindexes on the next open; a stale artifact is never served under a new tool, and an
+  unpinned fetch is the drift class that has twice changed behavior with no code change
+  (`SCIP_TS_VERSION` is the reference shape).
+- **Cache under `.marksman/`** with staleness decided by `ci_core::fingerprint` (content
+  hashes, never mtimes). Doubt = reindex, never a stale read.
+- **Serialize shared staging**: concurrent instances sharing an install cache (npx) hold the
+  advisory lock (`NpxCacheLock` is the reference shape) so a racing install can't corrupt the
+  producer out from under another process.
+- **Keep stdout clean**: a producer's output stream must never reach the MCP/JSON-RPC channel.
+- Fail LOUDLY: a producer that can't run disables its artifact path with an actionable
+  message (contract §6) — it never silently serves the previous artifact as if fresh.
 
 ## Adding a language (checklist)
 
