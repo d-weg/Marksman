@@ -29,6 +29,11 @@ mod gate;
 mod jdtls;
 mod movefix;
 
+/// What a bare `move_file` covers for Java — composed into the `apply_edits` description by
+/// ci-mcp, so the completeness claim the agent reads lives NEXT TO the code that makes it true
+/// (movefix + jdtls + the javac gate). Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "the `package` declaration rewritten and every importer's `import`/fully-qualified reference retargeted (jdtls-native when available, syntactic fallback otherwise)";
+
 /// The gated Java provider. `gated()` is `true` because construction goes through the
 /// registry's javac check ([`gate_missing`]) — a missing JDK disables the language with the
 /// install hint (`ProviderBuild::Unavailable`), it never ships an ungated Java silently.

@@ -28,6 +28,11 @@ mod gate;
 mod movefix;
 mod phpactor;
 
+/// What a bare `move_file` covers for PHP — composed into the `apply_edits` description by
+/// ci-mcp, so the completeness claim the agent reads lives NEXT TO the code that makes it true
+/// (movefix + phpactor + the PHPStan gate). Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "the `namespace` declaration rewritten and every `use`/fully-qualified reference retargeted (phpactor-native when available, syntactic fallback otherwise)";
+
 /// The gated PHP provider. `gated()` is `true` because construction goes through the registry's
 /// PHPStan check ([`gate_missing`]) — a missing php/phpstan disables the language with the
 /// install hint (`ProviderBuild::Unavailable`), it never ships an ungated PHP silently.

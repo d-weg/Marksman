@@ -35,6 +35,11 @@ mod gate;
 mod movefix;
 mod sourcekit;
 
+/// What a bare `move_file` covers for Swift — composed into the `apply_edits` description by
+/// ci-mcp, so the completeness claim the agent reads lives NEXT TO the code that makes it true
+/// (movefix + the `swift build` gate). Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "within a target no reference rewrites are needed (imports are module-level); a cross-target move updates Package.swift membership, and the `swift build` gate judges the result";
+
 /// The gated Swift provider. `gated()` is `true` because construction goes through the registry's
 /// `swift` check ([`gate_missing`]) — a missing Swift toolchain disables the language with the
 /// install hint (`ProviderBuild::Unavailable`), it never ships an ungated Swift silently.
