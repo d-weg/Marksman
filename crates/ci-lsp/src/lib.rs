@@ -162,6 +162,16 @@ impl LspClient {
         if std::env::var("CI_TIMING").is_ok() {
             eprintln!("[timing]   lsp initialize {:?}", t_init.elapsed());
         }
+        // A failed initialize MUST be loud. Treating it as "server up, no capabilities" lets a
+        // server that errored-and-exited (observed: typescript-language-server ≥5.2 without a
+        // workspace `typescript` install replies with an initialize ERROR then exits) fall to
+        // the push-diagnostics path, where a dead server publishes nothing and silence reads as
+        // clean — a FALSE CLEAN through the gate, the exact degrade the house rules forbid.
+        if let Some(err) = resp.get("error") {
+            return Err(Error::Driver(format!(
+                "lsp initialize failed — the gate cannot run: {err}"
+            )));
+        }
         client.pull_diagnostics = resp
             .pointer("/result/capabilities/diagnosticProvider")
             .map(|v| !v.is_null())
@@ -708,9 +718,12 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/a.ts"), "export const x: number = 1;\n").unwrap();
 
-        // The provider supplies the server command; this crate stays generic.
+        // The provider supplies the server command; this crate stays generic. Versions pinned to
+        // lang-ts's production tier (engine.rs TS_LSP_VERSION/TYPESCRIPT_VERSION): an unpinned
+        // `typescript` resolves to the 7.x Go line, which ships no tsserver — tsls then errors
+        // at initialize and exits (the false-clean this crate's initialize check now catches).
         let mut cmd = Command::new("npx");
-        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
+        cmd.args(["--yes", "-p", "typescript-language-server@5.3.0", "-p", "typescript@6.0.3", "typescript-language-server", "--stdio"])
             .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
         let mut lsp = LspClient::start(root, cmd).expect("start tsls");
 

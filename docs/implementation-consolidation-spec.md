@@ -29,10 +29,15 @@ P1–P13 landed, one proposal per commit, verified green.** The record:
 per-crate `#[ignore]` tiers: rust 18/18, java 10/10, php 6/6, swift 8/8 — **including all four
 `oci_*_without_host_tools` container e2es** (docker + images present on this host). Not run
 here (tools absent, tests self-skip loudly): mvn/gradle classpath derivation, host-jdtls and
-host-phpactor rename e2es — the container e2es exercise those renames in-image. Pre-existing
-failure, NOT from this branch (fails identically at base `5ba01dc`): ci-edit's two tsls-gate
-e2es false-clean after an npx cache refresh pulled a newer typescript-language-server —
-flagged as a follow-up task (gate-soundness class, tsls fallback tier).
+host-phpactor rename e2es — the container e2es exercise those renames in-image. The one pre-existing
+failure found during verification (failed identically at base `5ba01dc`) was ROOT-CAUSED and
+FIXED in the follow-up commit: the tsls-gate e2es false-cleaned because (a) npm's `typescript`
+latest is now the 7.x Go line, which ships no tsserver, so tsls errors at `initialize` and
+exits, and (b) `LspClient::start_in` never checked the initialize response for an error — the
+dead server's silence read as clean through the push-diagnostics path. Fixed both ways: a
+failed initialize is now a loud `Err` in ci-lsp (the soundness half — production was already
+version-pinned and unaffected), and the two test launchers pin the same tsls/typescript pair
+as lang-ts's production tier. All three e2es green after the fix; workspace 257/257, clippy 0.
 
 The original audit follows unchanged.
 

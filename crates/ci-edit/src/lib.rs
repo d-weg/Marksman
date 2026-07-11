@@ -1315,8 +1315,12 @@ mod tests {
     static TSLS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn start_tsls(root: &Path) -> ci_lsp::LspClient {
         let _serialize = TSLS_START.lock().unwrap();
+        // Versions pinned to lang-ts's production tier (engine.rs TS_LSP_VERSION/
+        // TYPESCRIPT_VERSION): an unpinned `typescript` resolves to the 7.x Go line, which
+        // ships no tsserver — tsls then errors at initialize and exits (the false-clean
+        // ci-lsp's initialize check now catches).
         let mut cmd = std::process::Command::new("npx");
-        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
+        cmd.args(["--yes", "-p", "typescript-language-server@5.3.0", "-p", "typescript@6.0.3", "typescript-language-server", "--stdio"])
             .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
         ci_lsp::LspClient::start(root, cmd).expect("start tsls")
     }
