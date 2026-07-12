@@ -58,6 +58,11 @@ languages your repo actually contains.
 to install anything missing. A missing toolchain disables just that language, actionably — never
 a silent half-degrade.
 
+> **Don't want to install language toolchains?** [Container mode](#container-mode-optional)
+> runs a language's whole toolchain (gate, rename engine — and for TypeScript, the indexer
+> too) from a per-language OCI image at pinned versions: one container runtime instead of N
+> toolchains, and the verdict can't drift with whatever's on the host.
+
 ### 1. Build
 ```bash
 git clone https://github.com/d-weg/Marksman.git
@@ -109,6 +114,37 @@ To keep it elsewhere, point `CI_MODEL_DIR` at that directory (in the shell for `
 the MCP server's `env` block). `CI_NO_MODEL_FETCH=1` disables the auto-download.
 </details>
 
+## Container mode (optional)
+
+Instead of installing each language's toolchain, run it from a per-language OCI image —
+**one container runtime instead of N toolchains, at pinned versions** (a host toolchain
+upgrade can never silently change a verdict). All five gated languages are covered:
+`marksman-ts` also runs the **indexer** (scip-typescript) in-container, so TypeScript needs
+no host Node at all.
+
+```bash
+# 1. Build the image(s) for the languages you want — images are built locally, never pulled:
+docker build -f docker/marksman-ts.Dockerfile    -t marksman-ts    docker/
+docker build -f docker/marksman-rust.Dockerfile  -t marksman-rust  docker/
+docker build -f docker/marksman-java.Dockerfile  -t marksman-java  docker/
+docker build -f docker/marksman-php.Dockerfile   -t marksman-php   docker/
+docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/
+
+# 2. Opt in (per run, or in the MCP server's env block):
+CI_SANDBOX=oci marksman-mcp --root /path/to/repo
+```
+
+How it behaves — see [docker/README.md](docker/README.md) for details:
+- **Opt-in and loud.** Without `CI_SANDBOX=oci`, nothing changes (the host path is
+  byte-identical). With it, a missing runtime warns and stays on the host at startup; a
+  missing *image* errors loudly at the first operation — never a silent fallback to a
+  different toolchain mid-session.
+- **Runtime-generic.** The first of `container` (Apple), `docker`, `podman`, `nerdctl` found
+  on PATH is used; `CI_SANDBOX_RUNTIME` picks one explicitly.
+- One warm container per language, started lazily, reused across edits, removed on exit. The
+  repo and the system temp dir are bind-mounted at their host paths, so nothing about your
+  files changes.
+
 ## CLI
 
 ```
@@ -133,6 +169,9 @@ Environment variables:
 | `CI_TSGO` | path to a `tsgo` binary (TS7 native) — enables the fastest gate tier and the `CI_TS_MODE=lsp` sweep without npx | unset (PATH is probed) |
 | `CI_TS_LSP_SERVER` | full command line for an alternative TS LSP server on the `lsp` tier (whitespace-split) | unset |
 | `CI_PROVIDER` | `sidecar` runs the language provider as a separate process over a protobuf wire (`marksman-provider-<lang>`); unset = in-process | in-process |
+| `CI_SANDBOX` | `oci` runs each language's toolchain in its `marksman-<lang>` container ([Container mode](#container-mode-optional)); unset = host toolchains | host |
+| `CI_SANDBOX_RUNTIME` | the OCI runtime CLI to drive (name or absolute path) | first of `container`/`docker`/`podman`/`nerdctl` on PATH |
+| `CI_GATE_TIMEOUT_SECS` | wall-clock ceiling for a gate verdict tool; a timeout REFUSES the edit (never passes, never downgrades the gate) | `600` |
 | `CI_TS_MODE` | benchmark-reproduction knob only (read-path ablation arms + the `lsp` sweep producer; docs/benchmarks.md §2/§6) — not a supported configuration | `full` |
 | `CI_SCIP_<LANG>` | overrides the `scip.<lang>` config setting (`1`=on, `0`=off). **Rust defaults ON**: the compiler-accurate `use` graph is generated on first open / refreshed at `index` when stale (≈ a `cargo check`), content-fingerprinted, with drifted files served fresh tree-sitter edges; `CI_SCIP_RUST=0` opts out | rust: on · others: the `scip.<lang>` config value |
 | `MARKSMAN_ROOT` | repo root for the MCP server (legacy `CODEINDEX_ROOT` still honored) | current directory |

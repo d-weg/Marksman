@@ -26,6 +26,11 @@
 `marksman doctor <repo>` reports what a Swift package needs and what's present. sourcekit-lsp is
 SwiftPM-only (no Xcode project support).
 
+**No host Swift toolchain? Use [container mode](../../docker/README.md)**: the `marksman-swift`
+image (~2.5GB — the compiler is the size) ships the `swift build` gate and sourcekit-lsp
+(`docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/`, then
+`CI_SANDBOX=oci`) — shipped and e2e-verified ([container-gate spec](../container-gate-spec.md)).
+
 ## Known gaps
 
 - Cross-**target** moves (touching `Package.swift` membership) are not handled by the syntactic

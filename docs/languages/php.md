@@ -32,8 +32,10 @@
 
 - **Rename hard-requires phpactor** — no syntactic rename fallback yet; the gated `replace_text`
   path (surfaced in the reject) is the workaround, and it works well because the PHPStan gate
-  validates it. The [containerized-gate spec](../container-gate-spec.md) would ship phpactor in an
-  image.
+  validates it. **No host phpactor? Use [container mode](../../docker/README.md)**: the
+  `marksman-php` image ships phpstan AND phpactor (`docker build -f docker/marksman-php.Dockerfile
+  -t marksman-php docker/`, then `CI_SANDBOX=oci`) — shipped and e2e-verified
+  ([container-gate spec](../container-gate-spec.md)).
 
 ## Recent fix
 

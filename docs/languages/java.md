@@ -31,10 +31,11 @@
 ## Known gaps
 
 - **Rename hard-requires jdtls** — there is no syntactic rename fallback yet; the gated
-  `replace_text` path (surfaced in the reject) is the workaround. The
-  [containerized-gate spec](../container-gate-spec.md) would ship jdtls in an image so rename
-  works with no host install; a compiler-gated syntactic rename is the alternative under
-  consideration.
+  `replace_text` path (surfaced in the reject) is the workaround. **No host jdtls? Use
+  [container mode](../../docker/README.md)**: the `marksman-java` image ships the JDK gate AND
+  jdtls, so rename works with no host install (`docker build -f docker/marksman-java.Dockerfile
+  -t marksman-java docker/`, then `CI_SANDBOX=oci`) — shipped and e2e-verified
+  ([container-gate spec](../container-gate-spec.md)).
 - Symbol resolution has two papercuts that cost a round-trip: `"'DocEntry' is ambiguous (2
   definitions)"` (a class vs its same-named constructor) and `"symbol not found — pass a path"`
   for a bare qualified method name.
