@@ -1,25 +1,31 @@
 # Containerized gate — spec for review
 
-**Status: IMPLEMENTED M1–M2.4 (2026-07-09, branch `container-gate`).** Motivated by the
+**Status: IMPLEMENTED M1–M2.4 (2026-07-09, branch `container-gate`) + M6 TS
+(2026-07-11, branch `consistency-audit`): the fifth gated language containerized, incl. its
+scip-typescript INDEXER — e2e `oci_ts_index_gate_and_rename_without_host_tools` green (index +
+gate reject + cross-file rename in-container, no host Node), host tiers unchanged 8/8.**
+Motivated by the
 java/php/swift bench review ([the lang-suite run](benchmarks.md) surfaced that the worst cells
 were toolchain *availability*, not logic: java rename fell back to fully manual editing because
 jdtls was absent). Run a language's gate/rename toolchain inside a sandboxed root filesystem, so a
 device needs a container runtime instead of N language toolchains, with the verdict pinned to a
 known toolchain version. Opt-in via `CI_SANDBOX=oci`; the host path is byte-identical otherwise.
 
-**Coverage — all four gated languages have an image + run their toolchain in-container:**
+**Coverage — all five gated languages have an image + run their toolchain in-container:**
 | lang | image | gate in-container | rename in-container | notes |
 |---|---|:--:|:--:|---|
 | java | `marksman-java` (905MB) | ✅ javac sidecar | ✅ jdtls | needed a jdtls readiness fix (done) |
 | php | `marksman-php` (~450MB) | ✅ phpstan (tree gate) | ✅ phpactor | full, first try |
 | rust | `marksman-rust` | ✅ cargo check | ✅ rust-analyzer | full — serverStatus already waited on |
 | swift | `marksman-swift` (~2.5GB) | ✅ swift build | ✅ sourcekit | full — needed `--experimental-feature background-indexing` + a `$/progress` index-settle wait (containerized-only) |
+| ts (M6) | `marksman-ts` | ✅ tsgo | ✅ tsgo | **also the INDEXER**: scip-typescript in-image — TS is the one language whose READ path needs the toolchain, so the image serves indexing too (contract §10 producer, pinned versions matching `engine.rs`). Container gate tier = tsgo only (the ladder's lower rungs don't transplant: ts-morph npm-installs at runtime, tsls can't resolve a global typescript) — which is also the fastest tier |
 
 Adding a language is now **plug-and-play**: an image + declaring the tool via `ci_core::tool_command`
 (the single host-vs-container resolver) + `resolve_sandbox(root, "marksman-<lang>")`. No per-launcher
-`if containerized` branches — that choice lives in one place. Measured perf (§7): mount I/O is a
-non-issue (+7%). Deferred: TS (Node toolchain, not a single LSP), the pure-Rust youki `libcontainer`
-backend (M5), and image slimming.
+`if containerized` branches — that choice lives in one place (TS's tsgo-only ladder collapse and
+swift's background-indexing flag are the two documented exceptions). Measured perf (§7): mount I/O
+is a non-issue (+7%). Deferred: the pure-Rust youki `libcontainer` backend (M5), image slimming,
+and the `CI_TS_MODE=lsp` sweep arm (host-only comparison arm).
 
 ## Terms
 

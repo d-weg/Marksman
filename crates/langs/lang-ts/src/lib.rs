@@ -9,7 +9,7 @@ use ci_core::{
 use ci_edit::Composed;
 use ci_scip::ScipIndex;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 
 mod ablation;
@@ -173,9 +173,10 @@ fn file_summary(root: &Path, rel: &str) -> FileSummary {
 }
 
 /// Builds the write engine (lazily in `apply_edits`, or via the prewarmer): the selection
-/// ladder in `engine.rs` (tsgo → ts-morph → tsls), with its toolchain-aware error.
-fn engine_factory() -> ci_edit::EngineFactory {
-    Arc::new(|root: &Path| start_engine(root))
+/// ladder in `engine.rs` (tsgo → ts-morph → tsls on the host; tsgo from the image in a
+/// container), with its toolchain-aware error.
+fn engine_factory(sandbox: Arc<dyn ci_core::Sandbox>) -> ci_edit::EngineFactory {
+    Arc::new(move |root: &Path| start_engine(root, &sandbox))
 }
 
 impl TsProvider {
@@ -186,12 +187,17 @@ impl TsProvider {
     /// (no fingerprint, unreadable index) reindexes — a stale load is a correctness bug, a
     /// spurious reindex only a slow start.
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_in(root, ci_core::resolve_sandbox(root, "marksman-ts"))
+    }
+
+    /// [`open`] with an explicit sandbox — the seam the OCI e2e drives directly.
+    fn open_in(root: &Path, sandbox: Arc<dyn ci_core::Sandbox>) -> Result<Self> {
         let out = root.join(".marksman").join("index.scip");
         let current = source_fingerprint(root);
         if out.exists() {
             match load_fingerprint(&fingerprint_path(root)) {
                 Some(stored) => match fingerprint_drift(root, &stored, &current) {
-                    None => match Self::from_index(root, &out) {
+                    None => match Self::from_index_in(root, &out, sandbox.clone()) {
                         Ok(p) => {
                             eprintln!("[lang-ts] loaded cached {} (source unchanged)", out.display());
                             return Ok(p);
@@ -203,43 +209,56 @@ impl TsProvider {
                 None => eprintln!("[lang-ts] no fingerprint for existing index.scip; reindexing"),
             }
         }
-        Self::index_with(root, current)
+        Self::index_with(root, current, sandbox)
     }
 
     /// Index `root` with scip-typescript (`npx @sourcegraph/scip-typescript`), then load it.
     /// Always reindexes; `open` is the cached path.
     pub fn index(root: &Path) -> Result<Self> {
-        Self::index_with(root, source_fingerprint(root))
+        Self::index_with(root, source_fingerprint(root), ci_core::resolve_sandbox(root, "marksman-ts"))
     }
 
     /// The fingerprint is computed by the caller BEFORE scip runs: if a file changes while the
     /// indexer is running, the stored fingerprint reflects the pre-change bytes, so the next
     /// `open` sees a mismatch and reindexes (conservative), rather than blessing an index that
     /// missed the mid-run edit.
-    fn index_with(root: &Path, fp: Fingerprint) -> Result<Self> {
+    fn index_with(root: &Path, fp: Fingerprint, sandbox: Arc<dyn ci_core::Sandbox>) -> Result<Self> {
         let out = root.join(".marksman").join("index.scip");
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // Serialize the npx invocation against other MCP instances sharing this npm cache, so a
-        // concurrent `npx` staging can't corrupt the scip-typescript install out from under us.
-        let _cache_lock = NpxCacheLock::acquire();
-        let status = Command::new("npx")
-            .arg("--yes")
-            .arg(format!("@sourcegraph/scip-typescript@{SCIP_TS_VERSION}"))
-            .args(["index", "--infer-tsconfig", "--no-progress-bar", "--output"])
-            .arg(&out)
-            .current_dir(root)
-            .env("npm_config_cache", npm_cache())
-            // Discard the indexer's stdout — it must never pollute an MCP/JSON-RPC stream.
-            .stdout(Stdio::null())
-            .status()
-            .map_err(|e| Error::Driver(format!("launching scip-typescript via npx failed: {e}")))?;
+        // The PRODUCER runs where the toolchain runs (contract §10): bare `scip-typescript` on
+        // the image's PATH in a container (the artifact lands under .marksman/, which the
+        // sandbox bind-mounts at the same path), the pinned npx staging on the host. The npx
+        // cache lock serializes HOST staging only — a container needs no staging.
+        let mut cmd = ci_core::tool_command(&*sandbox, "scip-typescript", || {
+            let mut c = Command::new("npx");
+            c.arg("--yes")
+                .arg(format!("@sourcegraph/scip-typescript@{SCIP_TS_VERSION}"))
+                .env("npm_config_cache", npm_cache());
+            Ok(c)
+        })?;
+        cmd.args(["index", "--infer-tsconfig", "--no-progress-bar", "--output"]).arg(&out).current_dir(root);
+        let _cache_lock = if sandbox.containerized() { None } else { NpxCacheLock::acquire() };
+        // Capped + time-bounded (and stdout captured, never near the JSON-RPC stream). The
+        // gate timeout is generous; a producer that outlives it fails LOUDLY (§10) — the next
+        // open reindexes, nothing stale is served.
+        let run = sandbox
+            .run_capped(&mut cmd, ci_core::gate_timeout(), ci_core::GATE_OUTPUT_CAP)
+            .map_err(|e| Error::Driver(format!("launching scip-typescript failed: {e}")))?;
         drop(_cache_lock);
-        if !status.success() {
-            return Err(Error::Driver(format!("scip-typescript index failed ({status})")));
+        if run.timed_out {
+            return Err(Error::Driver(format!(
+                "scip-typescript index exceeded the timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher for this repo",
+                ci_core::gate_timeout().as_secs()
+            )));
         }
-        let provider = Self::from_index(root, &out)?;
+        if !run.status.is_some_and(|st| st.success()) {
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            let first = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("no error output");
+            return Err(Error::Driver(format!("scip-typescript index failed: {first}")));
+        }
+        let provider = Self::from_index_in(root, &out, sandbox)?;
         // Augment with files scip indexed that the walk can't see (gitignored/hidden sources a
         // tsconfig still includes) so their edits invalidate the cache too. Hashed AFTER the
         // run, so the conservative pre-run guarantee narrows to just these hidden files.
@@ -270,7 +289,11 @@ impl TsProvider {
 
     /// Load a provider from an existing `index.scip` (skip running the indexer).
     pub fn from_index(root: &Path, index_scip: &Path) -> Result<Self> {
-        Ok(Self::assemble(root, Arc::new(ScipIndex::load(index_scip)?), engine_factory()))
+        Self::from_index_in(root, index_scip, ci_core::resolve_sandbox(root, "marksman-ts"))
+    }
+
+    fn from_index_in(root: &Path, index_scip: &Path, sandbox: Arc<dyn ci_core::Sandbox>) -> Result<Self> {
+        Ok(Self::assemble(root, Arc::new(ScipIndex::load(index_scip)?), engine_factory(sandbox)))
     }
 
     /// Wire the halves: the read index advertises its properties (artifact, semantic
@@ -506,6 +529,56 @@ mod tests {
         .unwrap();
         let refreshed = TsProvider::open(root).expect("open after edit reindexes");
         assert!(refreshed.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.name.as_deref() == Some("sub")));
+    }
+
+    // M6 (docs/container-gate-spec.md): the WHOLE TypeScript toolchain from the `marksman-ts`
+    // image — indexing (scip-typescript, the producer), the gate verdict, and the cross-file
+    // rename (both tsgo) all run in-container, so this passes with NO host Node. TS is the
+    // only language whose READ path needs the toolchain, which is why this e2e also asserts
+    // the index. Requires docker (or another OCI runtime) up AND the ts image:
+    //   docker build -f docker/marksman-ts.Dockerfile -t marksman-ts docker/
+    #[test]
+    #[ignore]
+    fn oci_ts_index_gate_and_rename_without_host_tools() {
+        let Some(runtime) = ci_core::oci_runtime() else {
+            eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true},"include":["src"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/math.ts"), "export function add(a: number, b: number): number {\n  return a + b;\n}\n").unwrap();
+        fs::write(root.join("src/app.ts"), "import { add } from \"./math\";\nexport const r = add(1, 2);\n").unwrap();
+
+        let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
+            root.to_path_buf(),
+            runtime,
+            "marksman-ts".into(),
+        ));
+        // Index in-container: the image's scip-typescript writes .marksman/index.scip through
+        // the identical-path mount.
+        let p = TsProvider::open_in(root, sandbox).expect("in-container scip-typescript indexing");
+        assert!(p.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.id == "src/math.ts#add"));
+        let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
+
+        // Type-breaking edit -> REJECTED by the container's tsgo gate.
+        let bad = p
+            .apply_edits(&[EditOp::SetBody { node_id: "src/math.ts#add".into(), body: "{\n  \"nope\"\n}".into() }], &opts)
+            .unwrap();
+        assert!(matches!(bad, CommitResult::Rejected { .. }), "type error must reject: {bad:?}");
+
+        // Cross-file rename -> both files rewritten by the container's tsgo.
+        let ok = p
+            .apply_edits(&[EditOp::Rename { node_id: "src/math.ts#add".into(), new_name: "sum".into() }], &opts)
+            .unwrap();
+        assert!(matches!(ok, CommitResult::Ok { .. }), "rename commits: {ok:?}");
+        assert!(fs::read_to_string(root.join("src/app.ts")).unwrap().contains("sum(1, 2)"), "caller renamed");
+        assert!(!fs::read_to_string(root.join("src/math.ts")).unwrap().contains("add"), "definition renamed");
     }
 
     // The treesitter-gated ablation provider: no scip anywhere, tree-sitter reads, and the

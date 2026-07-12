@@ -77,7 +77,21 @@ impl Drop for NpxCacheLock {
 /// auto-picked only when it needs NO network (`CI_TSGO`, or `tsgo` on PATH) — a surprise npx
 /// download doesn't belong in the middle of someone's first edit. `CI_EDIT_ENGINE` forces one
 /// tier: `tsgo` | `tsmorph` | `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names).
-pub(crate) fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
+///
+/// In a CONTAINER (`CI_SANDBOX=oci` + the `marksman-ts` image) the tier is tsgo, period: the
+/// image bakes it at a pinned version, and the ladder's lower rungs don't transplant —
+/// ts-morph stages an npm install at runtime (defeating the pinned image), and tsls can't
+/// resolve a global typescript install. tsgo is also the fastest tier, so the container gets
+/// the best engine by construction, resolved by bare name on the image's PATH.
+pub(crate) fn start_engine(
+    root: &Path,
+    sandbox: &std::sync::Arc<dyn ci_core::Sandbox>,
+) -> Result<Box<dyn GateEngine + Send>> {
+    if sandbox.containerized() {
+        let mut c = Command::new("tsgo");
+        c.args(["--lsp", "-stdio"]);
+        return Ok(Box::new(ci_lsp::LspClient::start_in(root, c, &**sandbox)?));
+    }
     let pref = std::env::var("CI_EDIT_ENGINE").unwrap_or_default();
     match pref.as_str() {
         "tsgo" => return Ok(Box::new(ci_lsp::LspClient::start(root, tsgo_lsp_command())?)),
