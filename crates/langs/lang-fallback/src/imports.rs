@@ -180,7 +180,7 @@ pub(crate) fn collect_java_imports(node: TsNode, bytes: &[u8], from_rel: &str, r
 /// per contract §3 — a `use` whose FQCN no PSR-4 prefix claims (a vendor/global class), or a
 /// repo with NO composer.json, contributes NO edge (an invented edge is worse than none).
 /// Grouped uses (`use App\{Foo, Bar};`) expand to one edge per member.
-pub(crate) fn collect_php_imports(node: TsNode, bytes: &[u8], from_rel: &str, root: &Path, out: &mut Vec<PathBuf>) {
+pub(crate) fn collect_php_imports(node: TsNode, bytes: &[u8], root: &Path, out: &mut Vec<PathBuf>) {
     if node.kind() == "namespace_use_declaration" {
         for fqcn in use_clause_fqcns(&node, bytes) {
             if let Some(p) = resolve_use(root, &fqcn) {
@@ -190,7 +190,7 @@ pub(crate) fn collect_php_imports(node: TsNode, bytes: &[u8], from_rel: &str, ro
     }
     let mut c = node.walk();
     for ch in node.named_children(&mut c) {
-        collect_php_imports(ch, bytes, from_rel, root, out);
+        collect_php_imports(ch, bytes, root, out);
     }
 }
 
@@ -269,7 +269,7 @@ pub fn psr4_map(root: &Path) -> Vec<(String, Vec<String>)> {
         }
     }
     // Longest prefix first: a more-specific mapping wins over a broader one.
-    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
     out
 }
 

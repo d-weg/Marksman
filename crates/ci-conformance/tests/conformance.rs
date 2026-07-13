@@ -7,7 +7,10 @@ use ci_core::LanguageProvider;
 use lang_fallback::{FallbackProvider, FbLang};
 use std::path::Path;
 
-fn fallback(lang: FbLang) -> Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> {
+/// A provider constructor for one battery instance: repo root -> boxed provider.
+type MkProvider = Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>>;
+
+fn fallback(lang: FbLang) -> MkProvider {
     Box::new(move |root| Box::new(FallbackProvider::new(root, lang)))
 }
 
@@ -89,7 +92,7 @@ fn conformance_js() {
 fn conformance_ts_fallback() {
     // The ablation read path (CI_TS_MODE=treesitter-gated reads through this) — NOT the
     // product TS provider; that one is `conformance_ts_scip` in the real-tool tier.
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> =
+    let mk: MkProvider =
         Box::new(|root| Box::new(FallbackProvider::new(root, FbLang::Ts)));
     run_read_battery(
         &mk,
@@ -288,7 +291,7 @@ fn conformance_swift() {
 // the reject under test is the GATE channel, not the parser.
 #[test]
 fn conformance_php_gated_mock() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+    let mk: MkProvider = Box::new(|root| {
         Box::new(lang_php::PhpProvider::with_factory(root, lang_template::mock::factory()))
     });
     run_read_battery(
@@ -344,7 +347,7 @@ fn conformance_php_phpstan() {
         eprintln!("SKIP: php/phpstan not installed — `composer require --dev phpstan/phpstan`");
         return;
     }
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> =
+    let mk: MkProvider =
         Box::new(|root| Box::new(lang_php::PhpProvider::new(root)));
     run_read_battery(
         &mk,
@@ -555,7 +558,7 @@ fn conformance_cpp() {
 
 #[test]
 fn conformance_rust_reads() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> =
+    let mk: MkProvider =
         Box::new(|root| Box::new(lang_rust::RustProvider::new(root)));
     run_read_battery(
         &mk,
@@ -584,7 +587,7 @@ fn conformance_rust_reads() {
 // what its checker flags — before the real checker is wired in.
 #[test]
 fn conformance_template() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+    let mk: MkProvider = Box::new(|root| {
         Box::new(lang_template::GatedTreeSitter::new(root, FbLang::Go, lang_template::mock::factory()))
     });
     run_read_battery(
@@ -623,7 +626,7 @@ fn conformance_template() {
 // mock's marker — the reject under test is the GATE channel, not the parser.
 #[test]
 fn conformance_java_gated_mock() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+    let mk: MkProvider = Box::new(|root| {
         Box::new(lang_java::JavaProvider::with_factory(root, lang_template::mock::factory()))
     });
     run_read_battery(
@@ -672,7 +675,7 @@ fn conformance_java_gated_mock() {
 #[test]
 #[ignore]
 fn conformance_java_javac() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> =
+    let mk: MkProvider =
         Box::new(|root| Box::new(lang_java::JavaProvider::new(root)));
     run_read_battery(
         &mk,
@@ -720,7 +723,7 @@ fn conformance_java_javac() {
 // honest EMPTY graph (module-level imports), so `edge: None`.
 #[test]
 fn conformance_swift_gated_mock() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+    let mk: MkProvider = Box::new(|root| {
         Box::new(lang_swift::SwiftProvider::with_factory(root, lang_template::mock::factory()))
     });
     run_read_battery(
@@ -768,7 +771,7 @@ fn conformance_swift_swiftbuild() {
     // whole package, so the read + edit fixtures both live under `Sources/App/`.
     const MANIFEST: &str =
         "// swift-tools-version:5.9\nimport PackageDescription\n\nlet package = Package(\n  name: \"App\",\n  targets: [ .executableTarget(name: \"App\", path: \"Sources/App\") ]\n)\n";
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> =
+    let mk: MkProvider =
         Box::new(|root| Box::new(lang_swift::SwiftProvider::new(root)));
     run_read_battery(
         &mk,
@@ -817,7 +820,7 @@ fn conformance_swift_swiftbuild() {
 #[test]
 #[ignore]
 fn conformance_ts_scip() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+    let mk: MkProvider = Box::new(|root| {
         std::fs::write(
             root.join("tsconfig.json"),
             r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true},"include":["src"]}"#,
@@ -854,7 +857,7 @@ fn conformance_ts_scip() {
 #[test]
 #[ignore]
 fn conformance_ts_lsp_sweep() {
-    let mk: Box<dyn Fn(&Path) -> Box<dyn LanguageProvider>> = Box::new(|root| {
+    let mk: MkProvider = Box::new(|root| {
         std::fs::write(
             root.join("tsconfig.json"),
             r#"{"compilerOptions":{"target":"ES2020","module":"ESNext","moduleResolution":"Bundler","strict":true,"noEmit":true},"include":["src"]}"#,
@@ -975,7 +978,7 @@ fn scrub(src: &str) -> String {
                 if b.get(j) == Some(&b'"') {
                     let start = i;
                     let close: Vec<u8> =
-                        std::iter::once(b'"').chain(std::iter::repeat(b'#').take(hashes)).collect();
+                        std::iter::once(b'"').chain(std::iter::repeat_n(b'#', hashes)).collect();
                     let mut k = j + 1;
                     while k < b.len() && !b[k..].starts_with(&close) {
                         k += 1;
@@ -1060,9 +1063,9 @@ fn blank_test_mods(scrubbed: &mut String) {
         // A cfg(test) on a non-mod item: blank just the attribute so the scan advances.
         let end = end.unwrap_or(attr + ATTR.len() - 1);
         let mut bytes = std::mem::take(scrubbed).into_bytes();
-        for k in attr..=end {
-            if bytes[k] != b'\n' {
-                bytes[k] = b' ';
+        for b in &mut bytes[attr..=end] {
+            if *b != b'\n' {
+                *b = b' ';
             }
         }
         *scrubbed = String::from_utf8(bytes).expect("blanking rewrites ASCII bytes to spaces");

@@ -142,10 +142,15 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The old TS repo holds the model + the Python reference vectors. Layout:
-    /// /Users/.../codeindex (old)  and  /Users/.../codeindex-rs (this).
+    /// The frozen Node prototype repo holds the model + the Python reference vectors (the only
+    /// embedder-parity oracle). `$CI_PARITY_REPO` points at a checkout anywhere; the default
+    /// assumes the historical sibling layout (…/codeindex next to …/codeindex-rs). The parity
+    /// test self-skips when the assets are absent either way.
     fn old_repo() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../codeindex")
+        match std::env::var("CI_PARITY_REPO") {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../codeindex"),
+        }
     }
 
     fn cosine(a: &[f32], b: &[f64]) -> f64 {

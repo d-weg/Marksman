@@ -27,39 +27,43 @@ pub(crate) const INSTALL_HINT: &str =
 /// The sourcekit-lsp binary: `$CI_SOURCEKIT_LSP`, else `sourcekit-lsp` on PATH, else the common
 /// toolchain locations. `None` = rename is unavailable (a rename op then explains itself).
 pub(crate) fn sourcekit_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CI_SOURCEKIT_LSP") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("sourcekit-lsp");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    [
-        "/usr/bin/sourcekit-lsp",
-        "/usr/local/bin/sourcekit-lsp",
-        "/Library/Developer/CommandLineTools/usr/bin/sourcekit-lsp",
-    ]
-    .iter()
-    .map(PathBuf::from)
-    .find(|p| p.is_file())
+    ci_core::discover_tool(
+        "CI_SOURCEKIT_LSP",
+        &["sourcekit-lsp"],
+        &[
+            "/usr/bin/sourcekit-lsp",
+            "/usr/local/bin/sourcekit-lsp",
+            "/Library/Developer/CommandLineTools/usr/bin/sourcekit-lsp",
+        ],
+    )
 }
 
 /// Start sourcekit-lsp for `root`. Launched directly (it discovers the SwiftPM package from the
 /// workspace root); background indexing warms the IndexStoreDB the rename reads from.
-pub(crate) fn start(root: &std::path::Path) -> Result<LspClient> {
-    let Some(bin) = sourcekit_binary() else {
-        return Err(ci_core::Error::Driver(format!(
-            "swift rename needs sourcekit-lsp — Install: {INSTALL_HINT}"
-        )));
-    };
-    let mut cmd = Command::new(bin);
+pub(crate) fn start(root: &std::path::Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
+    // The image ships sourcekit-lsp on PATH; `tool_command` resolves it by bare name there, else the
+    // host binary.
+    let mut cmd = ci_core::tool_command(sandbox, "sourcekit-lsp", || {
+        let Some(bin) = sourcekit_binary() else {
+            return Err(ci_core::Error::Driver(format!(
+                "swift rename needs sourcekit-lsp — Install: {INSTALL_HINT}"
+            )));
+        };
+        Ok(Command::new(bin))
+    })?;
+    // Cross-file rename reads the IndexStoreDB. In a CONTAINER there is no prior indexed build, so
+    // sourcekit must build the index itself (`background-indexing`) and the rename must wait for it
+    // (ensure_ready via `set_expects_index_progress`) — otherwise it rewrites only the definition. A
+    // host has an existing/fast index and already renames cross-file, so it pays neither (host path
+    // unchanged).
+    let containerized = sandbox.containerized();
+    if containerized {
+        cmd.arg("--experimental-feature").arg("background-indexing");
+    }
     cmd.current_dir(root);
-    LspClient::start(root, cmd)
+    let mut client = LspClient::start_in(root, cmd, sandbox)?;
+    if containerized {
+        client.set_expects_index_progress();
+    }
+    Ok(client)
 }

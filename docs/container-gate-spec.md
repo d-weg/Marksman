@@ -1,13 +1,31 @@
 # Containerized gate — spec for review
 
-**Status: DRAFT (2026-07-09, branch `container-gate`).** Motivated by the java/php/swift
-bench review ([the lang-suite run](benchmarks.md) surfaced that the worst cells were toolchain
-*availability*, not logic: java rename fell back to fully manual editing because jdtls was
-absent). The idea: run a language's gate/rename toolchain inside a sandboxed root filesystem, so
-a device running Marksman needs a container runtime instead of N language toolchains, and the
-gate's verdict is pinned to a known toolchain version. This document fixes the goal, picks the
-mechanism, names the seam in the current code, and phases the work with acceptance criteria.
-Nothing here is implemented yet.
+**Status: IMPLEMENTED M1–M2.4 (2026-07-09, branch `container-gate`) + M6 TS
+(2026-07-11, branch `consistency-audit`): the fifth gated language containerized, incl. its
+scip-typescript INDEXER — e2e `oci_ts_index_gate_and_rename_without_host_tools` green (index +
+gate reject + cross-file rename in-container, no host Node), host tiers unchanged 8/8.**
+Motivated by the
+java/php/swift bench review ([the lang-suite run](benchmarks.md) surfaced that the worst cells
+were toolchain *availability*, not logic: java rename fell back to fully manual editing because
+jdtls was absent). Run a language's gate/rename toolchain inside a sandboxed root filesystem, so a
+device needs a container runtime instead of N language toolchains, with the verdict pinned to a
+known toolchain version. Opt-in via `CI_SANDBOX=oci`; the host path is byte-identical otherwise.
+
+**Coverage — all five gated languages have an image + run their toolchain in-container:**
+| lang | image | gate in-container | rename in-container | notes |
+|---|---|:--:|:--:|---|
+| java | `marksman-java` (905MB) | ✅ javac sidecar | ✅ jdtls | needed a jdtls readiness fix (done) |
+| php | `marksman-php` (~450MB) | ✅ phpstan (tree gate) | ✅ phpactor | full, first try |
+| rust | `marksman-rust` | ✅ cargo check | ✅ rust-analyzer | full — serverStatus already waited on |
+| swift | `marksman-swift` (~2.5GB) | ✅ swift build | ✅ sourcekit | full — needed `--experimental-feature background-indexing` + a `$/progress` index-settle wait (containerized-only) |
+| ts (M6) | `marksman-ts` | ✅ tsgo | ✅ tsgo | **also the INDEXER**: scip-typescript in-image — TS is the one language whose READ path needs the toolchain, so the image serves indexing too (contract §10 producer, pinned versions matching `engine.rs`). Container gate tier = tsgo only (the ladder's lower rungs don't transplant: ts-morph npm-installs at runtime, tsls can't resolve a global typescript) — which is also the fastest tier |
+
+Adding a language is now **plug-and-play**: an image + declaring the tool via `ci_core::tool_command`
+(the single host-vs-container resolver) + `resolve_sandbox(root, "marksman-<lang>")`. No per-launcher
+`if containerized` branches — that choice lives in one place (TS's tsgo-only ladder collapse and
+swift's background-indexing flag are the two documented exceptions). Measured perf (§7): mount I/O
+is a non-issue (+7%). Deferred: the pure-Rust youki `libcontainer` backend (M5), image slimming,
+and the `CI_TS_MODE=lsp` sweep arm (host-only comparison arm).
 
 ## Terms
 
@@ -162,17 +180,24 @@ This is the one place the idea is genuinely constrained: it does **not** make Ma
 install-free on a Mac. It makes it install-free on Linux, and version-reproducible everywhere it
 runs.
 
-## 7. Risks to measure before committing past M2
+## 7. Risks — MEASURED (2026-07-09, macOS 15.7 · Docker Desktop · arm64 · php gate on the 33-file
+corpus fixture, the mount-heavy tree gate = the worst case)
 
-- **Overlay I/O across the boundary — the make-or-break number.** Bind mounts on the macOS VM are
-  notoriously slow, and the php gate re-mirrors the whole project per call. Measure copy-in vs
-  mount vs named-volume for the tree gates on a large repo; if it erases the gate's speed
-  advantage, keep tree gates on the host and containerize only the buffer/stdio engines (still
-  solves the jdtls/phpactor-absent problem, which was the actual pain).
-- **Cold start** of the resident container on first gated op (amortized by warm reuse, but the
-  first edit pays it).
-- **Image size / pull time** on first use.
-- **Path-mapping correctness** across the boundary (a regression here = wrong-file diagnostics).
+- **Overlay I/O across the boundary — the make-or-break number: NOT a problem.** Pure bind-mount
+  overhead (same container phpstan, mounted project vs a copy on the container's own fs) is
+  **+26ms / +7%** — a rounding error, not the "notoriously slow" cost feared. Docker Desktop's file
+  sharing is fine for the whole-project mirror. So tree gates DO containerize (php already does),
+  and the M2.4 "defer tree gates to M3" caveat is lifted — it was a perf worry that didn't
+  materialize. (The container phpstan even ran *faster* than the host's — 401 vs 819ms — a newer
+  phpstan/php build, not the point, but confirms no regression.)
+- **`docker exec` overhead — the real per-op container cost:** ~129ms fixed per one-shot gate call
+  (php's `run_capped`/`output` path). Java pays this **once** (its javac sidecar is a resident
+  `docker exec -i`, so gates are stdio round-trips) — one reason the stdio engines were the right
+  first target.
+- **Cold start** of the container: ~181ms, one-time per session, amortized across every edit.
+- **Image size**: java 905MB, php ~half that. Lazy-pull per language.
+- **Path-mapping correctness**: the identical-path mount makes this a non-issue (host paths ARE
+  container paths); verified by the java + php cross-file rename e2e.
 
 ## 8. Testing plan
 
@@ -197,6 +222,98 @@ runs.
   budget of the host path.
 - **M4 — image build + `doctor` integration + docs.** Per-language pinned images, lazy pull,
   `marksman doctor` container tier, a one-line opt-in (`CI_SANDBOX=oci`).
+
+## 9a. M1 threading pattern (the exact per-engine change)
+
+M1 is behavior-preserving plumbing. It is specified once here so every engine — Java, PHP, Swift,
+Rust — follows it **identically** (readability = the four diffs look the same).
+
+**Shared pieces (done):** `ci_core::Sandbox` (`run_capped` + `spawn`) · `HostSandbox` ·
+`LspClient::start_in(root, cmd, &dyn Sandbox)` · **`ci_core::resolve_sandbox(root) -> Arc<dyn
+Sandbox>`** — the one switch M2 edits; M1 returns `HostSandbox`.
+
+**Per gate engine (`lang-{php,swift,java,rust}`), four mechanical edits:**
+
+1. **Field.** Add `sandbox: Arc<dyn ci_core::Sandbox>` to the engine struct (`PhpEngine`,
+   `SwiftEngine`, `JavaEngine`, `RustEngine`). For Java, `JavacSidecar` also carries it (its
+   spawn is the gate).
+2. **Gate spawn → the sandbox.** The free gate fn takes a `sandbox: &dyn Sandbox` param; the
+   `diagnostics()` method passes `&*self.sandbox`. The trait has three exec shapes because the
+   codebase already uses three — match the one the engine uses today (behavior-preserving):
+   - PHP / Swift use `ci_core::run_capped(&mut cmd, …)` → `sandbox.run_capped(&mut cmd, …)`.
+   - Rust uses `cmd.output()` (its `cargo check` JSON must stay UNCAPPED) → `sandbox.output(&mut
+     cmd)`. Do NOT switch it to `run_capped` — the 32 MB cap could truncate a large diagnostic set.
+   - Java's gate is a resident sidecar: `JavacSidecar::start(root, sandbox)` calls
+     `sandbox.spawn(&mut cmd)` instead of `cmd.spawn()` (and `JavacSidecar` holds the sandbox).
+3. **LSP start → the sandbox.** The `<lsp>::start(root)` helper (`phpactor`/`sourcekit`/`jdtls`,
+   and rust-analyzer inline) gains a `sandbox: &dyn Sandbox` and calls
+   `LspClient::start_in(root, cmd, sandbox)` instead of `LspClient::start(root, cmd)`. The engine's
+   lazy `self.lsp()` (and the rust factory's eager start) passes `&*self.sandbox`.
+4. **Construct with the resolver.** Each `engine_factory` builds the struct with
+   `sandbox: ci_core::resolve_sandbox(root)`. Nothing else in the factory changes.
+
+**Type choice:** `Arc<dyn Sandbox>` (not `Box`) so the one instance is shared cheaply between the
+engine, its sidecar, and the free fns it calls; `Sandbox: Send + Sync` makes the `Arc` `Send`, which
+the `Box<dyn GateEngine + Send>` providers require.
+
+**Acceptance per engine:** the crate builds 0-warning; its `#[ignore]` gate/rename e2e (where the
+toolchain is present) produce byte-identical verdicts; `git diff` shows only the four edits above.
+**Global acceptance:** `cargo test --workspace` unchanged (253 passed), 0-warning.
+
+## 9b. M2 execution plan (the OCI backend, testable on this Mac)
+
+**Enabling fact:** Docker Desktop is installed here, and on macOS it runs a Linux VM — so we can
+build and run Linux OCI containers locally, no separate VM to provision. M2 is therefore
+testable on this machine, not deferred to remote Linux.
+
+**Backend choice — a CLI-runtime `OciSandbox`, not (yet) in-process libcontainer.** The `Sandbox`
+trait is backend-agnostic, so M2 ships the backend that is testable now: one that shells out to an
+**OCI runtime CLI**, chosen by `$CI_SANDBOX_RUNTIME` else the first found on PATH of
+`container`/`docker`/`podman`/`nerdctl`. The **chosen local runtime is Apple's native `container`**
+(macOS 15+; this machine is 15.7) — a per-container lightweight VM on Virtualization.framework, **no
+daemon**, closer to the user's "open/generic, not Docker" preference than Docker Desktop. It
+installs from a signed `.pkg` at github.com/apple/container/releases (not a brew cask). The IMAGE is
+plain OCI, so the runtime choice never changes the verdict. The pure-Rust, daemonless **youki
+`libcontainer`** backend from §2 stays the target for Linux hosts with no CLI at all — a *second*
+`Sandbox` impl added later (M5), swapped in behind the same trait with zero engine changes.
+
+**The trick that makes `spawn(cmd)` wrap an arbitrary host `Command`: identical-path mounts.**
+Mount the repo AND the system temp dir into the container at their **same absolute host paths**
+(`-v /Users/…/repo:/Users/…/repo`, `-v $TMPDIR:$TMPDIR`). Then `current_dir`, java's
+`-sourcepath`, the sidecar's materialized `GateSidecar.java` tempdir, phpstan's overlay tree — all
+host paths — are valid *inside* the container unchanged. No path translation; `OciSandbox` just
+re-launches the same argv via `<runtime> exec`. (This subsumes §3's "path mapping" for the common
+case.)
+
+**Warm container lifecycle (§4), concretely:** on first gated op for a repo, `OciSandbox` starts
+one detached container — `<runtime> run -d --rm -v repo:repo:ro -v $TMPDIR:$TMPDIR <image> sleep
+infinity` — keyed by repo so a session reuses it; torn down at drop. The repo is **read-only**;
+the overlay rides the engine's existing channel (java sidecar buffers over stdin, an LSP over
+didOpen), so no per-edit filesystem materialization for the stdio engines — the cheap case.
+
+### Substeps
+
+- **M2.1 — `resolve_sandbox` switch + `OciSandbox` skeleton (testable here, no container yet).**
+  `resolve_sandbox(root)` returns `OciSandbox` only when `$CI_SANDBOX=oci` AND a runtime is present,
+  else `HostSandbox` (unchanged default). Skeleton `OciSandbox` implementing `Sandbox`; runtime
+  discovery. Acceptance: default path unchanged (workspace 254 green, 0-warning); `CI_SANDBOX=oci`
+  with no runtime falls back to host with a logged note (never a hard failure).
+- **M2.2 — the java image + warm-container plumbing.** A `docker/marksman-java.Dockerfile` (a JDK
+  base + jdtls) built to a local tag. `OciSandbox` start/exec/teardown with the identical-path
+  mounts. Acceptance: `<runtime> exec` runs `java -version` inside the warm container against a
+  bind-mounted repo.
+- **M2.3 — java gate + rename end-to-end, NO host jdtls (the payoff).** Drive `JavaProvider` with
+  `CI_SANDBOX=oci`; the javac sidecar and jdtls come from the image. Acceptance: on a repo with
+  jdtls REMOVED from the host PATH, the java gate rejects/commits with byte-identical verdicts to
+  the host path, and `jdtls_rename_lands_cross_file` passes — the bench's worst finding, closed.
+  Run as an `#[ignore]` e2e gated on `$CI_SANDBOX=oci` + a runtime.
+- **M2.4 — the other stdio engines** (php phpactor, swift sourcekit, rust rust-analyzer in their
+  images) — same shape as java, LSP over stdio. Tree gates (phpstan/swift build/cargo) stay on the
+  host until M3 measures overlay-mount I/O.
+- **M2.5 (later) — `LibcontainerSandbox`** for daemonless Linux, behind the same trait.
+
+**The one open decision:** M2 uses `docker` as the *local test* runtime (it's what's installed),
+while staying runtime-generic in code. Confirm that's acceptable, or name the runtime to target.
 
 ## 10. Relationship to prior findings
 

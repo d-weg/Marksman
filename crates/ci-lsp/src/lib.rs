@@ -71,19 +71,43 @@ pub struct LspClient {
     fresh_demand: Option<Instant>,
     /// Whether any `experimental/serverStatus` arrived AFTER the current fresh demand.
     status_since_demand: bool,
+    /// jdtls readiness (it speaks `language/status`, not rust-analyzer's `experimental/serverStatus`).
+    /// `saw_jdtls_status` = it's a `language/status` server at all; `jdtls_ready` flips once it
+    /// reports `ServiceReady` — its project import is done. Before that a `textDocument/rename` sees
+    /// only the open file and returns a definition-only edit (cross-file references unrewritten).
+    saw_jdtls_status: bool,
+    jdtls_ready: bool,
+    /// sourcekit-lsp readiness. Its cross-file rename reads an IndexStoreDB that background-indexing
+    /// builds asynchronously (reported via work-done `$/progress`); before it settles a rename sees
+    /// only the open file. `expects_index_progress` is set by the sourcekit launcher (only that
+    /// server background-indexes — so no other server pays the wait); `active_progress` counts
+    /// begun-but-not-ended progress tokens, and `saw_progress` marks that indexing has started.
+    expects_index_progress: bool,
+    active_progress: u32,
+    saw_progress: bool,
 }
 
 impl LspClient {
     /// Spawn a language server (`cmd`, supplied by the language provider — this crate
     /// is language-agnostic and Rust-only) and run the LSP handshake. `root` is the
     /// workspace root used for `rootUri` and document URIs.
-    pub fn start(root: &Path, mut cmd: Command) -> Result<Self> {
-        let mut child = cmd
-            .current_dir(root)
+    /// Start the server on the host. Convenience for `start_in(root, cmd, &HostSandbox)` — the
+    /// path every current caller takes.
+    pub fn start(root: &Path, cmd: Command) -> Result<Self> {
+        Self::start_in(root, cmd, &ci_core::HostSandbox)
+    }
+
+    /// Start the server inside `sandbox`. The server is a resident process the client talks to
+    /// over stdio, so a container backend just execs it in the running container with the same
+    /// pipes — no filesystem crosses the boundary (the reason stdio-protocol engines containerize
+    /// first; see `docs/container-gate-spec.md`).
+    pub fn start_in(root: &Path, mut cmd: Command, sandbox: &dyn ci_core::Sandbox) -> Result<Self> {
+        cmd.current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = sandbox
+            .spawn(&mut cmd)
             .map_err(|e| Error::Driver(format!("spawn language server: {e}")))?;
 
         let stdin = child.stdin.take().ok_or_else(|| Error::Driver("no lsp stdin".into()))?;
@@ -104,6 +128,11 @@ impl LspClient {
             status_grace_done: false,
             fresh_demand: None,
             status_since_demand: false,
+            saw_jdtls_status: false,
+            jdtls_ready: false,
+            expects_index_progress: false,
+            active_progress: 0,
+            saw_progress: false,
         };
 
         let init = json!({
@@ -120,6 +149,9 @@ impl LspClient {
                     "documentSymbol": { "hierarchicalDocumentSymbolSupport": true },
                 },
                 "workspace": { "fileOperations": { "willRename": true } },
+                // sourcekit-lsp reports its background index build via work-done progress ONLY when
+                // the client advertises support — the readiness signal a rename must wait on.
+                "window": { "workDoneProgress": true },
                 "experimental": { "serverStatusNotification": true },
             },
             "workspaceFolders": [ { "uri": file_uri(root), "name": "root" } ],
@@ -129,6 +161,16 @@ impl LspClient {
         let resp = client.pump_until_response(id, Duration::from_secs(60))?;
         if std::env::var("CI_TIMING").is_ok() {
             eprintln!("[timing]   lsp initialize {:?}", t_init.elapsed());
+        }
+        // A failed initialize MUST be loud. Treating it as "server up, no capabilities" lets a
+        // server that errored-and-exited (observed: typescript-language-server ≥5.2 without a
+        // workspace `typescript` install replies with an initialize ERROR then exits) fall to
+        // the push-diagnostics path, where a dead server publishes nothing and silence reads as
+        // clean — a FALSE CLEAN through the gate, the exact degrade the house rules forbid.
+        if let Some(err) = resp.get("error") {
+            return Err(Error::Driver(format!(
+                "lsp initialize failed — the gate cannot run: {err}"
+            )));
         }
         client.pull_diagnostics = resp
             .pointer("/result/capabilities/diagnosticProvider")
@@ -338,15 +380,10 @@ impl LspClient {
                 self.quiescent = false;
                 self.fresh_demand = Some(Instant::now() + Duration::from_millis(2000));
                 self.status_since_demand = false;
-                loop {
-                    match self.rx.try_recv() {
-                        Ok(msg) => {
-                            self.observe(&msg);
-                            if msg.get("id").is_some() && msg.get("method").is_some() {
-                                self.reply_server_request(&msg)?;
-                            }
-                        }
-                        Err(_) => break,
+                while let Ok(msg) = self.rx.try_recv() {
+                    self.observe(&msg);
+                    if msg.get("id").is_some() && msg.get("method").is_some() {
+                        self.reply_server_request(&msg)?;
                     }
                 }
             }
@@ -392,11 +429,82 @@ impl LspClient {
     /// once initial analysis is done. Must be called on every message every receive loop sees,
     /// or a status update read by one loop is lost to the others.
     fn observe(&mut self, msg: &Value) {
-        if msg.get("method").and_then(|m| m.as_str()) == Some("experimental/serverStatus") {
-            self.saw_server_status = true;
-            self.status_since_demand = true;
-            self.quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
+        match msg.get("method").and_then(|m| m.as_str()) {
+            Some("experimental/serverStatus") => {
+                self.saw_server_status = true;
+                self.status_since_demand = true;
+                self.quiescent = msg.pointer("/params/quiescent").and_then(|q| q.as_bool()).unwrap_or(false);
+            }
+            // jdtls: Starting → ProjectStatus → Started → ServiceReady (import complete).
+            Some("language/status") => {
+                self.saw_jdtls_status = true;
+                if msg.pointer("/params/type").and_then(|t| t.as_str()) == Some("ServiceReady") {
+                    self.jdtls_ready = true;
+                }
+            }
+            // Work-done progress (sourcekit's background index build): count begun-but-unended
+            // tokens so `ensure_ready` can wait for the index to settle before a rename.
+            Some("$/progress") => match msg.pointer("/params/value/kind").and_then(|k| k.as_str()) {
+                Some("begin") => {
+                    self.active_progress += 1;
+                    self.saw_progress = true;
+                }
+                Some("end") => self.active_progress = self.active_progress.saturating_sub(1),
+                _ => {}
+            },
+            _ => {}
         }
+    }
+
+    /// Receive at most one message within `wait`, tracking status and answering any server→client
+    /// request so the server never blocks. Ok on a message or a timeout; errors only on disconnect.
+    fn pump_one(&mut self, wait: Duration) -> Result<()> {
+        match self.rx.recv_timeout(wait) {
+            Ok(msg) => {
+                self.observe(&msg);
+                if msg.get("id").is_some() && msg.get("method").is_some() {
+                    self.reply_server_request(&msg)?;
+                }
+                Ok(())
+            }
+            Err(RecvTimeoutError::Timeout) => Ok(()),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::Driver("lsp server disconnected".into())),
+        }
+    }
+
+    /// Block until jdtls finishes importing the project — it signals with a `language/status`
+    /// `ServiceReady`, distinct from the `experimental/serverStatus` [`wait_quiescent`] tracks.
+    /// Before it, a `textDocument/rename` sees only the open file and returns a definition-only edit
+    /// (cross-file references unrewritten). No-op — and zero added latency — for a server that never
+    /// speaks `language/status`: by the time a rename runs, the warm-up diagnostics have already
+    /// pumped jdtls's early "Starting", so `saw_jdtls_status` distinguishes it from rust-analyzer /
+    /// tsls (which never send it). Best-effort: on the deadline it proceeds rather than failing.
+    pub fn ensure_ready(&mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while self.saw_jdtls_status && !self.jdtls_ready && Instant::now() < deadline {
+            self.pump_one(Duration::from_millis(200))?;
+        }
+        // sourcekit-lsp only: wait for the background index build. Give it a grace window to BEGIN
+        // (it starts after the SwiftPM package loads), then drain until every progress token ends.
+        // If it already finished during warm-up, `saw_progress` is set and `active_progress` is 0,
+        // so both loops fall straight through. Gated by `expects_index_progress`, so no other server
+        // (rust-analyzer waits via serverStatus; tsls, jdtls) pays any latency here.
+        if self.expects_index_progress {
+            let grace = Instant::now() + Duration::from_secs(10);
+            while !self.saw_progress && Instant::now() < grace {
+                self.pump_one(Duration::from_millis(100))?;
+            }
+            while self.active_progress > 0 && Instant::now() < deadline {
+                self.pump_one(Duration::from_millis(100))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark this server as one whose rename waits on a background index build (sourcekit-lsp with
+    /// `--experimental-feature background-indexing`) — its launcher calls this after `start`.
+    pub fn set_expects_index_progress(&mut self) {
+        self.expects_index_progress = true;
     }
 
     /// Block until a status-reporting server (rust-analyzer) is quiescent. No-op for servers
@@ -610,9 +718,12 @@ mod tests {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(root.join("src/a.ts"), "export const x: number = 1;\n").unwrap();
 
-        // The provider supplies the server command; this crate stays generic.
+        // The provider supplies the server command; this crate stays generic. Versions pinned to
+        // lang-ts's production tier (engine.rs TS_LSP_VERSION/TYPESCRIPT_VERSION): an unpinned
+        // `typescript` resolves to the 7.x Go line, which ships no tsserver — tsls then errors
+        // at initialize and exits (the false-clean this crate's initialize check now catches).
         let mut cmd = Command::new("npx");
-        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
+        cmd.args(["--yes", "-p", "typescript-language-server@5.3.0", "-p", "typescript@6.0.3", "typescript-language-server", "--stdio"])
             .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
         let mut lsp = LspClient::start(root, cmd).expect("start tsls");
 

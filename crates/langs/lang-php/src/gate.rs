@@ -2,12 +2,12 @@
 //! for rename/willRename. The two never trade jobs: phpactor serves the cross-file rewrites
 //! (its `willRenameFiles` is real LSP fileOperations), while PHPStan — a batch analyser, not a
 //! server — answers the type-check verdict from a materialized overlay.
-use ci_core::{Diag, Error, Result};
+use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
-use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use crate::phpactor;
 
@@ -19,8 +19,10 @@ fn phpstan_level() -> String {
     std::env::var("CI_PHPSTAN_LEVEL").unwrap_or_else(|_| "5".to_string())
 }
 
-/// The PHPStan binary: `$CI_PHPSTAN`, else `phpstan`/`vendor/bin/phpstan` on/near the repo,
-/// else a PATH `phpstan`. `None` = no gate available.
+/// The PHPStan binary: `$CI_PHPSTAN`, else `vendor/bin/phpstan` in the repo, else a PATH
+/// `phpstan`. `None` = no gate available. The vendored middle step is per-repo, so it sits
+/// inline between `discover_tool`'s env and PATH halves (the env recheck inside is harmless —
+/// a set-but-missing `$CI_PHPSTAN` already fell through above).
 pub(crate) fn phpstan_binary(root: &Path) -> Option<PathBuf> {
     if let Ok(p) = std::env::var("CI_PHPSTAN") {
         let p = PathBuf::from(p);
@@ -32,15 +34,7 @@ pub(crate) fn phpstan_binary(root: &Path) -> Option<PathBuf> {
     if vendored.is_file() {
         return Some(vendored);
     }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("phpstan");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
+    ci_core::discover_tool("CI_PHPSTAN", &["phpstan"], &[])
 }
 
 /// Materialize `rel` with `content` under `base`, creating parent dirs. Returns the absolute path.
@@ -63,7 +57,7 @@ fn write_overlay(base: &Path, rel: &str, content: &str) -> Result<PathBuf> {
 /// reject on a perfectly good edit (the schema-field bench blew a rust arm to 1M tokens because
 /// the touched file was analysed alone and every reference to an unmaterialized sibling read as a
 /// new error). Reported paths are relativized back to the repo-relative keys the spine speaks.
-fn phpstan_diagnostics(bin: &Path, root: &Path, files: &[(String, String)]) -> Result<Vec<Diag>> {
+fn phpstan_diagnostics(bin: &Path, root: &Path, sandbox: &dyn Sandbox, files: &[(String, String)]) -> Result<Vec<Diag>> {
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -115,40 +109,38 @@ fn phpstan_diagnostics(bin: &Path, root: &Path, files: &[(String, String)]) -> R
     );
     let neon_path = dir.path().join("phpstan-gate.neon");
     std::fs::write(&neon_path, neon).map_err(|e| Error::Driver(format!("phpstan overlay write: {e}")))?;
-    let mut cmd = Command::new(bin);
+    // The image ships phpstan as a bare launcher on PATH; `tool_command` resolves it by name there,
+    // else the host binary. The overlay tree + neon live under $TMPDIR, which the sandbox mounts, so
+    // the analyse targets and `current_dir` resolve unchanged inside.
+    let mut cmd = ci_core::tool_command(sandbox, "phpstan", || Ok(Command::new(bin)))?;
     cmd.args(["analyse", "--error-format=json", "--no-progress", "--no-ansi"])
         .arg("-c")
         .arg(&neon_path)
         .arg(format!("--level={}", phpstan_level()))
         .args(&targets)
         .current_dir(dir.path());
-    // Capped + time-bounded like the swift gate: a chatty analyser can't OOM us, and a wedged one
-    // can't hang the edit forever (generous timeout — a legit slow analysis is never killed).
-    let out = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
-        .map_err(|e| Error::Driver(format!("phpstan spawn: {e}")))?;
-    if out.timed_out {
-        return Err(Error::Driver(format!(
-            "phpstan exceeded the gate timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher if this project legitimately analyses slower",
-            ci_core::gate_timeout().as_secs()
-        )));
-    }
+    // Capped + time-bounded (run_gate_capped): a chatty analyser can't OOM us, and a wedged one
+    // can't hang the edit forever; a timeout REFUSES the edit (Error::GateTimeout propagates).
+    let out = ci_core::run_gate_capped(sandbox, &mut cmd, "phpstan")?;
     // PHPStan exits non-zero WHEN it finds errors — that is the normal reporting path, not a
     // tool failure. Parse stdout regardless.
     let stdout = String::from_utf8_lossy(&out.stdout);
     let diags = parse_phpstan_json(&stdout, dir.path())?;
-    // Reject-on-failed-tool (the invariant lang-rust's gate encodes): if PHPStan exits non-zero
-    // but we parsed NO diagnostics, it crashed before emitting JSON (segfault, OOM-kill, a fatal
-    // in a rule/extension, a bad --level, no PHP runtime) — the message is on stderr and stdout is
-    // empty. The spine reads an empty diagnostic set as clean-commit, so surface the failure as a
-    // reject rather than let a broken analyser pass silently.
-    if !out.status.is_some_and(|s| s.success()) && diags.is_empty() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let first = stderr
-            .lines()
-            .map(str::trim)
-            .find(|l| !l.is_empty())
-            .unwrap_or("phpstan failed with no diagnostic output");
-        return Ok(vec![Diag { file: "phpstan".into(), code: 0, message: first.to_string(), line: 0 }]);
+    // Reject-on-failed-tool: PHPStan exiting non-zero with NO diagnostics parsed means it crashed
+    // before emitting JSON (segfault, OOM-kill, a fatal in a rule/extension, a bad --level, no PHP
+    // runtime) — the message is on stderr and stdout is empty.
+    if let Some(d) =
+        ci_core::silent_tool_failure_diag(out.status.is_some_and(|s| s.success()), &diags, "phpstan", || {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            stderr
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("phpstan failed with no diagnostic output")
+                .to_string()
+        })
+    {
+        return Ok(vec![d]);
     }
     Ok(diags)
 }
@@ -207,19 +199,24 @@ fn parse_phpstan_json(stdout: &str, overlay_root: &Path) -> Result<Vec<Diag>> {
 
 /// The PHP write engine behind `Composed`: PHPStan verdicts, phpactor rewrites.
 pub(crate) struct PhpEngine {
-    pub(crate) root: PathBuf,
-    pub(crate) phpstan: PathBuf,
-    /// phpactor, started on the FIRST rename/move only — diagnostics never wait on it, and a
-    /// missing phpactor costs nothing until an op actually needs cross-file rewrites.
-    pub(crate) lsp: Option<LspClient>,
+    root: PathBuf,
+    phpstan: PathBuf,
+    /// phpactor, started on the FIRST rename/move only (`ci_edit::LazyLsp`) — diagnostics never
+    /// wait on it, and a missing phpactor costs nothing until an op needs cross-file rewrites.
+    lsp: ci_edit::LazyLsp,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`) — the PHPStan verdict path uses it
+    /// per call; the container backend swaps in here (docs/container-gate-spec.md).
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl PhpEngine {
-    fn phpactor(&mut self) -> Result<&mut LspClient> {
-        if self.lsp.is_none() {
-            self.lsp = Some(phpactor::start(&self.root)?);
-        }
-        Ok(self.lsp.as_mut().expect("just set"))
+    pub(crate) fn new(root: &Path, phpstan: PathBuf, sandbox: Arc<dyn Sandbox>) -> Self {
+        let lsp = ci_edit::LazyLsp::new({
+            let root = root.to_path_buf();
+            let sandbox = sandbox.clone();
+            move || phpactor::start(&root, &*sandbox)
+        });
+        Self { root: root.to_path_buf(), phpstan, lsp, sandbox }
     }
 }
 
@@ -234,13 +231,13 @@ fn deleted_path_references(root: &Path, files: &[(String, String)]) -> Vec<Diag>
 
 impl GateEngine for PhpEngine {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
-        let mut out = phpstan_diagnostics(&self.phpstan, &self.root, files)?;
+        let mut out = phpstan_diagnostics(&self.phpstan, &self.root, &*self.sandbox, files)?;
         out.extend(deleted_path_references(&self.root, files));
         Ok(out)
     }
 
     fn rename(&mut self, file: &str, line: u32, character: u32, new_name: &str) -> Result<Value> {
-        GateEngine::rename(self.phpactor()?, file, line, character, new_name)
+        GateEngine::rename(self.lsp.get()?, file, line, character, new_name)
     }
 
     fn will_rename(&mut self, from: &str, to: &str) -> Result<Value> {
@@ -249,30 +246,19 @@ impl GateEngine for PhpEngine {
         // rewrite the syntactic model only approximates. This mirrors lang-java's jdtls ordering
         // (engine-native where it exists, the movefix hooks as the runnable fallback), and the
         // PHPStan gate judges whichever rewrite lands.
-        if let Ok(lsp) = self.phpactor() {
-            if let Ok(we) = GateEngine::will_rename(lsp, from, to) {
-                if !ci_edit::workspace_edit_is_empty(&we) {
-                    return Ok(we);
-                }
-            }
-        }
-        Ok(crate::movefix::move_workspace_edit(&self.root, from, to).unwrap_or_else(|| json!({})))
+        self.lsp.will_rename_or(from, to, || {
+            crate::movefix::move_workspace_edit(&self.root, from, to).unwrap_or_else(|| json!({}))
+        })
     }
 
     fn sync_disk(&mut self) -> Result<()> {
         // PHPStan holds no cross-call buffers (each analyse materializes its own overlay); only
         // a started phpactor has state to resync.
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.sync_disk(),
-            None => Ok(()),
-        }
+        self.lsp.sync_disk()
     }
 
     fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.fs_events(created, deleted),
-            None => Ok(()),
-        }
+        self.lsp.fs_events(created, deleted)
     }
 }
 

@@ -11,6 +11,7 @@ pub mod error;
 pub mod fingerprint;
 pub mod outline;
 pub mod paths;
+pub mod sandbox;
 pub mod text;
 pub mod toolchain;
 pub mod types;
@@ -20,7 +21,11 @@ pub use config::{Config, ProviderManifest};
 pub use driver::{LanguageProvider, ReadIndex};
 pub use error::{Error, Result};
 pub use outline::{elide_bodies, elide_bodies_with};
-pub use paths::rel_path;
+pub use paths::{jailed_rel, rel_path};
+pub use sandbox::{oci_runtime, resolve_sandbox, tool_command, HostSandbox, OciSandbox, Sandbox};
 pub use text::byte_offset;
-pub use toolchain::{gate_timeout, probe_tool, run_capped, CappedOutput, ToolStatus, ToolchainReport};
+pub use toolchain::{
+    discover_tool, gate_timeout, probe_tool, run_capped, run_gate_capped, silent_tool_failure_diag,
+    CappedOutput, ToolStatus, ToolchainReport, GATE_OUTPUT_CAP,
+};
 pub use types::*;

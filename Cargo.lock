@@ -96,6 +96,7 @@ dependencies = [
  "ci-embed",
  "ci-index",
  "ci-proto",
+ "ci-providers",
  "ci-retrieve",
  "ci-walk",
  "lang-fallback",
@@ -197,6 +198,7 @@ dependencies = [
  "ci-embed",
  "ci-index",
  "ci-proto",
+ "ci-providers",
  "ci-retrieve",
  "ignore",
  "lang-fallback",
@@ -218,6 +220,21 @@ dependencies = [
  "prost",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "ci-providers"
+version = "0.1.0"
+dependencies = [
+ "ci-build",
+ "ci-core",
+ "ci-proto",
+ "lang-fallback",
+ "lang-java",
+ "lang-php",
+ "lang-rust",
+ "lang-swift",
+ "lang-ts",
 ]
 
 [[package]]

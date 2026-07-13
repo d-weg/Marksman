@@ -15,11 +15,13 @@ use std::sync::{Arc, Mutex};
 mod actions;
 mod apply;
 mod composed;
+mod lazy_lsp;
 pub mod moves;
 
 pub use actions::{action_to_op, Action};
 pub use apply::{apply_delete, apply_structural, leading_symbol_name, workspace_edit_is_empty};
 pub use composed::{Composed, EngineFactory, FreshDeepener, LiveSummarizer, Prewarmer};
+pub use lazy_lsp::LazyLsp;
 
 use apply::{apply_move, apply_rename};
 
@@ -120,6 +122,9 @@ impl GateEngine for LspClient {
         if let Ok(content) = std::fs::read_to_string(self.root().join(file)) {
             let _ = LspClient::diagnostics(self, &[(file.to_string(), content)]);
         }
+        // jdtls signals import-done with `language/status` ServiceReady, not the serverStatus the
+        // warm-up waits on — without this a rename fires mid-import and rewrites only the definition.
+        let _ = self.ensure_ready();
         let uri = format!("file://{}", self.root().join(file).to_string_lossy());
         let params = json!({
             "textDocument": {"uri": uri},
@@ -151,6 +156,7 @@ impl GateEngine for LspClient {
         if let Ok(content) = std::fs::read_to_string(self.root().join(from)) {
             let _ = LspClient::diagnostics(self, &[(from.to_string(), content)]);
         }
+        let _ = self.ensure_ready();
         let old_uri = format!("file://{}", self.root().join(from).to_string_lossy());
         let new_uri = format!("file://{}", self.root().join(to).to_string_lossy());
         let params = json!({ "files": [{ "oldUri": old_uri, "newUri": new_uri }] });
@@ -1309,8 +1315,12 @@ mod tests {
     static TSLS_START: std::sync::Mutex<()> = std::sync::Mutex::new(());
     fn start_tsls(root: &Path) -> ci_lsp::LspClient {
         let _serialize = TSLS_START.lock().unwrap();
+        // Versions pinned to lang-ts's production tier (engine.rs TS_LSP_VERSION/
+        // TYPESCRIPT_VERSION): an unpinned `typescript` resolves to the 7.x Go line, which
+        // ships no tsserver — tsls then errors at initialize and exits (the false-clean
+        // ci-lsp's initialize check now catches).
         let mut cmd = std::process::Command::new("npx");
-        cmd.args(["--yes", "-p", "typescript-language-server", "-p", "typescript", "typescript-language-server", "--stdio"])
+        cmd.args(["--yes", "-p", "typescript-language-server@5.3.0", "-p", "typescript@6.0.3", "typescript-language-server", "--stdio"])
             .env("npm_config_cache", std::env::var("CI_NPM_CACHE").unwrap_or_else(|_| "/tmp/ci-npm-cache".into()));
         ci_lsp::LspClient::start(root, cmd).expect("start tsls")
     }

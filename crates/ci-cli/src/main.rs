@@ -6,18 +6,13 @@
 //!
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
-use ci_build::{build_index, build_registry, ProviderBuild};
+use ci_build::{build_index, build_registry};
 use ci_core::{Config, Manifest};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_exists, load_index, save_index};
 use ci_retrieve::{retrieve, RetrieveOptions};
-use ci_proto::ProcessProvider;
-use lang_fallback::{FallbackProvider, FbLang};
-use lang_rust::RustProvider;
-use lang_ts::TsProvider;
 use std::path::{Path, PathBuf};
 use std::process::exit;
-use std::sync::Arc;
 
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
@@ -43,113 +38,6 @@ fn die(msg: impl std::fmt::Display) -> ! {
     exit(1);
 }
 
-/// Construct the provider for one language, honoring the manifest's vendored binary and
-/// `CI_PROVIDER=sidecar`. Returns `None` (and warns) when a language's tooling can't start, so a
-/// mixed-language index isn't sunk by one language failing. Called by [`build_registry`] once per
-/// active language — so Node's `scip-typescript` only runs when the repo actually has `.ts*`.
-fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
-    // `CI_PROVIDER=sidecar`: index over the protobuf wire via a `marksman-provider-<lang>` process.
-    if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
-        if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
-            eprintln!("[marksman] language: {lang} (sidecar process — protobuf wire)");
-            match ProcessProvider::spawn(cmd) {
-                Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
-                Err(e) => {
-                    eprintln!("[marksman] sidecar {lang} failed to start ({e}); skipping");
-                    return ProviderBuild::Failed(e.to_string());
-                }
-            }
-        }
-        eprintln!("[marksman] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
-    }
-    match lang {
-        "rust" => {
-            // Reads are in-process (no external deps); rust-analyzer gates only writes.
-            if let Some(missing) = lang_rust::toolchain().describe_missing() {
-                eprintln!("[marksman] warning: {missing}\n  (rust indexing/reads work; type-checked edits will fail until installed)");
-            }
-            eprintln!("[marksman] language: rust (tree-sitter reads + rust-analyzer scip graph; gate: cargo check, renames: rust-analyzer)");
-            ProviderBuild::Ready(Arc::new(RustProvider::open(root, config.scip_enabled("rust"))))
-        }
-        "ts" => {
-            // CI_TS_MODE ablation arms (docs/benchmarks.md): serve TS from tree-sitter instead
-            // of SCIP — "treesitter" is the generic UNGATED provider (needs nothing external),
-            // "treesitter-gated" keeps the warm ts-morph gate on a tree-sitter read path.
-            match std::env::var("CI_TS_MODE").as_deref() {
-                Ok("treesitter") => {
-                    eprintln!("[marksman] language: typescript (ABLATION: generic tree-sitter, UNGATED — CI_TS_MODE=treesitter)");
-                    return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Ts)));
-                }
-                Ok("treesitter-gated") => {
-                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                        eprintln!("[marksman] typescript DISABLED (gated ablation still needs the gate's toolchain):\n{missing}");
-                        return ProviderBuild::Unavailable(missing);
-                    }
-                    eprintln!("[marksman] language: typescript (ABLATION: tree-sitter read + ts-morph gate — CI_TS_MODE=treesitter-gated)");
-                    return ProviderBuild::Ready(Arc::new(lang_ts::TsTreeGated::new(root)));
-                }
-                Ok("lsp") => {
-                    // COMPARISON arm: index by sweeping the tsgo language server (ci-lsp-index)
-                    // instead of scip-typescript; same SCIP read path, different producer.
-                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                        eprintln!("[marksman] typescript DISABLED (the LSP sweep still needs Node for tsgo via npx):\n{missing}");
-                        return ProviderBuild::Unavailable(missing);
-                    }
-                    eprintln!("[marksman] language: typescript (COMPARISON: tsgo LSP-sweep index — CI_TS_MODE=lsp)");
-                    return match TsProvider::index_with_lsp_sweep(root) {
-                        Ok(p) => ProviderBuild::Ready(Arc::new(p)),
-                        Err(e) => {
-                            eprintln!("[marksman] tsgo LSP-sweep indexing failed ({e}); skipping TS files");
-                            ProviderBuild::Failed(e.to_string())
-                        }
-                    };
-                }
-                _ => {}
-            }
-            // Check the toolchain BEFORE running any of it: a missing Node is one actionable
-            // message (what + why + install), not a cryptic npx spawn error mid-index.
-            if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                eprintln!("[marksman] typescript DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            // `open` reuses the cached .codeindex/index.scip when the source fingerprint still
-            // matches; scip-typescript re-runs only when the source actually changed.
-            eprintln!("[marksman] language: typescript — opening scip index for {} …", root.display());
-            match TsProvider::open(root) {
-                Ok(p) => ProviderBuild::Ready(Arc::new(p)),
-                Err(e) => {
-                    eprintln!("[marksman] typescript indexing failed ({e}); skipping TS files");
-                    ProviderBuild::Failed(e.to_string())
-                }
-            }
-        }
-        "java" => {
-            // Ungated ABLATION arm (mirrors CI_TS_MODE=treesitter): fallback provider on demand.
-            if std::env::var("CI_JAVA_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman] language: java (ABLATION: generic tree-sitter, UNGATED — CI_JAVA_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Java)));
-            }
-            // Gated tier: a missing JDK disables the language with the install hint
-            // (contract §6) — never a silent fall-back to ungated edits.
-            if let Some(missing) = lang_java::gate_missing() {
-                eprintln!("[marksman] java DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            eprintln!("[marksman] language: java (tree-sitter reads; gate: resident javax.tools sidecar, renames: jdtls)");
-            ProviderBuild::Ready(Arc::new(lang_java::JavaProvider::new(root)))
-        }
-        // Every other supported language rides the generic tree-sitter fallback: full read
-        // path, ungated edits, zero external dependencies.
-        other => match FbLang::from_name(other) {
-            Some(fb) => {
-                eprintln!("[marksman] language: {} (generic tree-sitter fallback, in-process — ungated edits)", fb.label());
-                ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
-            }
-            None => ProviderBuild::Failed(format!("unknown language '{other}'")),
-        },
-    }
-}
-
 fn cmd_index(root: &Path) {
     let mut config = rust_config(root);
     ci_embed::ensure_model(&model_dir(), &config.embedding_model).unwrap_or_else(|e| die(e));
@@ -160,7 +48,7 @@ fn cmd_index(root: &Path) {
     // Rust+TS+Python repo indexes fully). `cfg` is a snapshot for the constructors — build_registry
     // only rewrites include/exclude, which they don't read.
     let cfg = config.clone();
-    let built = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg))
+    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[marksman]"))
         .unwrap_or_else(|e| die(e));
     // A partial index (one language's toolchain down) still beats none for the CLI indexer, so we
     // proceed — but warn, since those files won't be indexed until the toolchain is fixed.

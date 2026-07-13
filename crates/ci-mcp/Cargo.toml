@@ -13,6 +13,7 @@ path = "src/main.rs"
 ci-core = { path = "../ci-core" }
 ci-index = { path = "../ci-index" }
 ci-build = { path = "../ci-build" }
+ci-providers = { path = "../ci-providers" }
 ci-embed = { path = "../ci-embed" }
 ci-retrieve = { path = "../ci-retrieve" }
 ci-arch = { path = "../ci-arch" }

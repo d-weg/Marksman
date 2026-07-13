@@ -1,184 +1,22 @@
-//! Marksman MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the
-//! input tools (retrieve_context, describe_architecture, find_symbols) and the
-//! output tools (list_anchors, read_node, apply_edits). Launch per repo:
+//! Marksman MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the two-tool
+//! facade: `inspect` (mode-dispatched reads: search / symbol / file / node / map) and
+//! `apply_edits` (structured, atomically applied, type-check-gated edits). Launch per repo:
 //!   marksman-mcp --root /path/to/repo   (or $MARKSMAN_ROOT, or cwd)
 //!
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
 use ci_arch::{build_architecture, format_architecture};
-use ci_build::{build_registry, ProviderBuild, ProviderRegistry};
+use ci_build::{build_registry, ProviderRegistry};
 use ci_core::{Config, EditOpts, Manifest, Node, NodeKind};
 use ci_edit::{action_to_op, resolve_all_in, resolve_in, Action};
 use ci_embed::StaticEmbedder;
 use ci_index::{index_dir, index_exists, load_index, save_index, IndexData};
 use ci_retrieve::{retrieve, RetrieveOptions};
-use ci_proto::ProcessProvider;
-use lang_fallback::{FallbackProvider, FbLang};
-use lang_rust::RustProvider;
-use lang_ts::TsProvider;
+use lang_fallback::FbLang;
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-/// Construct the provider for one language, honoring the manifest's vendored binary and
-/// `CI_PROVIDER=sidecar`. Called once per active language by [`build_registry`], so a language's
-/// toolchain is never probed, fetched, or run unless the repo actually has its files (a
-/// Rust-only repo never touches Node). Each language's TOOLCHAIN is checked before any of it
-/// runs: a missing dependency becomes `Unavailable` with the install instructions (permanent,
-/// carried on the registry), not a cryptic spawn error or a retry loop.
-fn make_provider(lang: &str, root: &Path, config: &Config) -> ProviderBuild {
-    if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
-        if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
-            eprintln!("[marksman-mcp] language: {lang} (sidecar process — protobuf wire)");
-            match ProcessProvider::spawn(cmd) {
-                Ok(p) => return ProviderBuild::Ready(Arc::new(p)),
-                Err(e) => {
-                    eprintln!("[marksman-mcp] sidecar {lang} failed to start ({e}); skipping");
-                    return ProviderBuild::Failed(e.to_string());
-                }
-            }
-        }
-        eprintln!("[marksman-mcp] CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
-    }
-    match lang {
-        "rust" => {
-            // Reads are in-process tree-sitter (no external deps) — the provider always comes
-            // up. rust-analyzer gates only WRITES: warn now if missing, and apply_edits repeats
-            // the same install hint if actually invoked.
-            if let Some(missing) = lang_rust::toolchain().describe_missing() {
-                eprintln!("[marksman-mcp] warning: {missing}\n  (rust reads work; type-checked edits will fail until installed)");
-            }
-            eprintln!("[marksman-mcp] language: rust (tree-sitter reads + rust-analyzer scip graph; gate: cargo check, renames: rust-analyzer)");
-            ProviderBuild::Ready(Arc::new(RustProvider::open(root, config.scip_enabled("rust"))))
-        }
-        "ts" => {
-            // CI_TS_MODE ablation arms (docs/benchmarks.md): serve TS from tree-sitter instead
-            // of SCIP — "treesitter" is the generic UNGATED provider (needs nothing external),
-            // "treesitter-gated" keeps the warm ts-morph gate on a tree-sitter read path.
-            match std::env::var("CI_TS_MODE").as_deref() {
-                Ok("treesitter") => {
-                    eprintln!("[marksman-mcp] language: typescript (ABLATION: generic tree-sitter, UNGATED — CI_TS_MODE=treesitter)");
-                    return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Ts)));
-                }
-                Ok("treesitter-gated") => {
-                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                        eprintln!("[marksman-mcp] typescript DISABLED (gated ablation still needs the gate's toolchain):\n{missing}");
-                        return ProviderBuild::Unavailable(missing);
-                    }
-                    eprintln!("[marksman-mcp] language: typescript (ABLATION: tree-sitter read + ts-morph gate — CI_TS_MODE=treesitter-gated)");
-                    return ProviderBuild::Ready(Arc::new(lang_ts::TsTreeGated::new(root)));
-                }
-                Ok("lsp") => {
-                    // COMPARISON arm: index by sweeping the tsgo language server (ci-lsp-index)
-                    // instead of scip-typescript; same SCIP read path, different producer.
-                    if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                        eprintln!("[marksman-mcp] typescript DISABLED (the LSP sweep still needs Node for tsgo via npx):\n{missing}");
-                        return ProviderBuild::Unavailable(missing);
-                    }
-                    eprintln!("[marksman-mcp] language: typescript (COMPARISON: tsgo LSP-sweep index — CI_TS_MODE=lsp)");
-                    return match TsProvider::index_with_lsp_sweep(root) {
-                        Ok(p) => ProviderBuild::Ready(Arc::new(p)),
-                        Err(e) => {
-                            eprintln!("[marksman-mcp] tsgo LSP-sweep indexing failed ({e}); skipping TS files");
-                            ProviderBuild::Failed(e.to_string())
-                        }
-                    };
-                }
-                _ => {}
-            }
-            // TypeScript needs Node for BOTH paths (scip-typescript index + the gate). Missing
-            // toolchain = the language is off, loudly and actionably — never a half-working
-            // provider or an ungated fallback.
-            if let Some(missing) = lang_ts::toolchain().describe_missing() {
-                eprintln!("[marksman-mcp] typescript DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            // `open` loads the cached .codeindex/index.scip when the source fingerprint still
-            // matches (ms), and re-runs scip-typescript only when it doesn't (~20s).
-            eprintln!("[marksman-mcp] language: typescript — opening scip index for {} …", root.display());
-            match TsProvider::open(root) {
-                Ok(p) => ProviderBuild::Ready(Arc::new(p)),
-                Err(e) => {
-                    eprintln!("[marksman-mcp] typescript indexing failed ({e}); skipping TS files");
-                    ProviderBuild::Failed(e.to_string())
-                }
-            }
-        }
-        "java" => {
-            // The ungated ABLATION arm (mirrors CI_TS_MODE=treesitter): the generic fallback
-            // provider, reachable for measurement — never the silent degradation path.
-            if std::env::var("CI_JAVA_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman-mcp] language: java (ABLATION: generic tree-sitter, UNGATED — CI_JAVA_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Java)));
-            }
-            // Gated tier: reads are in-process tree-sitter, the WRITE gate is the resident
-            // javax.tools sidecar — so a missing JDK disables the language with the install
-            // hint (contract §6), it never falls back to ungated edits silently.
-            if let Some(missing) = lang_java::gate_missing() {
-                eprintln!("[marksman-mcp] java DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            if let Some(t) = lang_java::toolchain().tools.iter().find(|t| t.tool == "jdtls" && t.found.is_none()) {
-                eprintln!("[marksman-mcp] warning: java rename/move needs {} — Install: {}\n  (reads and the javac gate work without it)", t.tool, t.install);
-            }
-            eprintln!("[marksman-mcp] language: java (tree-sitter reads; gate: resident javax.tools sidecar, renames: jdtls)");
-            ProviderBuild::Ready(Arc::new(lang_java::JavaProvider::new(root)))
-        }
-        "php" => {
-            // The ungated ABLATION arm (mirrors CI_JAVA_MODE=treesitter): the generic fallback
-            // provider, reachable for measurement — never the silent degradation path.
-            if std::env::var("CI_PHP_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman-mcp] language: php (ABLATION: generic tree-sitter, UNGATED — CI_PHP_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Php)));
-            }
-            // Gated tier: reads are in-process tree-sitter, the WRITE gate is PHPStan — so a
-            // missing php/phpstan disables the language with the install hint (contract §6), it
-            // never falls back to ungated edits silently.
-            if let Some(missing) = lang_php::gate_missing(root) {
-                eprintln!("[marksman-mcp] php DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            if let Some(t) = lang_php::toolchain(root).tools.iter().find(|t| t.tool == "phpactor" && t.found.is_none()) {
-                eprintln!("[marksman-mcp] warning: php rename/move needs {} — Install: {}\n  (reads and the phpstan gate work without it)", t.tool, t.install);
-            }
-            eprintln!("[marksman-mcp] language: php (tree-sitter reads; gate: phpstan analyse, renames: phpactor)");
-            ProviderBuild::Ready(Arc::new(lang_php::PhpProvider::new(root)))
-        }
-        "swift" => {
-            // The ungated ABLATION arm (mirrors CI_JAVA_MODE=treesitter): the generic fallback
-            // provider, reachable for measurement — never the silent degradation path.
-            if std::env::var("CI_SWIFT_MODE").as_deref() == Ok("treesitter") {
-                eprintln!("[marksman-mcp] language: swift (ABLATION: generic tree-sitter, UNGATED — CI_SWIFT_MODE=treesitter)");
-                return ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, FbLang::Swift)));
-            }
-            // Gated tier: reads are in-process tree-sitter, the WRITE gate is `swift build` — so a
-            // missing Swift toolchain disables the language with the install hint (contract §6), it
-            // never falls back to ungated edits silently.
-            if let Some(missing) = lang_swift::gate_missing() {
-                eprintln!("[marksman-mcp] swift DISABLED:\n{missing}");
-                return ProviderBuild::Unavailable(missing);
-            }
-            if let Some(t) = lang_swift::toolchain().tools.iter().find(|t| t.tool == "sourcekit-lsp" && t.found.is_none()) {
-                eprintln!("[marksman-mcp] warning: swift rename needs {} — Install: {}\n  (reads and the `swift build` gate work without it)", t.tool, t.install);
-            }
-            eprintln!("[marksman-mcp] language: swift (tree-sitter reads; gate: `swift build`, renames: sourcekit-lsp)");
-            ProviderBuild::Ready(Arc::new(lang_swift::SwiftProvider::new(root)))
-        }
-        // Every other supported language rides the generic tree-sitter fallback: full read
-        // path, ungated edits, zero external dependencies.
-        other => match FbLang::from_name(other) {
-            Some(fb) => {
-                eprintln!(
-                    "[marksman-mcp] language: {} (generic tree-sitter fallback, in-process — edits are ungated)",
-                    fb.label()
-                );
-                ProviderBuild::Ready(Arc::new(FallbackProvider::new(root, fb)))
-            }
-            None => ProviderBuild::Failed(format!("unknown language '{other}'")),
-        },
-    }
-}
 
 /// The extension → provider registry for `root`, dispatching each file to its language's provider
 /// so a mixed repo reads/edits fully. Absent/disabled languages register nothing.
@@ -186,7 +24,7 @@ fn build_registry_for(root: &Path) -> Result<ProviderRegistry, String> {
     let mut config = Config::load(root).unwrap_or_default();
     config.index_dir = ".marksman".into();
     let cfg = config.clone();
-    let built = build_registry(root, &mut config, |lang| make_provider(lang, root, &cfg)).map_err(|e| e.to_string())?;
+    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[marksman-mcp]")).map_err(|e| e.to_string())?;
     // A language that's present + enabled but whose provider failed to construct (e.g.
     // scip-typescript lost an npx-cache race and exited non-zero) yields an INCOMPLETE registry:
     // its files would silently have no provider, so every read/edit on them degrades to "symbol
@@ -485,7 +323,7 @@ impl Server {
                 content.trim_end()
             )
         } else {
-            format!("(no symbol anchors in {file} — {lines} lines of file-level statements; read_node/Read for content, replace_text with `path` + unique `oldText` to edit)")
+            format!("(no symbol anchors in {file} — {lines} lines of file-level statements; inspect mode:node / Read for content, replace_text with `path` + unique `oldText` to edit)")
         })
     }
 
@@ -581,7 +419,7 @@ impl Server {
             .collect();
         if ids.is_empty() {
             return Err(format!(
-                "symbol '{reference}' not found in the index — pass a `path`, or a node id from list_anchors/retrieve_context"
+                "symbol '{reference}' not found in the index — pass a `path`, or a node id from inspect (mode:file / mode:search)"
             ));
         }
         let ids = gate(ids)?;
@@ -727,7 +565,7 @@ impl Server {
             1 => Ok(ids.into_iter().next().unwrap()),
             _ => self.resolve_by_containment(registry, path, op_needle).ok_or_else(|| {
                 if ids.is_empty() {
-                    format!("query {query:?} resolved to no symbol — use retrieve_context to find it, then edit by name/id")
+                    format!("query {query:?} resolved to no symbol — use inspect mode:search to find it, then edit by name/id")
                 } else {
                     let viable = self.viable_candidates(registry, &ids, op_needle);
                     if viable.is_empty() && op_needle.is_some_and(|n| !n.is_empty()) {
@@ -831,7 +669,7 @@ impl Server {
         } else if let Some(name) = args["name"].as_str() {
             self.resolve_symbol(&registry, args["file"].as_str().unwrap_or(""), name, None)?
         } else {
-            return Err("provide `id` (a node id from list_anchors) or `name`".into());
+            return Err("provide `id` (a node id from inspect mode:file) or `name`".into());
         };
         let file = file_of(&id).to_string();
         let nodes = registry.structure(Path::new(&file)).map_err(|e| e.to_string())?;
@@ -1553,7 +1391,7 @@ impl Server {
                  everywhere. Do NOT grep, re-read, or run checks to verify."
             }
             (false, true) => {
-                "The scan above already re-checked the whole repo — do NOT grep, re-read, or list_anchors \
+                "The scan above already re-checked the whole repo — do NOT grep, re-read, or inspect \
                  to verify the rename(s). Code references MUST be fixed; comment/doc mentions SHOULD \
                  follow the rename too (stale prose misleads the next reader) unless the user wants the \
                  old wording kept. To fix any line, re-issue its `fix` action VERBATIM — all of them in \
@@ -1641,7 +1479,7 @@ impl Server {
                 text
             } else {
                 let head: Vec<&str> = text.lines().take(30).collect();
-                format!("{}\n… ({} more lines — read_node {} if you must see them)", head.join("\n"), n - 30, id)
+                format!("{}\n… ({} more lines — inspect mode:node {} if you must see them)", head.join("\n"), n - 30, id)
             };
             blocks.push(format!(
                 "{id} (L{}-{}):\n```\n{shown}\n```",
@@ -1924,7 +1762,7 @@ fn replaced_extent_note(root: &Path, registry: &ProviderRegistry, ai: usize, act
             t
         } else {
             let head: Vec<&str> = t.lines().take(12).collect();
-            format!("{}\n… ({} more lines — read_node {} for the rest)", head.join("\n"), n - 12, id)
+            format!("{}\n… ({} more lines — inspect mode:node {} for the rest)", head.join("\n"), n - 12, id)
         }
     };
     let lines_text = cap(slice_lines(&content, node.range.start_line, node.range.end_line));
@@ -1991,11 +1829,11 @@ fn tools_list() -> Value {
     let mut tools = json!([
         {
             "name": "apply_edits",
-            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS + Rust gated; Python structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never read_node/retrieve_context/list_anchors the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Same for ADDING code to a named module/file: send `add_symbol` on turn 1 with `name`/`query` = any symbol you expect in the destination (its exported function, its own module name) — the server resolves the file, and a miss returns candidates, so an inspect-first survey only re-derives what this call already knows. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by find_symbols, list_anchors, retrieve_context, or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move. Per language, that one action already covers: TS — %TS_MOVE%; Rust — %RUST_MOVE%. Do NOT add create_file/replace_text helpers for imports or module decls alongside it — each helper you type is output spent re-doing what the move does, and researching the sites to WRITE those helpers is the real cost. When the task states the from/to paths, send the bare move with NO exploration first: the commit response shows EVERY line the move rewrote, per file (declarations, created module files, import/`use` paths) — a pre-move survey can only re-derive that diff — and the type-check gate rejects safely if anything is off. Genuinely unsure? `dryRun:true` on the bare move returns the same verdict without writing — ONE call, cheaper than any importer survey (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines — and config/manifest files with no compiler, e.g. a Cargo.toml or package.json line: those apply ungated, TOML/JSON syntax verified only, and land in the SAME atomic batch as code edits). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `add_symbol` (path — or, when you don't know the file, `name`/`query` naming ANY symbol already in it (the server resolves the file: no locate call first); value=the complete new top-level declaration — a function, type, or test) — appends at the END of the file with spacing handled server-side; the way to ADD a symbol that doesn't exist yet (insert_before instead places code before an EXISTING symbol; if the name already exists, the reply shows its current source and points at replace_node). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
+            "description": "Apply structured code edits atomically, type-checked over the blast radius before they land — NOTHING is written unless the whole batch compiles clean, so a rejected attempt is FREE (nothing to undo, nothing corrupted). TS/Rust/Java/PHP/Swift gated; Python etc. structural-only (`gated:false` — verify yourself). Use this for EVERY code edit, big or SMALL; do NOT grep-then-Edit (untyped, verified by hand).\nWIDE CHANGES — the protocol for anything whose blast radius you'd otherwise hunt for (adding a REQUIRED member to a type, changing a signature): make the anchor edit ALONE, first, with no pre-reading — the rejection is the site discovery. The type-checker enumerates EVERY affected site exhaustively (searching for the sites yourself is slower and can miss some), and the reject shows each site's current source (its in-scope variables included) plus a ready-to-copy `fix:` action with the target symbol and anchor already filled in. Then re-issue ONE batch: the anchor edit + each `fix:` verbatim with only `value` filled from the shown source. Never inspect the sites — the reject already contains their code and scope.\nADDRESSING: if the task NAMES the symbol, go STRAIGHT here — no locate step first. Same for ADDING code to a named module/file: send `add_symbol` on turn 1 with `name`/`query` = any symbol you expect in the destination (its exported function, its own module name) — the server resolves the file, and a miss returns candidates, so an inspect-first survey only re-derives what this call already knows. Use a node id (e.g. `src/http/retry.ts#parseResponse`) when you were GIVEN one (by inspect or a reject) — unique and self-locating. If you only know the FILE and the NAME, pass `name` + `path` (resolution scoped to that file); do NOT construct a `file#Name` id yourself — nested symbols' ids include their scope (`file#Class.method`), so a guessed id misses (the error then lists the file's real ids). A bare `name` alone also works (the index finds its file); a same-name collision auto-resolves when YOUR OWN edit disambiguates it (e.g. only one `timeoutMs` definition contains oldText `3000` — that one is the target); only a genuinely ambiguous name returns candidate ids to re-issue with. Don't know the name at all? pass `query` (free-text) plus `path` — your oldText resolves it when the description alone is ambiguous.\nBATCH independent edits into ONE call — they apply and type-check together, atomically. A one-line change (flip a default, fix a value) is `replace_text` BY NAME: name=`timeoutMs` oldText=`3000` newText=`5000` — no Grep, no Read, gate-verified. In gated languages (TS/Rust/Java/PHP/Swift), `rename`/`move_file` additionally rewrite every reference/import across the repo in ONE call — a bare `move_file` is the COMPLETE move. Per language, that one action already covers: TS — %TS_MOVE%; Rust — %RUST_MOVE%; Java — %JAVA_MOVE%; PHP — %PHP_MOVE%; Swift — %SWIFT_MOVE%. Do NOT add create_file/replace_text helpers for imports or module decls alongside it — each helper you type is output spent re-doing what the move does, and researching the sites to WRITE those helpers is the real cost. When the task states the from/to paths, send the bare move with NO exploration first: the commit response shows EVERY line the move rewrote, per file (declarations, created module files, import/`use` paths) — a pre-move survey can only re-derive that diff — and the type-check gate rejects safely if anything is off. Genuinely unsure? `dryRun:true` on the bare move returns the same verdict without writing — ONE call, cheaper than any importer survey (ungated: best-effort within the edited file — verify references yourself).\nPick the SMALLEST edit: • `replace_text` (name, oldText=substring unique within the symbol, newText) — cheapest, no read first; with NO name/query but a `path`, a UNIQUE oldText edits the FILE directly (the way to touch imports/`mod` decls/file-top lines — and config/manifest files with no compiler, e.g. a Cargo.toml or package.json line: those apply ungated, TOML/JSON syntax verified only, and land in the SAME atomic batch as code edits). • `replace_node` + target=`body`|`return`|`param.N` (0-based)|`doc`, value=new code — one sub-node. • `set_body` (name, value=new `{ … }`) — rewrite most of a body. • `insert_in_body` (name, value=statement, optional oldText=body line to insert AFTER — substring-matched and auto-indented, so never reason about whitespace; omit oldText to append at the END of the body) / `delete_in_body` (name, oldText=the line to remove). • `insert_member` (name=an interface/type/class/object symbol, value=the new member — INCLUDE its own `;` for a type/interface field or `,` for an object property) — inserted as the FIRST member of the `{ … }` block. • `add_parameter` (name, value=`x: T`) / `set_return_type` (name, value=type; to CHANGE an existing one use replace_node target:return). • `add_symbol` (path — or, when you don't know the file, `name`/`query` naming ANY symbol already in it (the server resolves the file: no locate call first); value=the complete new top-level declaration — a function, type, or test) — appends at the END of the file with spacing handled server-side; the way to ADD a symbol that doesn't exist yet (insert_before instead places code before an EXISTING symbol; if the name already exists, the reply shows its current source and points at replace_node). • `rename` (name, value=new name; path optional); `move_file` (path, value=new path); also `insert_before` / `create_file` / `delete_file`.",
             "inputSchema": {"type":"object","properties":{
                 "actions":{"type":"array","description":"One or more edits, applied atomically and type-checked together — batch related edits here instead of separate calls.","items":{"type":"object","additionalProperties":false,"properties":{
                     "action":{"type":"string","enum":["rename","replace_text","replace_node","set_body","insert_in_body","delete_in_body","insert_member","add_parameter","set_return_type","insert_before","add_symbol","move_file","create_file","delete_file"],"description":"Fields per action — rename: name, value(new name) · replace_text: name, oldText, newText · replace_node: name, value(new code), target? · set_body: name, value · insert_in_body: name, value, oldText? · delete_in_body: name, oldText · insert_member: name, value · add_parameter: name, value · set_return_type: name, value · insert_before: name, value · add_symbol: path OR name/query(any symbol in the target file — the server resolves the file), value(the new top-level declaration) · move_file: path, value(new path) · create_file: path, value(source) · delete_file: path. For symbol actions `query` may replace `name`, and `path` may scope a bare `name`."},
-                    "name":{"type":"string","description":"Target symbol: a node id `file#Scope.name` you were GIVEN (find_symbols/list_anchors/a reject), or a bare NAME — add `path` when you know the defining file, omit it to let the index find the file. If ambiguous, the reply lists candidate ids to re-issue with. Used by every symbol action."},
+                    "name":{"type":"string","description":"Target symbol: a node id `file#Scope.name` you were GIVEN (inspect/a reject), or a bare NAME — add `path` when you know the defining file, omit it to let the index find the file. If ambiguous, the reply lists candidate ids to re-issue with. Used by every symbol action."},
                     "query":{"type":"string","description":"Use INSTEAD of `name` when you don't know it: a free-text description of the target; the server resolves it via the index and applies if unambiguous. Pass `path` (and, for text ops, oldText) alongside — when the description alone is ambiguous, the one symbol in that file containing your oldText resolves it."},
                     "path":{"type":"string","description":"The file to resolve a bare `name` in — pass it whenever you know the defining file (avoids ambiguity; the id stays validated). Also the file path for move_file/create_file/delete_file, and optionally rename."},
                     "value":{"type":"string","description":"The new code/text for MOST actions: rename→the new name; replace_node→new node code; set_body→new `{ … }` block; insert_in_body→a statement; insert_member→the new member (include its own `;` or `,`); add_parameter→`x: T`; set_return_type→the type; add_symbol→the complete new top-level declaration; move_file→the new path; create_file→the file source. NOTE: replace_text does NOT use `value` — it uses oldText/newText."},
@@ -2044,7 +1882,10 @@ fn tools_list() -> Value {
     if let Some(desc) = tools[0]["description"].as_str() {
         let d = desc
             .replace("%TS_MOVE%", lang_ts::MOVE_COVERAGE)
-            .replace("%RUST_MOVE%", lang_rust::MOVE_COVERAGE);
+            .replace("%RUST_MOVE%", lang_rust::MOVE_COVERAGE)
+            .replace("%JAVA_MOVE%", lang_java::MOVE_COVERAGE)
+            .replace("%PHP_MOVE%", lang_php::MOVE_COVERAGE)
+            .replace("%SWIFT_MOVE%", lang_swift::MOVE_COVERAGE);
         tools[0]["description"] = json!(d);
     }
     tools
@@ -2073,12 +1914,14 @@ fn resp(id: Value, result: Value) -> Value {
 /// two-tool facade is the whole surface: retrieval handlers (`retrieve_context`,
 /// `find_symbols`, `list_anchors`, `read_node`, `describe_architecture`) are reachable
 /// only through `inspect`'s mode dispatch, never by tool name.
-const TOOL_HANDLERS: &[(&str, fn(&mut Server, &Value) -> Result<String, String>)] = &[
+type ToolHandler = fn(&mut Server, &Value) -> Result<String, String>;
+
+const TOOL_HANDLERS: &[(&str, ToolHandler)] = &[
     ("apply_edits", |server, args| server.apply_edits(args)),
     ("inspect", |server, args| server.inspect(args)),
 ];
 
-fn tool_handler(name: &str) -> Option<fn(&mut Server, &Value) -> Result<String, String>> {
+fn tool_handler(name: &str) -> Option<ToolHandler> {
     TOOL_HANDLERS.iter().find(|(n, _)| *n == name).map(|(_, h)| *h)
 }
 
@@ -2105,7 +1948,7 @@ fn main() {
 
         let out: Option<Value> = match method {
             "initialize" => id.map(|id| {
-                resp(id, json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"codeindex-rs","version":"0.1.0"}}))
+                resp(id, json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"marksman","version":"0.1.0"}}))
             }),
             "notifications/initialized" => None,
             "ping" => id.map(|id| resp(id, json!({}))),
@@ -2361,7 +2204,10 @@ mod tests {
         assert_eq!(tools[0]["name"], "apply_edits", "apply_edits leads the listing");
         assert!(desc.contains(lang_ts::MOVE_COVERAGE), "ts claim wired in");
         assert!(desc.contains(lang_rust::MOVE_COVERAGE), "rust claim wired in");
-        assert!(!desc.contains("%TS_MOVE%") && !desc.contains("%RUST_MOVE%"), "no unexpanded placeholders");
+        assert!(desc.contains(lang_java::MOVE_COVERAGE), "java claim wired in");
+        assert!(desc.contains(lang_php::MOVE_COVERAGE), "php claim wired in");
+        assert!(desc.contains(lang_swift::MOVE_COVERAGE), "swift claim wired in");
+        assert!(!desc.contains("_MOVE%"), "no unexpanded placeholders");
     }
 
     #[test]

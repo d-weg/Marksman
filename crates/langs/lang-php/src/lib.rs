@@ -28,6 +28,11 @@ mod gate;
 mod movefix;
 mod phpactor;
 
+/// What a bare `move_file` covers for PHP — composed into the `apply_edits` description by
+/// ci-mcp, so the completeness claim the agent reads lives NEXT TO the code that makes it true
+/// (movefix + phpactor + the PHPStan gate). Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "the `namespace` declaration rewritten and every `use`/fully-qualified reference retargeted (phpactor-native when available, syntactic fallback otherwise)";
+
 /// The gated PHP provider. `gated()` is `true` because construction goes through the registry's
 /// PHPStan check ([`gate_missing`]) — a missing php/phpstan disables the language with the
 /// install hint (`ProviderBuild::Unavailable`), it never ships an ungated PHP silently.
@@ -83,8 +88,11 @@ fn engine_factory(root: &Path) -> EngineFactory {
             let hint = gate_missing(&root).unwrap_or_else(|| "php/phpstan required for the gate".into());
             return Err(ci_core::Error::Driver(format!("php edit engine unavailable.\n{hint}")));
         };
-        Ok(Box::new(gate::PhpEngine { root: engine_root.to_path_buf(), phpstan, lsp: None })
-            as Box<dyn GateEngine + Send>)
+        Ok(Box::new(gate::PhpEngine::new(
+            engine_root,
+            phpstan,
+            ci_core::resolve_sandbox(engine_root, "marksman-php"),
+        )) as Box<dyn GateEngine + Send>)
     })
 }
 
@@ -541,6 +549,57 @@ mod tests {
         assert!(
             fs::read_to_string(root.join("src/App.php")).unwrap().contains("Util::fetchBase()"),
             "REFERENCE rewritten cross-file — the reason phpactor exists here"
+        );
+    }
+
+    // An engine whose toolchain runs inside the `marksman-php` OCI container (bypassing the host
+    // probe, as `CI_SANDBOX=oci` would at runtime). `phpstan` field is a placeholder — the
+    // containerized gate resolves phpstan by bare name in the image.
+    fn oci_php_factory() -> EngineFactory {
+        Arc::new(|engine_root: &Path| {
+            let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
+                engine_root.to_path_buf(),
+                ci_core::oci_runtime().expect("an OCI runtime on PATH"),
+                "marksman-php".into(),
+            ));
+            Ok(Box::new(gate::PhpEngine::new(
+                engine_root,
+                std::path::PathBuf::from("phpstan"),
+                sandbox,
+            )) as Box<dyn GateEngine + Send>)
+        })
+    }
+
+    // M2.4 (docs/container-gate-spec.md §9b). Requires docker (or another OCI runtime) up AND the
+    // php image:  docker build -f docker/marksman-php.Dockerfile -t marksman-php docker/
+    // The PHPStan gate AND the phpactor cross-file rename both run in the container from the image
+    // (the gate's overlay tree lives under $TMPDIR, which the sandbox mounts), so this passes with
+    // NO host php/phpstan/phpactor — the second bench "absent LSP" case (php rename), closed.
+    #[test]
+    #[ignore]
+    fn oci_php_gate_and_rename_without_host_tools() {
+        if ci_core::oci_runtime().is_none() {
+            eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
+            return;
+        }
+        let dir = write_repo(&[
+            ("composer.json", "{ \"autoload\": { \"psr-4\": { \"App\\\\\": \"src/\" } } }\n"),
+            ("src/Util.php", "<?php\nnamespace App;\nclass Util {\n  public static function base(): int {\n    return 1;\n  }\n}\n"),
+            ("src/App.php", "<?php\nnamespace App;\nclass App {\n  public function run(): int {\n    return Util::base();\n  }\n}\n"),
+        ]);
+        let root = dir.path();
+        let p = PhpProvider::with_factory(root, oci_php_factory());
+        let res = p
+            .apply_edits(
+                &[EditOp::Rename { node_id: "src/Util.php#Util.base".into(), new_name: "fetchBase".into() }],
+                &OPTS,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename commits through the CONTAINER gate: {res:?}");
+        assert!(fs::read_to_string(root.join("src/Util.php")).unwrap().contains("fetchBase"), "definition renamed");
+        assert!(
+            fs::read_to_string(root.join("src/App.php")).unwrap().contains("Util::fetchBase()"),
+            "cross-file reference rewritten by the CONTAINER's phpactor — no host phpactor consulted"
         );
     }
 }

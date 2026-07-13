@@ -66,6 +66,29 @@ pub fn probe_tool(cmd: &mut Command) -> Option<String> {
     Some(if first.is_empty() { "present".into() } else { first })
 }
 
+/// Resolve an external tool binary the conventional way: `$<env>` when it names an existing
+/// file, else the first of `names` found on `$PATH`, else the first existing path in
+/// `fallbacks`. `None` = not installed (the caller's toolchain report says how to get it).
+///
+/// Env semantics: a set-but-missing `$<env>` falls through to the PATH scan (matching the
+/// historical per-provider lookups this replaces). Providers whose env var is
+/// unconditional-trust — `CI_RUST_ANALYZER`, `CI_TSGO`, where an explicitly-set-but-wrong path
+/// should fail loudly later instead of silently falling through — deliberately do NOT use this.
+pub fn discover_tool(env: &str, names: &[&str], fallbacks: &[&str]) -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var(env) {
+        let p = std::path::PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for name in names {
+        if let Some(p) = crate::sandbox::find_on_path(name) {
+            return Some(p);
+        }
+    }
+    fallbacks.iter().map(std::path::PathBuf::from).find(|p| p.is_file())
+}
+
 /// The outcome of [`run_capped`].
 pub struct CappedOutput {
     /// The child's exit status, or `None` when the deadline killed it (`timed_out`).
@@ -85,6 +108,55 @@ pub struct CappedOutput {
 pub fn gate_timeout() -> Duration {
     let secs = std::env::var("CI_GATE_TIMEOUT_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
     Duration::from_secs(secs)
+}
+
+/// Byte cap for a gate verdict tool's captured stdout/stderr. 32 MiB — a warm compiler pass
+/// emits error messages only, so this is orders of magnitude of headroom; its job is bounding a
+/// pathologically chatty tool, not trimming a normal one. Truncation is SOUND for a gate: a
+/// capped stream can only DROP diagnostics on an already-failing exit code, and
+/// [`silent_tool_failure_diag`] turns "failed with nothing parsed" into a reject — so no drop
+/// path reaches a false clean.
+pub const GATE_OUTPUT_CAP: usize = 32 * 1024 * 1024;
+
+/// Run a one-shot gate VERDICT tool through `sandbox`: output capped at [`GATE_OUTPUT_CAP`],
+/// killed at [`gate_timeout`]. A timeout is [`Error::GateTimeout`](crate::Error::GateTimeout) —
+/// the caller MUST propagate it (the edit is refused, disk untouched), never map it into a
+/// weaker verdict or a fallback engine. Spawn failures are `Driver` (those MAY have a fallback:
+/// "tool absent" is honest degrade territory, "tool hung" never is).
+pub fn run_gate_capped(
+    sandbox: &dyn crate::Sandbox,
+    cmd: &mut Command,
+    tool: &str,
+) -> crate::Result<CappedOutput> {
+    let out = sandbox
+        .run_capped(cmd, gate_timeout(), GATE_OUTPUT_CAP)
+        .map_err(|e| crate::Error::Driver(format!("{tool} spawn: {e}")))?;
+    if out.timed_out {
+        return Err(crate::Error::GateTimeout(format!(
+            "{tool} exceeded the gate timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher if this \
+             project legitimately takes longer",
+            gate_timeout().as_secs()
+        )));
+    }
+    Ok(out)
+}
+
+/// The reject-on-failed-tool invariant, in one place: a gate tool that exits non-zero having
+/// produced ZERO parsed diagnostics died before reporting (segfault, OOM-kill, bad config, no
+/// runtime) — and the spine reads an empty diagnostic set as clean-commit. Return the one `Diag`
+/// that makes the spine REJECT instead of reading silence as clean. `first_line` extracts the
+/// per-tool failure message (stderr first line, a `contains("error:")` scan, …) — the only part
+/// that is legitimately per-language.
+pub fn silent_tool_failure_diag(
+    exited_ok: bool,
+    parsed: &[crate::Diag],
+    anchor_file: &str,
+    first_line: impl FnOnce() -> String,
+) -> Option<crate::Diag> {
+    if exited_ok || !parsed.is_empty() {
+        return None;
+    }
+    Some(crate::Diag { file: anchor_file.into(), code: 0, message: first_line(), line: 0 })
 }
 
 /// Run `cmd` capturing stdout/stderr, each capped at `cap` bytes (excess is drained but dropped, so

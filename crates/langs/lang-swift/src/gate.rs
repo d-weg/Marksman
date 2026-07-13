@@ -10,12 +10,12 @@
 //! text — compiler errors land on STDOUT, SwiftPM manifest/toolchain failures on stderr (no JSON
 //! — the JSON-diagnostics issue is still open upstream); both streams are regex-parsed to
 //! file:line:col.
-use ci_core::{Diag, Error, Result};
+use ci_core::{Diag, Error, Result, Sandbox};
 use ci_edit::GateEngine;
-use ci_lsp::LspClient;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
+use std::sync::Arc;
 
 use crate::sourcekit;
 
@@ -27,6 +27,7 @@ use crate::sourcekit;
 /// deleted symbol is the introduced break we WANT to catch.
 fn swift_build_diagnostics(
     root: &Path,
+    sandbox: &dyn Sandbox,
     files: &[(String, String)],
     target_dirs: Option<&[String]>,
 ) -> Result<Vec<Diag>> {
@@ -49,16 +50,9 @@ fn swift_build_diagnostics(
     }
     let mut cmd = Command::new("swift");
     cmd.arg("build").current_dir(mirror.path());
-    // Capped + time-bounded: a chatty build can't OOM us, and a hung one can't hang the edit
-    // forever (the timeout is generous so a legitimately slow cold build is never killed).
-    let out = ci_core::run_capped(&mut cmd, ci_core::gate_timeout(), 32 * 1024 * 1024)
-        .map_err(|e| Error::Driver(format!("swift build spawn: {e}")))?;
-    if out.timed_out {
-        return Err(Error::Driver(format!(
-            "swift build exceeded the gate timeout ({}s) — set CI_GATE_TIMEOUT_SECS higher if this package legitimately builds slower",
-            ci_core::gate_timeout().as_secs()
-        )));
-    }
+    // Capped + time-bounded (run_gate_capped): a chatty build can't OOM us, and a hung one can't
+    // hang the edit forever; a timeout REFUSES the edit (Error::GateTimeout propagates).
+    let out = ci_core::run_gate_capped(sandbox, &mut cmd, "swift build")?;
     // `swift build` exits non-zero WHEN the build fails — the normal reporting path, not a tool
     // failure. The compiler prints its GCC-style diagnostics to STDOUT (the driver's progress log
     // rides there too); stderr carries SwiftPM-level manifest/toolchain failures. Parse both so a
@@ -69,18 +63,23 @@ fn swift_build_diagnostics(
         String::from_utf8_lossy(&out.stderr)
     );
     let mut diags = parse_swift_diagnostics(&combined, mirror.path());
-    // Reject-on-failed-tool (the invariant lang-rust's gate encodes at gate.rs `!success &&
-    // diags.is_empty()`): a nonzero exit with NO parsed diagnostic means the build failed in a
+    // Reject-on-failed-tool: a nonzero exit with NO parsed diagnostic means the build failed in a
     // way that carries no `PATH:LINE:COL: error:` line — a link error (`ld: symbol(s) not
-    // found`), an invalid manifest, a toolchain fault. The spine reads an empty diagnostic set
-    // as clean-commit, so surface the failure as a reject rather than let a broken build pass.
-    if !out.status.is_some_and(|s| s.success()) && diags.is_empty() {
-        let first = combined
-            .lines()
-            .map(str::trim)
-            .find(|l| l.contains("error:"))
-            .unwrap_or("swift build failed with no source-anchored diagnostic");
-        diags.push(Diag { file: "Package.swift".into(), code: 0, message: first.to_string(), line: 0 });
+    // found`), an invalid manifest, a toolchain fault.
+    if let Some(d) = ci_core::silent_tool_failure_diag(
+        out.status.is_some_and(|s| s.success()),
+        &diags,
+        "Package.swift",
+        || {
+            combined
+                .lines()
+                .map(str::trim)
+                .find(|l| l.contains("error:"))
+                .unwrap_or("swift build failed with no source-anchored diagnostic")
+                .to_string()
+        },
+    ) {
+        diags.push(d);
     }
     Ok(diags)
 }
@@ -94,7 +93,7 @@ fn swift_build_diagnostics(
 /// `swiftc -typecheck`); bounding the COPY is the only safe lever.
 fn copy_package_tree(src: &Path, dst: &Path, target_dirs: Option<&[String]>) -> Result<()> {
     let under_target = |rel: &str| {
-        target_dirs.map_or(true, |dirs| {
+        target_dirs.is_none_or(|dirs| {
             dirs.iter().any(|d| d.is_empty() || rel == d || rel.starts_with(&format!("{d}/")))
         })
     };
@@ -209,49 +208,56 @@ fn split_diag_head(line: &str) -> Option<(String, &str, u32)> {
 /// Build the package AT THE REPO ROOT so `.build/*/index/store` (the IndexStoreDB sourcekit-lsp's
 /// rename reads from) is populated. Best-effort — a build failure isn't fatal here (the gate has
 /// its own verdict path); the rename simply falls back to whatever index freshness sourcekit has.
-/// Skipped when there is no `Package.swift` (sourcekit-lsp is SwiftPM-only anyway).
-fn prime_index(root: &Path) {
+/// Skipped when there is no `Package.swift` (sourcekit-lsp is SwiftPM-only anyway). Runs through
+/// the SANDBOX (time-bounded): under `CI_SANDBOX=oci` this primes the container's index store —
+/// the one sourcekit actually reads there — instead of pointlessly invoking host swift.
+fn prime_index(root: &Path, sandbox: &dyn Sandbox) {
     if !root.join("Package.swift").is_file() {
         return;
     }
-    let _ = Command::new("swift")
-        .arg("build")
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    let Ok(mut cmd) = ci_core::tool_command(sandbox, "swift", || Ok(Command::new("swift"))) else {
+        return;
+    };
+    cmd.arg("build").current_dir(root);
+    let _ = sandbox.run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024);
 }
 
 /// The Swift write engine behind `Composed`: `swift build` verdicts, sourcekit-lsp rewrites.
 pub(crate) struct SwiftEngine {
-    pub(crate) root: PathBuf,
-    /// sourcekit-lsp, started on the FIRST rename only — diagnostics never wait on it, and a
-    /// missing LSP costs nothing until an op actually needs cross-file rewrites.
-    pub(crate) lsp: Option<LspClient>,
+    root: PathBuf,
+    /// sourcekit-lsp, started on the FIRST rename only (`ci_edit::LazyLsp`) — diagnostics never
+    /// wait on it, and a missing LSP costs nothing until an op needs cross-file rewrites.
+    lsp: ci_edit::LazyLsp,
     /// Cached SwiftPM target source dirs (repo-relative), from `swift package describe`. Outer
-    /// `None` = not probed yet; inner `None` = describe unavailable (the G4 target check is then
-    /// skipped — fail open). Populated lazily on the first `diagnostics` call.
-    pub(crate) target_dirs: Option<Option<Vec<String>>>,
+    /// `None` = not probed yet; inner `None` = no Package.swift (not a SwiftPM package — the only
+    /// case the G4 target check legitimately skips). A describe FAILURE on a real package is an
+    /// `Err` (fail closed) and is NOT cached, so a fixed toolchain recovers on the next edit.
+    /// Populated lazily on the first `diagnostics` call.
+    target_dirs: Option<Option<Vec<String>>>,
+    /// Where the toolchain runs (`ci_core::resolve_sandbox`) — the `swift build` verdict, the
+    /// describe probe, and index priming all use it; the container backend swaps in here.
+    sandbox: Arc<dyn Sandbox>,
 }
 
 impl SwiftEngine {
-    fn sourcekit(&mut self) -> Result<&mut LspClient> {
-        if self.lsp.is_none() {
-            self.lsp = Some(sourcekit::start(&self.root)?);
-        }
-        Ok(self.lsp.as_mut().expect("just set"))
+    pub(crate) fn new(root: &Path, sandbox: Arc<dyn Sandbox>) -> Self {
+        let lsp = ci_edit::LazyLsp::new({
+            let root = root.to_path_buf();
+            let sandbox = sandbox.clone();
+            move || sourcekit::start(&root, &*sandbox)
+        });
+        Self { root: root.to_path_buf(), lsp, target_dirs: None, sandbox }
     }
 
     /// G4 honesty check: `swift build` only type-checks files that belong to a SwiftPM target, so
     /// an edit to a file OUTSIDE every target would build clean and commit under a false
     /// "type-verified" banner. Swift's import graph is empty, so the gate's `files` set is exactly
     /// the edited files — refuse the batch (an `Err`, which propagates before baseline-diff can
-    /// cancel it) when an edited `.swift` file is in no target. Fail open if describe is
-    /// unavailable.
+    /// cancel it) when an edited `.swift` file is in no target. Fail CLOSED when describe fails
+    /// on a real package (the `?` below): a check that can't run must refuse, not skip.
     fn reject_untargeted(&mut self, files: &[(String, String)]) -> Result<()> {
         if self.target_dirs.is_none() {
-            self.target_dirs = Some(describe_target_dirs(&self.root));
+            self.target_dirs = Some(describe_target_dirs(&self.root, &*self.sandbox)?);
         }
         let Some(Some(dirs)) = self.target_dirs.as_ref() else { return Ok(()) };
         for (rel, content) in files {
@@ -275,25 +281,36 @@ impl SwiftEngine {
 
 /// The repo-relative source directory of each SwiftPM target, via `swift package describe
 /// --type json` (authoritative — it evaluates Package.swift). A `.swift` file under one of these
-/// dirs is compiled by `swift build`; one outside all of them is not (the G4 check). `None` on
-/// any failure, so the check is skipped rather than guessing.
-fn describe_target_dirs(root: &Path) -> Option<Vec<String>> {
+/// dirs is compiled by `swift build`; one outside all of them is not (the G4 check). Runs through
+/// the SANDBOX — under `CI_SANDBOX=oci` the container's swift answers, so the check works exactly
+/// where host swift is absent. `Ok(None)` ONLY for "no Package.swift" (legitimately not a SwiftPM
+/// package — `swift build` refuses such an edit anyway); a describe failure on a REAL package is
+/// an `Err` — fail CLOSED. Guessing "no targets" here would let an ungateable edit sail through
+/// under a false type-verified banner, the silent gate degrade the house rules forbid.
+fn describe_target_dirs(root: &Path, sandbox: &dyn Sandbox) -> Result<Option<Vec<String>>> {
     if !root.join("Package.swift").is_file() {
-        return None;
+        return Ok(None);
     }
-    let out = Command::new("swift")
-        .args(["package", "describe", "--type", "json"])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
+    let fail = |why: String| {
+        Error::Driver(format!(
+            "`swift package describe` failed ({why}) — the SwiftPM target check cannot run, so \
+             this edit cannot be gated. Fix Package.swift or the Swift toolchain and retry."
+        ))
+    };
+    let mut cmd = ci_core::tool_command(sandbox, "swift", || Ok(Command::new("swift")))?;
+    cmd.args(["package", "describe", "--type", "json"]).current_dir(root);
+    let out = ci_core::run_gate_capped(sandbox, &mut cmd, "swift package describe")?;
+    if !out.status.is_some_and(|s| s.success()) {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let first =
+            stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("nonzero exit").to_string();
+        return Err(fail(first));
     }
-    let v: Value = serde_json::from_slice(&out.stdout).ok()?;
-    let targets = v.get("targets")?.as_array()?;
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| fail(format!("unparsable JSON: {e}")))?;
+    let targets = v
+        .get("targets")
+        .and_then(|t| t.as_array())
+        .ok_or_else(|| fail("no `targets` array in the describe output".into()))?;
     let mut dirs = Vec::new();
     for t in targets {
         if let Some(p) = t.get("path").and_then(|p| p.as_str()) {
@@ -301,7 +318,7 @@ fn describe_target_dirs(root: &Path) -> Option<Vec<String>> {
             dirs.push(if p == "." { String::new() } else { p });
         }
     }
-    Some(dirs)
+    Ok(Some(dirs))
 }
 
 /// Diagnostics for references to files the CURRENT BATCH deletes, via the shared §8 engine over
@@ -317,7 +334,7 @@ impl GateEngine for SwiftEngine {
     fn diagnostics(&mut self, files: &[(String, String)]) -> Result<Vec<Diag>> {
         self.reject_untargeted(files)?; // also populates self.target_dirs (cached describe)
         let dirs = self.target_dirs.as_ref().and_then(|o| o.as_deref());
-        let mut out = swift_build_diagnostics(&self.root, files, dirs)?;
+        let mut out = swift_build_diagnostics(&self.root, &*self.sandbox, files, dirs)?;
         out.extend(deleted_path_references(&self.root, files));
         Ok(out)
     }
@@ -333,8 +350,8 @@ impl GateEngine for SwiftEngine {
         //      mirror, so the root's index would otherwise stay empty), and
         //   2. drain sourcekit's index queue with `workspace/_pollIndex` so the rename sees every
         //      reference, not just the definition.
-        prime_index(&self.root);
-        let lsp = self.sourcekit()?;
+        prime_index(&self.root, &*self.sandbox);
+        let lsp = self.lsp.get()?;
         // `_pollIndex` blocks until the index is up to date; ignore its (empty) result. Best-effort
         // — an older sourcekit without the request just falls through to whatever freshness it has.
         let _ = lsp.request("workspace/_pollIndex", json!({}));
@@ -352,17 +369,11 @@ impl GateEngine for SwiftEngine {
     fn sync_disk(&mut self) -> Result<()> {
         // `swift build` holds no cross-call buffers (each build materializes its own mirror); only
         // a started sourcekit-lsp has state to resync.
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.sync_disk(),
-            None => Ok(()),
-        }
+        self.lsp.sync_disk()
     }
 
     fn fs_events(&mut self, created: &[String], deleted: &[String]) -> Result<()> {
-        match self.lsp.as_mut() {
-            Some(lsp) => lsp.fs_events(created, deleted),
-            None => Ok(()),
-        }
+        self.lsp.fs_events(created, deleted)
     }
 }
 

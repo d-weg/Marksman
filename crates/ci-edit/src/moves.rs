@@ -21,6 +21,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+pub mod dotted;
+
 /// One reference to a project file, as found by [`MoveModel::ref_occurrences`].
 #[derive(Debug, Clone)]
 pub struct RefOccurrence {

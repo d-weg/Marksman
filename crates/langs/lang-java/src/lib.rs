@@ -29,6 +29,11 @@ mod gate;
 mod jdtls;
 mod movefix;
 
+/// What a bare `move_file` covers for Java — composed into the `apply_edits` description by
+/// ci-mcp, so the completeness claim the agent reads lives NEXT TO the code that makes it true
+/// (movefix + jdtls + the javac gate). Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "the `package` declaration rewritten and every importer's `import`/fully-qualified reference retargeted (jdtls-native when available, syntactic fallback otherwise)";
+
 /// The gated Java provider. `gated()` is `true` because construction goes through the
 /// registry's javac check ([`gate_missing`]) — a missing JDK disables the language with the
 /// install hint (`ProviderBuild::Unavailable`), it never ships an ungated Java silently.
@@ -80,14 +85,14 @@ impl LanguageProvider for JavaProvider {
 /// a dependency.
 fn engine_factory() -> EngineFactory {
     Arc::new(|root: &Path| {
-        let sidecar = gate::JavacSidecar::start(root).map_err(|e| match gate_missing() {
+        let sandbox = ci_core::resolve_sandbox(root, "marksman-java");
+        let sidecar = gate::JavacSidecar::start(root, &*sandbox).map_err(|e| match gate_missing() {
             Some(missing) => {
                 ci_core::Error::Driver(format!("java edit engine failed to start ({e}).\n{missing}"))
             }
             None => e,
         })?;
-        Ok(Box::new(gate::JavaEngine { root: root.to_path_buf(), sidecar, lsp: None })
-            as Box<dyn GateEngine + Send>)
+        Ok(Box::new(gate::JavaEngine::new(root, sidecar, sandbox)) as Box<dyn GateEngine + Send>)
     })
 }
 
@@ -548,6 +553,60 @@ mod tests {
         );
     }
 
+    // An engine whose toolchain runs inside the `marksman-java` OCI container (bypassing the
+    // registry's host probe, exactly as `CI_SANDBOX=oci` would at runtime).
+    fn oci_java_factory() -> EngineFactory {
+        Arc::new(|root: &Path| {
+            let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
+                root.to_path_buf(),
+                ci_core::oci_runtime().expect("an OCI runtime on PATH"),
+                "marksman-java".into(),
+            ));
+            let sidecar = gate::JavacSidecar::start(root, &*sandbox)?;
+            Ok(Box::new(gate::JavaEngine::new(root, sidecar, sandbox)) as Box<dyn GateEngine + Send>)
+        })
+    }
+
+    // The M2.3 PAYOFF (docs/container-gate-spec.md §9b). Requires docker (or another OCI runtime)
+    // up AND the java image:
+    //   docker build -f docker/marksman-java.Dockerfile -t marksman-java docker/
+    // Gate (javac sidecar) AND cross-file rename (jdtls) both run in the container from the image,
+    // so this passes with NO host jdtls/javac — the exact bench finding (java rename fell back to
+    // manual when host jdtls was absent), closed. jdtls does a real project import in a cold
+    // container, so this is the slowest e2e here.
+    #[test]
+    #[ignore]
+    fn oci_java_gate_and_rename_without_host_tools() {
+        if ci_core::oci_runtime().is_none() {
+            eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
+            return;
+        }
+        let dir = write_repo(&[
+            ("Util.java", "public class Util {\n  public static int base() {\n    return 1;\n  }\n}\n"),
+            ("App.java", "public class App {\n  public int run() {\n    return Util.base();\n  }\n}\n"),
+        ]);
+        let root = dir.path();
+        let p = JavaProvider::with_factory(root, oci_java_factory());
+        let res = p
+            .apply_edits(
+                &[EditOp::Rename { node_id: "Util.java#Util.base".into(), new_name: "fetchBase".into() }],
+                &OPTS,
+            )
+            .unwrap();
+        // apply_edits returning (not erroring) proves the whole container path ran end to end: the
+        // javac sidecar AND jdtls both launched inside the image, no host jdtls/javac consulted, and
+        // the rename executed — jdtls renamed the definition in Util.java.
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename commits through the CONTAINER gate: {res:?}");
+        assert!(
+            fs::read_to_string(root.join("Util.java")).unwrap().contains("fetchBase"),
+            "definition renamed inside the container"
+        );
+        assert!(
+            fs::read_to_string(root.join("App.java")).unwrap().contains("Util.fetchBase()"),
+            "cross-file reference rewritten by the CONTAINER's jdtls — no host jdtls consulted"
+        );
+    }
+
     // Requires mvn (`brew install maven`). NOT installed on this machine — SKIPS loudly.
     // Q3's build-tool derivation: a pom.xml + mvn present must route the classpath through
     // `dependency:build-classpath` (a dependency-less pom yields an empty-but-derived path,
@@ -564,7 +623,7 @@ mod tests {
             "<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>t</groupId>\n  <artifactId>t</artifactId>\n  <version>0</version>\n</project>\n",
         )]);
         assert!(
-            gate::maven_classpath(dir.path()).is_some(),
+            gate::maven_classpath(dir.path(), &ci_core::HostSandbox).is_some(),
             "mvn present + pom.xml => the build tool answers the classpath question"
         );
     }
@@ -579,7 +638,7 @@ mod tests {
         }
         let dir = write_repo(&[("build.gradle", "plugins { id 'java' }\n")]);
         assert!(
-            gate::gradle_classpath(dir.path()).is_some(),
+            gate::gradle_classpath(dir.path(), &ci_core::HostSandbox).is_some(),
             "gradle present + build.gradle => the init-script task answers the classpath question"
         );
     }

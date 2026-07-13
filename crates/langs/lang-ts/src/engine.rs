@@ -14,6 +14,10 @@ use std::process::Command;
 pub(crate) const SCIP_TS_VERSION: &str = "0.4.0";
 const TS_LSP_VERSION: &str = "5.3.0";
 const TYPESCRIPT_VERSION: &str = "6.0.3";
+/// `@typescript/native-preview` publishes DATED DEV BUILDS on a moving stream — the one TS
+/// tool that was still fetched unpinned (producer-surface spec F1). The pin is a dated build;
+/// bump deliberately. Local tsgo (`CI_TSGO` / PATH) is unconditional-trust and unaffected.
+const TSGO_VERSION: &str = "7.0.0-dev.20260707.2";
 
 /// Fresh npm cache dir so a corrupted default `~/.npm` cache can't break `npx`. Shared with the
 /// ts-morph sidecar (`tsmorph.rs`) so both TS tooling paths use the same cache location.
@@ -73,7 +77,21 @@ impl Drop for NpxCacheLock {
 /// auto-picked only when it needs NO network (`CI_TSGO`, or `tsgo` on PATH) — a surprise npx
 /// download doesn't belong in the middle of someone's first edit. `CI_EDIT_ENGINE` forces one
 /// tier: `tsgo` | `tsmorph` | `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names).
-pub(crate) fn start_engine(root: &Path) -> Result<Box<dyn GateEngine + Send>> {
+///
+/// In a CONTAINER (`CI_SANDBOX=oci` + the `marksman-ts` image) the tier is tsgo, period: the
+/// image bakes it at a pinned version, and the ladder's lower rungs don't transplant —
+/// ts-morph stages an npm install at runtime (defeating the pinned image), and tsls can't
+/// resolve a global typescript install. tsgo is also the fastest tier, so the container gets
+/// the best engine by construction, resolved by bare name on the image's PATH.
+pub(crate) fn start_engine(
+    root: &Path,
+    sandbox: &std::sync::Arc<dyn ci_core::Sandbox>,
+) -> Result<Box<dyn GateEngine + Send>> {
+    if sandbox.containerized() {
+        let mut c = Command::new("tsgo");
+        c.args(["--lsp", "-stdio"]);
+        return Ok(Box::new(ci_lsp::LspClient::start_in(root, c, &**sandbox)?));
+    }
     let pref = std::env::var("CI_EDIT_ENGINE").unwrap_or_default();
     match pref.as_str() {
         "tsgo" => return Ok(Box::new(ci_lsp::LspClient::start(root, tsgo_lsp_command())?)),
@@ -135,7 +153,7 @@ pub(crate) fn tsgo_lsp_command() -> Command {
     let mut c = Command::new("npx");
     c.arg("--yes")
         .arg("-p")
-        .arg("@typescript/native-preview")
+        .arg(format!("@typescript/native-preview@{TSGO_VERSION}"))
         .args(["tsgo", "--lsp", "-stdio"])
         .env("npm_config_cache", npm_cache());
     c

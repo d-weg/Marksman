@@ -8,32 +8,29 @@
 //!   (that's the javax.tools sidecar's job); this client exists for rename/willRename alone.
 use ci_core::Result;
 use ci_lsp::LspClient;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// jdtls's `-data` eclipse workspace, kept OUTSIDE the repo (under the system temp dir, keyed by
+/// `root` so it still persists per repo). jdtls's "invisible project" for a build-config-less repo
+/// LINKS the repo directory into this workspace, and eclipse refuses to link a folder that CONTAINS
+/// its own workspace — a `-data` under `root` yields "Failed to create the invisible project" and a
+/// definition-only rename (no cross-file view). The temp dir is also what the OCI sandbox mounts,
+/// so this path is writable inside the container too.
+fn workspace_dir(root: &Path) -> PathBuf {
+    let mut h = DefaultHasher::new();
+    root.hash(&mut h);
+    std::env::temp_dir().join("marksman-jdtls").join(format!("{:016x}", h.finish()))
+}
 
 pub(crate) const INSTALL_HINT: &str =
     "`brew install jdtls` (jdtls itself runs on Java 21+ — e.g. `brew install openjdk@21`)";
 
 /// The jdtls launcher: `$CI_JDTLS`, else PATH, else the Homebrew prefixes.
 pub(crate) fn jdtls_binary() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CI_JDTLS") {
-        let p = PathBuf::from(p);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&paths) {
-            let cand = dir.join("jdtls");
-            if cand.is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    ["/opt/homebrew/bin/jdtls", "/usr/local/bin/jdtls"]
-        .iter()
-        .map(PathBuf::from)
-        .find(|p| p.is_file())
+    ci_core::discover_tool("CI_JDTLS", &["jdtls"], &["/opt/homebrew/bin/jdtls", "/usr/local/bin/jdtls"])
 }
 
 /// A Java 21+ home for jdtls's own runtime: `$JAVA_HOME` when new enough, else the newest
@@ -76,22 +73,27 @@ fn java_major(home: &Path) -> Option<u32> {
 /// Start jdtls for `root`. The eclipse workspace persists per repo
 /// (`.marksman/jdtls-workspace`): first import of a real Maven/Gradle repo can take minutes,
 /// warm restarts don't — persisting it is load-bearing, not an optimization.
-pub(crate) fn start(root: &Path) -> Result<LspClient> {
-    let Some(bin) = jdtls_binary() else {
-        return Err(ci_core::Error::Driver(format!(
-            "java rename/move needs jdtls to rewrite references safely — Install: {INSTALL_HINT}. \
-             Without it, reissue a SYMBOL rename as `replace_text` edits over the definition and \
-             each reference in one batch — the javac gate type-checks the result, so a missed or \
-             wrong site rejects rather than lands."
-        )));
-    };
-    let mut cmd = Command::new(bin);
-    cmd.arg("-data").arg(root.join(".marksman").join("jdtls-workspace"));
-    if let Some(home) = java21_home() {
-        // The brew launcher resolves its runtime through JAVA_HOME first — pin the 21+ one.
-        cmd.env("JAVA_HOME", &home);
-    }
-    LspClient::start(root, cmd)
+pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
+    // The image ships jdtls (Java 21 + the server on PATH); `tool_command` resolves it by bare name
+    // there and falls to the host probe otherwise (its absence is exactly what the container fixes).
+    let mut cmd = ci_core::tool_command(sandbox, "jdtls", || {
+        let Some(bin) = jdtls_binary() else {
+            return Err(ci_core::Error::Driver(format!(
+                "java rename/move needs jdtls to rewrite references safely — Install: {INSTALL_HINT}. \
+                 Without it, reissue a SYMBOL rename as `replace_text` edits over the definition and \
+                 each reference in one batch — the javac gate type-checks the result, so a missed or \
+                 wrong site rejects rather than lands."
+            )));
+        };
+        let mut c = Command::new(bin);
+        if let Some(home) = java21_home() {
+            // The brew launcher resolves its runtime through JAVA_HOME first — pin the 21+ one.
+            c.env("JAVA_HOME", &home);
+        }
+        Ok(c)
+    })?;
+    cmd.arg("-data").arg(workspace_dir(root));
+    LspClient::start_in(root, cmd, sandbox)
 }
 
 #[cfg(test)]

@@ -35,6 +35,11 @@ mod gate;
 mod movefix;
 mod sourcekit;
 
+/// What a bare `move_file` covers for Swift — composed into the `apply_edits` description by
+/// ci-mcp, so the completeness claim the agent reads lives NEXT TO the code that makes it true
+/// (movefix + the `swift build` gate). Keep it one sentence fragment.
+pub const MOVE_COVERAGE: &str = "within a target no reference rewrites are needed (imports are module-level); a cross-target move updates Package.swift membership, and the `swift build` gate judges the result";
+
 /// The gated Swift provider. `gated()` is `true` because construction goes through the registry's
 /// `swift` check ([`gate_missing`]) — a missing Swift toolchain disables the language with the
 /// install hint (`ProviderBuild::Unavailable`), it never ships an ungated Swift silently.
@@ -88,7 +93,7 @@ fn engine_factory() -> EngineFactory {
         if let Some(missing) = gate_missing() {
             return Err(ci_core::Error::Driver(format!("swift edit engine unavailable.\n{missing}")));
         }
-        Ok(Box::new(gate::SwiftEngine { root: root.to_path_buf(), lsp: None, target_dirs: None })
+        Ok(Box::new(gate::SwiftEngine::new(root, ci_core::resolve_sandbox(root, "marksman-swift")))
             as Box<dyn GateEngine + Send>)
     })
 }
@@ -494,6 +499,54 @@ mod tests {
         assert!(
             fs::read_to_string(root.join("Sources/App/main.swift")).unwrap().contains("Util.fetchBase()"),
             "REFERENCE rewritten cross-file — the reason sourcekit-lsp exists here"
+        );
+    }
+
+    // An engine whose toolchain runs inside the `marksman-swift` OCI container.
+    fn oci_swift_factory() -> EngineFactory {
+        Arc::new(|root: &Path| {
+            let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
+                root.to_path_buf(),
+                ci_core::oci_runtime().expect("an OCI runtime on PATH"),
+                "marksman-swift".into(),
+            ));
+            Ok(Box::new(gate::SwiftEngine::new(root, sandbox))
+                as Box<dyn GateEngine + Send>)
+        })
+    }
+
+    // Requires docker (or another OCI runtime) up AND the swift image:
+    //   docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/
+    // `swift build` gate AND the sourcekit-lsp rename both run in the container, so this passes
+    // with NO host swift toolchain. Swift-on-Linux differs slightly from macOS; the rename must
+    // still land cross-file.
+    #[test]
+    #[ignore]
+    fn oci_swift_gate_and_rename_without_host_tools() {
+        if ci_core::oci_runtime().is_none() {
+            eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
+            return;
+        }
+        let dir = write_package(
+            "App",
+            &[
+                ("Sources/App/Util.swift", "struct Util {\n  static func base() -> Int {\n    return 1\n  }\n}\n"),
+                ("Sources/App/main.swift", "func run() -> Int {\n    return Util.base()\n}\nprint(run())\n"),
+            ],
+        );
+        let root = dir.path();
+        let p = SwiftProvider::with_factory(root, oci_swift_factory());
+        let res = p
+            .apply_edits(
+                &[EditOp::Rename { node_id: "Sources/App/Util.swift#Util.base".into(), new_name: "fetchBase".into() }],
+                &OPTS,
+            )
+            .unwrap();
+        assert!(matches!(res, CommitResult::Ok { .. }), "rename commits through the CONTAINER gate: {res:?}");
+        assert!(fs::read_to_string(root.join("Sources/App/Util.swift")).unwrap().contains("fetchBase"), "definition renamed");
+        assert!(
+            fs::read_to_string(root.join("Sources/App/main.swift")).unwrap().contains("Util.fetchBase()"),
+            "cross-file reference rewritten by the CONTAINER's sourcekit-lsp — no host swift consulted"
         );
     }
 
