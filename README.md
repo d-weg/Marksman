@@ -122,17 +122,19 @@ upgrade can never silently change a verdict). All five gated languages are cover
 `marksman-ts` also runs the **indexer** (scip-typescript) in-container, so TypeScript needs
 no host Node at all.
 
-```bash
-# 1. Build the image(s) for the languages you want — images are built locally, never pulled:
-docker build -f docker/marksman-ts.Dockerfile    -t marksman-ts    docker/
-docker build -f docker/marksman-rust.Dockerfile  -t marksman-rust  docker/
-docker build -f docker/marksman-java.Dockerfile  -t marksman-java  docker/
-docker build -f docker/marksman-php.Dockerfile   -t marksman-php   docker/
-docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/
+**Walkthrough: [docs/container-guide.md](docs/container-guide.md).** The helper does the
+work — it detects your runtime, builds only the images you need, and checks the version pins
+are in sync:
 
-# 2. Opt in (per run, or in the MCP server's env block):
-CI_SANDBOX=oci marksman-mcp --root /path/to/repo
+```bash
+scripts/marksman-images.sh check          # runtime? images? pins in sync?
+scripts/marksman-images.sh build ts rust  # build just what your repos need
+CI_SANDBOX=oci marksman-mcp --root /path/to/repo   # opt in (per run, or in the MCP env block)
 ```
+
+(The manual equivalent — `docker build -f docker/marksman-ts.Dockerfile -t marksman-ts
+docker/` per language — still works; the helper just wraps it with runtime detection and the
+pin check.)
 
 How it behaves — see [docker/README.md](docker/README.md) for details:
 - **Opt-in and loud.** Without `CI_SANDBOX=oci`, nothing changes (the host path is

@@ -9,6 +9,10 @@ accepts. Design + measurements: [docs/container-gate-spec.md](../docs/container-
 
 ## Build (local — images are never pulled)
 
+> The helper `scripts/marksman-images.sh` wraps all of this with runtime detection and a pin
+> check — `check` / `build [langs...]` / `list`. See [docs/container-guide.md](../docs/container-guide.md)
+> for the full walkthrough. The manual commands below are the equivalent it runs.
+
 ```bash
 docker build -f docker/marksman-ts.Dockerfile    -t marksman-ts    docker/   # ~515MB — scip-typescript + tsgo + typescript
 docker build -f docker/marksman-rust.Dockerfile  -t marksman-rust  docker/   #        — cargo + rust-analyzer
