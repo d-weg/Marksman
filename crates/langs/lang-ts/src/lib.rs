@@ -3,7 +3,7 @@
 //! `import_graph()` from [`ScipIndex`], deepened with tree-sitter sub-nodes. Write path:
 //! the tsgo/ts-morph/tsls engine behind the shared `ci_edit::commit_edits` gate.
 use ci_core::{
-    rel_path, CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
+    CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
     LanguageProvider, Node, ReadIndex, Result,
 };
 use ci_edit::Composed;
@@ -120,7 +120,11 @@ impl ReadIndex for TsRead {
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        let rel = rel_path(&self.root, file);
+        // Read jail (twin of ci-edit's write jail): an out-of-root path has
+        // no nodes — never a read outside the registered workspace.
+        let Some(rel) = ci_core::jailed_rel(&self.root, file) else {
+            return Ok(vec![]);
+        };
         Ok(deepen_from_disk(&self.root, &rel, self.scip.structure(&rel)?))
     }
 

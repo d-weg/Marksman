@@ -15,8 +15,8 @@
 //! to the gated [`ci_edit::GateEngine`] path as its LSP/indexer lands (the Rust provider is
 //! the model).
 use ci_core::{
-    rel_path, CommitResult, EditOp, EditOpts, Granularity, ImportGraph, LanguageProvider, Node,
-    Result, SymbolKind,
+    CommitResult, EditOp, EditOpts, Granularity, ImportGraph, LanguageProvider, Node, Result,
+    SymbolKind,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -220,7 +220,11 @@ impl LanguageProvider for FallbackProvider {
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        let rel = rel_path(&self.root, file);
+        // Read jail (twin of ci-edit's write jail): an out-of-root path has
+        // no nodes — never a read outside the registered workspace.
+        let Some(rel) = ci_core::jailed_rel(&self.root, file) else {
+            return Ok(vec![]);
+        };
         let content = match std::fs::read_to_string(self.root.join(&rel)) {
             Ok(c) => c,
             Err(_) => return Ok(vec![]),
@@ -1037,5 +1041,31 @@ mod tests {
             after.contains("        return sum(xs)\n        print(xs)"),
             "statement appended into the suite at the right indent: {after}"
         );
+    }
+
+    /// Read jail (twin of the ci-edit write jail): structure() never reads
+    /// outside the registered root — `../`, absolute-outside, and symlinked
+    /// escapes all yield no nodes; legit reads are unaffected.
+    #[test]
+    fn structure_read_is_jailed_to_root() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.py"), "def leak():\n    return 1\n").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("ok.py"), "def fine():\n    return 2\n").unwrap();
+        let p = FallbackProvider::new(root, FbLang::Python);
+
+        assert!(!p.structure(Path::new("ok.py")).unwrap().is_empty(), "legit read serves");
+        let traversal = format!("../{}/secret.py",
+            outside.path().file_name().unwrap().to_string_lossy());
+        assert!(p.structure(Path::new(&traversal)).unwrap().is_empty(), "../ refused");
+        assert!(p.structure(&outside.path().join("secret.py")).unwrap().is_empty(),
+            "absolute-outside refused");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+            assert!(p.structure(Path::new("link/secret.py")).unwrap().is_empty(),
+                "symlink escape refused");
+        }
     }
 }

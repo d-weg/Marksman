@@ -4,7 +4,7 @@
 //! type-checked edits via rust-analyzer are on the roadmap; this is what lets Marksman
 //! index and retrieve Rust — including its own source — today.
 use ci_core::{
-    rel_path, CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
+    CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
     LanguageProvider, Node, ReadIndex, Result, SymbolKind,
 };
 use ci_edit::{Composed, GateEngine};
@@ -295,7 +295,11 @@ impl ReadIndex for RustRead {
     }
 
     fn structure(&self, file: &Path) -> Result<Vec<Node>> {
-        let rel = rel_path(&self.root, file);
+        // Read jail (twin of ci-edit's write jail): an out-of-root path has
+        // no nodes — never a read outside the registered workspace.
+        let Some(rel) = ci_core::jailed_rel(&self.root, file) else {
+            return Ok(vec![]);
+        };
         let content = match std::fs::read_to_string(self.root.join(&rel)) {
             Ok(c) => c,
             Err(_) => return Ok(vec![]),

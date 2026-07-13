@@ -21,7 +21,7 @@ pub use config::{Config, ProviderManifest};
 pub use driver::{LanguageProvider, ReadIndex};
 pub use error::{Error, Result};
 pub use outline::{elide_bodies, elide_bodies_with};
-pub use paths::rel_path;
+pub use paths::{jailed_rel, rel_path};
 pub use sandbox::{oci_runtime, resolve_sandbox, tool_command, HostSandbox, OciSandbox, Sandbox};
 pub use text::byte_offset;
 pub use toolchain::{

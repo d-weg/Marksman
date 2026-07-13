@@ -195,6 +195,27 @@ must:
 - Fail LOUDLY: a producer that can't run disables its artifact path with an actionable
   message (contract §6) — it never silently serves the previous artifact as if fresh.
 
+## 11. The workspace jail — reads and writes stay under root
+
+Both IO layers refuse paths that escape the registered root, in the same two layers
+(lexical: absolute-outside and `..` climbing above root; symlink: nearest existing
+ancestor must canonicalize under root):
+
+- **Writes** were always jailed at the edit chokepoint (`ci-edit`'s `ensure_within_root`
+  covers every op path, node-id file, and move destination before any VFS mutation).
+- **Reads** are jailed at `structure()` — the one place a caller-supplied path becomes a
+  file read — via `ci_core::jailed_rel` (the write jail's twin). An out-of-root path has
+  no nodes; inspect/read surfaces then answer not-found. Every provider inherits this
+  through the three concrete `structure()` implementations (tree-sitter fallback, rust,
+  ts); a new provider with its own `structure()` MUST gate its read on `jailed_rel`
+  (conformance: `structure_read_is_jailed_to_root` in lang-fallback is the reference
+  shape).
+
+Rationale: marksman also serves embedders whose callers are semi-trusted (found live by
+Foundry's daemon security review — its RPC layer jails independently, but the library must
+not rely on every embedder remembering to). A local agent already has fs access, so this
+is defense in depth there — and the actual boundary everywhere else.
+
 ## Adding a language (checklist)
 
 1. Grammar + `classify` rows in `lang-fallback` (or a new crate at the gated tier).
