@@ -56,7 +56,10 @@ ported to a Java fixture (`javac` as the gate). Median $ per task, baseline vs M
 | schema-field | 0.088 | 0.169 | +92% | ambiguous-symbol + field-order friction |
 | type-rename | 0.190 | 0.264 | +39% | jdtls absent → manual fallback |
 
-**Why "do not cite":** the losing cells measure the **jdtls-absent** path (rename/type-rename
-fell back to fully manual editing), not the intended engine. To get representative numbers,
-install jdtls and re-run `rename`/`type-rename`; the move/locate/add-symbol wins are already
-real. See the [bench review](../benchmarks.md) for the full diagnosis.
+**Status of this table — known cause, workaround shipped, rerun pending.** The two losing cells
+(`rename`, `type-rename`) measure the **jdtls-absent** path, not the intended engine: without
+jdtls, cross-file rename falls back to fully manual editing. This is a known limitation, not a
+gate defect — the gated `replace_text` workaround is surfaced in the reject, and **container mode
+ships jdtls** so the intended engine runs with no host install (see [Known gaps](#known-gaps)).
+The `move`/`locate`/`add-symbol` wins are already real. The flagged cells stay flagged until a
+rerun with jdtls present (host install or container mode) replaces the fallback numbers.

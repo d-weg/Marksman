@@ -52,8 +52,11 @@ ported to a SwiftPM fixture (`swift build` as the gate). Median $ per task, base
 | schema-field | 0.064 | 0.083 | +31% | ⚠️ both arms false-failed the check — **prompt fixed**, re-run pending |
 | type-rename | 0.106 | 0.046 | **−57%** | clean win |
 
-**Why "preliminary":** `schema-field` was ill-posed — Swift's custom `init` let **both** arms
-derive the field in the initializer and touch no call sites, which the call-site check then
-false-fails (a degenerate 0/0 cell). The prompt was tightened to require the field as a required
-initializer parameter passed at each site; re-run `schema-field` after the fix. The rename /
-type-rename / move wins are real (sourcekit-lsp is present).
+**Status of this table — known harness bug, fixed, rerun pending.** `schema-field` was ill-posed:
+Swift's custom `init` let **both** arms derive the field in the initializer and touch no call
+sites, which the call-site check then false-fails (a degenerate 0/0 cell — a benchmark-harness
+bug, not a provider defect). The prompt is **already fixed in-tree** to require the field as a
+required initializer parameter passed explicitly at each construction site
+(`scripts/agent-bench/tasks.json`, the `schema-field` swift suite). It has **not been re-run
+yet**, so the degenerate cell above stays flagged. The rename / type-rename / move wins are real
+(sourcekit-lsp ships with the toolchain).

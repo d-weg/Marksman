@@ -61,6 +61,12 @@ single pass, taken BEFORE the gate fix — do not cite.**
 | schema-field | 0.154 | 0.755 | **+389%** | 🔴 gate false-reject bug — **now fixed**, re-run pending |
 | type-rename | 0.240 | 0.228 | −5% | phpactor absent → replace_text |
 
-**Why "do not cite":** `schema-field` hit the isolated-overlay gate bug (now fixed) and every
-Marksman cell's reply carried phantom "pre-existing" errors from the same cause. Re-run all PHP
-cells after the fix — `schema-field` should collapse from ~1M tokens to a clean win.
+**Status of this table — known bug, fixed, rerun pending.** The `schema-field` blowup was the
+isolated-overlay gate bug (the whole Marksman column also carried phantom "pre-existing" errors
+from the same cause). That bug is **fixed and regression-tested**
+(`phpstan_gate_resolves_sibling_class_across_files`, see [Recent fix](#recent-fix) above). A
+post-fix spot-check confirms the predicted collapse — `schema-field`'s Marksman cell drops from
+the ~$0.755 (≈1M-token) run above to **~$0.12**, a clean win, and every other cell wins too. The
+table is **not yet updated** because that check was a single post-fix pass, not the 3-run median
+the headline standard requires; the numbers above are the pre-fix run and stay flagged until a
+clean multi-run rerun lands.

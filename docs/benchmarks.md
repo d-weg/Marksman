@@ -148,9 +148,13 @@ results are still the reference for §2's ablations.
 ### 1.6 New-language suites (Java · PHP · Swift) — **WIP**
 
 The suite above (TS · Rust) is ported to three new **gated** languages. Each has a per-language
-page with its provider status, required/optional toolchains, and a **preliminary** benchmark
-(the first run is not yet clean — a PHP gate bug was fixed and a Swift prompt tightened *after*
-it; the numbers there are flagged "do not cite" with the exact re-run to do):
+page with its provider status, required/optional toolchains, and a **preliminary** benchmark.
+The first run surfaced three issues — a PHP gate bug (false-rejected cross-file edits), a Swift
+benchmark-prompt bug (a degenerate schema-field cell), and Java's jdtls-absent rename fallback.
+**All three are now understood and addressed in-tree** (the PHP gate fix is regression-tested; the
+Swift prompt is corrected; Java's fallback has a shipped workaround and container-mode jdtls) — the
+per-language tables stay flagged only because a clean multi-run rerun hasn't been captured yet, not
+because a fix is outstanding:
 
 | language | gate | rename engine | provider status & preliminary benchmark |
 |---|---|---|---|
