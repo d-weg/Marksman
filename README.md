@@ -66,7 +66,11 @@ Three steps to set up — build, index, register — plus a one-time **agent pre
 
 `peashooter doctor <repo>` reports exactly what your repository needs, what is installed, and how to install anything missing. A missing toolchain disables only that language, with a clear report.
 
-### 1. Build
+### 1. Get the binaries
+
+**Prebuilt (no toolchain):** each [release](https://github.com/d-weg/peashooter-mcp/releases) attaches `peashooter` + `peashooter-mcp` for macOS (arm64/x64) and Linux (x64/arm64), with SHA256 checksums. Download the archive for your platform, `tar -xzf` it, and skip to step 2.
+
+**From source** (needs Rust stable):
 
 ```bash
 git clone https://github.com/d-weg/peashooter-mcp.git

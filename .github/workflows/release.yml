@@ -1,0 +1,104 @@
+name: Release
+
+# Cut a release by pushing a semver tag:  git tag v0.1.0 && git push origin v0.1.0
+# Builds prebuilt `peashooter` + `peashooter-mcp` binaries for macOS and Linux
+# and attaches them (with checksums) to a GitHub Release.
+# workflow_dispatch builds the artifacts as a dry run WITHOUT publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm      # native arm64 runner (free for public repos)
+          - target: x86_64-apple-darwin
+            os: macos-13              # Intel
+          - target: aarch64-apple-darwin
+            os: macos-14              # Apple Silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin peashooter --bin peashooter-mcp
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="dev-${GITHUB_SHA::7}"     # workflow_dispatch dry run
+          fi
+          dist="peashooter-mcp-${VERSION}-${{ matrix.target }}"
+          bindir="target/${{ matrix.target }}/release"
+          mkdir -p "$dist"
+          cp "$bindir/peashooter" "$bindir/peashooter-mcp" "$dist"/
+          cp README.md LICENSE "$dist"/ 2>/dev/null || true
+          strip "$dist/peashooter" "$dist/peashooter-mcp" 2>/dev/null || true
+          tar -czf "${dist}.tar.gz" "$dist"
+          shasum -a 256 "${dist}.tar.gz" > "${dist}.tar.gz.sha256"
+          cat "${dist}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            peashooter-mcp-*.tar.gz
+            peashooter-mcp-*.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'      # dry runs (workflow_dispatch) build but never publish
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combined SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          cat ./*.sha256 > SHA256SUMS
+          echo "---- release assets ----"; ls -1
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
