@@ -3,10 +3,10 @@ name = "ci-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Marksman CLI: index / retrieve / doctor."
+description = "Peashooter CLI: index / retrieve / doctor."
 
 [[bin]]
-name = "marksman"
+name = "peashooter"
 path = "src/main.rs"
 
 [dependencies]

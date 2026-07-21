@@ -1,7 +1,7 @@
-//! Marksman MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the two-tool
+//! Peashooter MCP server (stdio, JSON-RPC 2.0, newline-delimited). Exposes the two-tool
 //! facade: `inspect` (mode-dispatched reads: search / symbol / file / node / map) and
 //! `apply_edits` (structured, atomically applied, type-check-gated edits). Launch per repo:
-//!   marksman-mcp --root /path/to/repo   (or $MARKSMAN_ROOT, or cwd)
+//!   peashooter-mcp --root /path/to/repo   (or $PEASHOOTER_ROOT, or cwd)
 //!
 //! The server is pure-Rust orchestration; all language/external tooling is behind
 //! the `lang-ts` provider.
@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex};
 /// so a mixed repo reads/edits fully. Absent/disabled languages register nothing.
 fn build_registry_for(root: &Path) -> Result<ProviderRegistry, String> {
     let mut config = Config::load(root).unwrap_or_default();
-    config.index_dir = ".marksman".into();
+    config.index_dir = ".peashooter".into();
     let cfg = config.clone();
-    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[marksman-mcp]")).map_err(|e| e.to_string())?;
+    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[peashooter-mcp]")).map_err(|e| e.to_string())?;
     // A language that's present + enabled but whose provider failed to construct (e.g.
     // scip-typescript lost an npx-cache race and exited non-zero) yields an INCOMPLETE registry:
     // its files would silently have no provider, so every read/edit on them degrades to "symbol
@@ -49,7 +49,7 @@ fn resolve_root() -> PathBuf {
             return PathBuf::from(p);
         }
     }
-    std::env::var("MARKSMAN_ROOT")
+    std::env::var("PEASHOOTER_ROOT")
         .or_else(|_| std::env::var("CODEINDEX_ROOT")) // legacy name, still honored
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default())
@@ -58,10 +58,10 @@ fn resolve_root() -> PathBuf {
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         // Default to the path the README's download step uses, so the documented
-        // `git clone … ~/.marksman/models/potion-code-16M` works without setting CI_MODEL_DIR.
+        // `git clone … ~/.peashooter/models/potion-code-16M` works without setting CI_MODEL_DIR.
         std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".marksman/models/potion-code-16M"))
-            .unwrap_or_else(|_| PathBuf::from(".marksman/models/potion-code-16M"))
+            .map(|h| PathBuf::from(h).join(".peashooter/models/potion-code-16M"))
+            .unwrap_or_else(|_| PathBuf::from(".peashooter/models/potion-code-16M"))
     })
 }
 
@@ -81,14 +81,14 @@ impl Server {
     fn new(root: PathBuf) -> Self {
         let mut config = Config::load(&root).unwrap_or_default();
         config.embedding_model = "minishlab/potion-code-16M".into();
-        config.index_dir = ".marksman".into();
+        config.index_dir = ".peashooter".into();
         Server { root, config, registry: Arc::new(Mutex::new(None)), embedder: None, index_cache: Mutex::new(None) }
     }
 
     /// The retrieval index, cached in memory and keyed on index.pb's mtime. Every tool call
     /// used to re-read + re-parse the whole store and rebuild BM25/graph — pure per-call
     /// waste, linear in repo size. `save_index` rewrites index.pb, so its mtime is the
-    /// generation marker: our own reindex_after_edit and an external `marksman index`
+    /// generation marker: our own reindex_after_edit and an external `peashooter index`
     /// both invalidate. The mtime is read BEFORE loading, so a writer racing the load causes
     /// a re-load on the next call rather than a stale cache entry.
     fn index_data(&self) -> Result<Arc<IndexData>, String> {
@@ -152,7 +152,7 @@ impl Server {
     fn retrieve_context(&mut self, args: &Value) -> Result<String, String> {
         let task = args["task"].as_str().ok_or("`task` is required")?.to_string();
         if !index_exists(&self.root, &self.config) {
-            return Err("no index — run `marksman index <root>` first".into());
+            return Err("no index — run `peashooter index <root>` first".into());
         }
         let index = self.index_data()?;
         let model = self.config.embedding_model.clone();
@@ -228,7 +228,7 @@ impl Server {
         }
         let substring = args["substring"].as_bool().unwrap_or(false);
         if !index_exists(&self.root, &self.config) {
-            return Err("no index — run `marksman index` first".into());
+            return Err("no index — run `peashooter index` first".into());
         }
         let index = self.index_data()?;
         const CAP: usize = 200;
@@ -489,7 +489,7 @@ impl Server {
     ) -> Result<String, String> {
         let id_in = |f: &str, n: &str| resolve_in(&registry.structure(Path::new(f)).unwrap_or_default(), n);
         if !index_exists(&self.root, &self.config) {
-            return Err("no index — run `marksman index` first, or address by name/id".into());
+            return Err("no index — run `peashooter index` first, or address by name/id".into());
         }
         // 1) an exact symbol name that appears as a token in the query.
         let index = self.index_data()?;
@@ -1063,7 +1063,7 @@ impl Server {
         if let ci_core::CommitResult::Ok { changed_files, .. } = &res {
             if !dry_run && !changed_files.is_empty() {
                 if let Err(e) = self.reindex_after_edit(changed_files) {
-                    eprintln!("[marksman-mcp] post-edit reindex failed (index may be stale until next `index`): {e}");
+                    eprintln!("[peashooter-mcp] post-edit reindex failed (index may be stale until next `index`): {e}");
                 }
             }
         }
@@ -1449,7 +1449,7 @@ impl Server {
             let Some(provider) = registry.entry_at(slot) else { continue };
             if let Ok(ci_core::CommitResult::Ok { changed_files, .. }) = provider.apply_edits(ops, &opts) {
                 if let Err(e) = self.reindex_after_edit(&changed_files) {
-                    eprintln!("[marksman-mcp] post-comment-update reindex failed: {e}");
+                    eprintln!("[peashooter-mcp] post-comment-update reindex failed: {e}");
                 }
                 applied.extend(descs.iter().filter(|(s, _)| *s == slot).map(|(_, d)| d.clone()));
             }
@@ -1898,7 +1898,7 @@ fn ensure_index_matches(meta_model: &str, meta_dims: usize, model: &str, dim: us
     if meta_model != model || meta_dims != dim {
         return Err(format!(
             "index was built with model {meta_model:?} (dim {meta_dims}) but this server uses \
-             {model:?} (dim {dim}) — re-run `marksman index`"
+             {model:?} (dim {dim}) — re-run `peashooter index`"
         ));
     }
     Ok(())
@@ -1929,7 +1929,7 @@ fn main() {
     let mut server = Server::new(resolve_root());
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    eprintln!("[marksman-mcp] ready for {}", server.root.display());
+    eprintln!("[peashooter-mcp] ready for {}", server.root.display());
     // Build the provider + warm the TS language server in the background now, so the
     // first apply_edits is fast instead of paying a cold project load inline.
     server.start_prewarm();
@@ -1948,7 +1948,7 @@ fn main() {
 
         let out: Option<Value> = match method {
             "initialize" => id.map(|id| {
-                resp(id, json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"marksman","version":"0.1.0"}}))
+                resp(id, json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"peashooter","version":"0.1.0"}}))
             }),
             "notifications/initialized" => None,
             "ping" => id.map(|id| resp(id, json!({}))),

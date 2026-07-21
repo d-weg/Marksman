@@ -14,14 +14,14 @@ known toolchain version. Opt-in via `CI_SANDBOX=oci`; the host path is byte-iden
 **Coverage — all five gated languages have an image + run their toolchain in-container:**
 | lang | image | gate in-container | rename in-container | notes |
 |---|---|:--:|:--:|---|
-| java | `marksman-java` (905MB) | ✅ javac sidecar | ✅ jdtls | needed a jdtls readiness fix (done) |
-| php | `marksman-php` (~450MB) | ✅ phpstan (tree gate) | ✅ phpactor | full, first try |
-| rust | `marksman-rust` | ✅ cargo check | ✅ rust-analyzer | full — serverStatus already waited on |
-| swift | `marksman-swift` (~2.5GB) | ✅ swift build | ✅ sourcekit | full — needed `--experimental-feature background-indexing` + a `$/progress` index-settle wait (containerized-only) |
-| ts (M6) | `marksman-ts` | ✅ tsgo | ✅ tsgo | **also the INDEXER**: scip-typescript in-image — TS is the one language whose READ path needs the toolchain, so the image serves indexing too (contract §10 producer, pinned versions matching `engine.rs`). Container gate tier = tsgo only (the ladder's lower rungs don't transplant: ts-morph npm-installs at runtime, tsls can't resolve a global typescript) — which is also the fastest tier |
+| java | `peashooter-java` (905MB) | ✅ javac sidecar | ✅ jdtls | needed a jdtls readiness fix (done) |
+| php | `peashooter-php` (~450MB) | ✅ phpstan (tree gate) | ✅ phpactor | full, first try |
+| rust | `peashooter-rust` | ✅ cargo check | ✅ rust-analyzer | full — serverStatus already waited on |
+| swift | `peashooter-swift` (~2.5GB) | ✅ swift build | ✅ sourcekit | full — needed `--experimental-feature background-indexing` + a `$/progress` index-settle wait (containerized-only) |
+| ts (M6) | `peashooter-ts` | ✅ tsgo | ✅ tsgo | **also the INDEXER**: scip-typescript in-image — TS is the one language whose READ path needs the toolchain, so the image serves indexing too (contract §10 producer, pinned versions matching `engine.rs`). Container gate tier = tsgo only (the ladder's lower rungs don't transplant: ts-morph npm-installs at runtime, tsls can't resolve a global typescript) — which is also the fastest tier |
 
 Adding a language is now **plug-and-play**: an image + declaring the tool via `ci_core::tool_command`
-(the single host-vs-container resolver) + `resolve_sandbox(root, "marksman-<lang>")`. No per-launcher
+(the single host-vs-container resolver) + `resolve_sandbox(root, "peashooter-<lang>")`. No per-launcher
 `if containerized` branches — that choice lives in one place (TS's tsgo-only ladder collapse and
 swift's background-indexing flag are the two documented exceptions). Measured perf (§7): mount I/O
 is a non-issue (+7%). Deferred: the pure-Rust youki `libcontainer` backend (M5), image slimming,
@@ -163,7 +163,7 @@ The gate is on the hot edit path; cold-vs-warm is 100×+ (the tsgo measurement).
 - Built from the OCI spec (buildable by `buildah`/`podman build`/`docker build` — any producer).
 - Size is real (a JVM+jdtls image is ~hundreds of MB; swift larger). Ship per-language so a
   php-only user never pulls the swift image; lazy-pull on first use, like every other toolchain.
-- `marksman doctor` learns a container tier: reports the runtime, the image (present/pullable),
+- `peashooter doctor` learns a container tier: reports the runtime, the image (present/pullable),
   and pinned versions — the same actionable shape it uses for host toolchains.
 
 ## 6. Platform reality (read before estimating)
@@ -176,7 +176,7 @@ container always means a Linux VM underneath (what Docker Desktop/podman-machine
 - End-to-end testing of the OCI path therefore needs a Linux environment (§8). The
   behavior-preserving `HostSandbox` refactor (M1) is fully testable on macOS.
 
-This is the one place the idea is genuinely constrained: it does **not** make Marksman
+This is the one place the idea is genuinely constrained: it does **not** make Peashooter
 install-free on a Mac. It makes it install-free on Linux, and version-reproducible everywhere it
 runs.
 
@@ -221,7 +221,7 @@ corpus fixture, the mount-heavy tree gate = the worst case)
   measurement picks the transport. Acceptance: identical verdicts; gate latency within an agreed
   budget of the host path.
 - **M4 — image build + `doctor` integration + docs.** Per-language pinned images, lazy pull,
-  `marksman doctor` container tier, a one-line opt-in (`CI_SANDBOX=oci`).
+  `peashooter doctor` container tier, a one-line opt-in (`CI_SANDBOX=oci`).
 
 ## 9a. M1 threading pattern (the exact per-engine change)
 
@@ -298,7 +298,7 @@ didOpen), so no per-edit filesystem materialization for the stdio engines — th
   else `HostSandbox` (unchanged default). Skeleton `OciSandbox` implementing `Sandbox`; runtime
   discovery. Acceptance: default path unchanged (workspace 254 green, 0-warning); `CI_SANDBOX=oci`
   with no runtime falls back to host with a logged note (never a hard failure).
-- **M2.2 — the java image + warm-container plumbing.** A `docker/marksman-java.Dockerfile` (a JDK
+- **M2.2 — the java image + warm-container plumbing.** A `docker/peashooter-java.Dockerfile` (a JDK
   base + jdtls) built to a local tag. `OciSandbox` start/exec/teardown with the identical-path
   mounts. Acceptance: `<runtime> exec` runs `java -version` inside the warm container against a
   bind-mounted repo.

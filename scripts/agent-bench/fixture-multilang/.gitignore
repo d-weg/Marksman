@@ -2,6 +2,6 @@ target/
 node_modules/
 .codeindex/
 .codeindex-rs/
-.marksman/
+.peashooter/
 Cargo.lock
 __pycache__/

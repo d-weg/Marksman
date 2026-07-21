@@ -258,11 +258,11 @@ pub(crate) fn gradle_classpath(root: &Path, sandbox: &dyn Sandbox) -> Option<Str
     let init = tempfile::NamedTempFile::with_suffix(".gradle").ok()?;
     std::fs::write(
         init.path(),
-        "allprojects { p ->\n  p.tasks.register('marksmanClasspath') {\n    doLast {\n      def c = p.configurations.findByName('testRuntimeClasspath') ?: p.configurations.findByName('runtimeClasspath') ?: p.configurations.findByName('compileClasspath')\n      if (c != null) { c.files.each { println it } }\n    }\n  }\n}\n",
+        "allprojects { p ->\n  p.tasks.register('peashooterClasspath') {\n    doLast {\n      def c = p.configurations.findByName('testRuntimeClasspath') ?: p.configurations.findByName('runtimeClasspath') ?: p.configurations.findByName('compileClasspath')\n      if (c != null) { c.files.each { println it } }\n    }\n  }\n}\n",
     )
     .ok()?;
     let mut cmd = ci_core::tool_command(sandbox, "gradle", || Ok(Command::new("gradle"))).ok()?;
-    cmd.args(["-q", "--init-script"]).arg(init.path()).arg("marksmanClasspath").current_dir(root);
+    cmd.args(["-q", "--init-script"]).arg(init.path()).arg("peashooterClasspath").current_dir(root);
     // Same discipline as maven_classpath: time-bounded, timeout ⇒ None (honest degrade).
     let out = sandbox.run_capped(&mut cmd, ci_core::gate_timeout(), 1024 * 1024).ok()?;
     if out.timed_out || !out.status.is_some_and(|s| s.success()) {

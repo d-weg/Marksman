@@ -1,9 +1,9 @@
-# Marksman rust gate image — cargo/rustc (the `cargo check` gate) + rust-analyzer (rename), so a
+# Peashooter rust gate image — cargo/rustc (the `cargo check` gate) + rust-analyzer (rename), so a
 # host needs neither. Built locally:
 #
-#   docker build -f docker/marksman-rust.Dockerfile -t marksman-rust docker/
+#   docker build -f docker/peashooter-rust.Dockerfile -t peashooter-rust docker/
 #
-# rust-analyzer sends `experimental/serverStatus`, which marksman already waits on — no readiness
+# rust-analyzer sends `experimental/serverStatus`, which peashooter already waits on — no readiness
 # gotcha (unlike jdtls). docs/container-gate-spec.md §9b.
 FROM rust:1-slim
 

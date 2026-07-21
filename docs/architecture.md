@@ -1,4 +1,4 @@
-# Marksman — architecture
+# Peashooter — architecture
 
 A from-scratch Rust rewrite of the TS tool `codeindex`: local, zero-API code retrieval +
 gated structural edits, **language-agnostic** via a provider seam.

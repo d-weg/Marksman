@@ -84,7 +84,7 @@ Crate merges (all rejected with reasons — see §1); orphaned files (none); dea
 (none); `legacy-benchmark.md` (intentional archive, correctly labeled); `docs/eval/`
 (live, gate for weight changes); bench fixtures (all five referenced by tasks.json);
 `Cargo.toml` workspace members (exact match with disk); `.gitignore` (no leaked
-artifacts); `marksman.config.json` (current); CONTRIBUTING.md (current).
+artifacts); `peashooter.config.json` (current); CONTRIBUTING.md (current).
 
 ## 3. Proposals
 

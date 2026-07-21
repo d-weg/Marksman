@@ -114,7 +114,7 @@ language without a usable checker stays ungated — honestly.
   `ci-treesitter` helpers. (The same-file-batch and byte-vs-char bugs both came from
   duplicated logic; the audit greps for reimplementations.)
 - Crate layout: `crates/langs/lang-<x>/` — `lib.rs` (provider + `LanguageProvider` impl),
-  engine modules as needed, a `marksman-provider-<x>` sidecar bin, tests in-crate (fast unit +
+  engine modules as needed, a `peashooter-provider-<x>` sidecar bin, tests in-crate (fast unit +
   `#[ignore]` real-tool e2e).
 
 ## 8. Moves & deletes — the reference-model contract
@@ -156,7 +156,7 @@ uses, string/comment masking).
 ## 9. Toolchain execution — the sandbox seam & timeout soundness
 
 - Every gate/rename subprocess runs through the engine's `Sandbox`
-  (`ci_core::resolve_sandbox(root, "marksman-<lang>")` at construction;
+  (`ci_core::resolve_sandbox(root, "peashooter-<lang>")` at construction;
   `ci_core::tool_command` resolves each tool by bare name in a container, by host probe
   otherwise). No engine spawns a raw host `Command` for anything the verdict or a safety
   check depends on — under `CI_SANDBOX=oci` a host-only spawn silently runs the WRONG
@@ -186,7 +186,7 @@ must:
   reindexes on the next open; a stale artifact is never served under a new tool, and an
   unpinned fetch is the drift class that has twice changed behavior with no code change
   (`SCIP_TS_VERSION` is the reference shape).
-- **Cache under `.marksman/`** with staleness decided by `ci_core::fingerprint` (content
+- **Cache under `.peashooter/`** with staleness decided by `ci_core::fingerprint` (content
   hashes, never mtimes). Doubt = reindex, never a stale read.
 - **Serialize shared staging**: concurrent instances sharing an install cache (npx) hold the
   advisory lock (`NpxCacheLock` is the reference shape) so a racing install can't corrupt the
@@ -211,7 +211,7 @@ ancestor must canonicalize under root):
   (conformance: `structure_read_is_jailed_to_root` in lang-fallback is the reference
   shape).
 
-Rationale: marksman also serves embedders whose callers are semi-trusted (found live by
+Rationale: peashooter also serves embedders whose callers are semi-trusted (found live by
 Foundry's daemon security review — its RPC layer jails independently, but the library must
 not rely on every embedder remembering to). A local agent already has fs access, so this
 is defense in depth there — and the actual boundary everywhere else.

@@ -23,12 +23,12 @@
 | Swift toolchain (`swift`) | the edit gate | **required** for gated edits | swift.org / Xcode; SwiftPM projects |
 | `sourcekit-lsp` | cross-file rename | bundled | ships **with** the Swift toolchain |
 
-`marksman doctor <repo>` reports what a Swift package needs and what's present. sourcekit-lsp is
+`peashooter doctor <repo>` reports what a Swift package needs and what's present. sourcekit-lsp is
 SwiftPM-only (no Xcode project support).
 
-**No host Swift toolchain? Use [container mode](../../docker/README.md)**: the `marksman-swift`
+**No host Swift toolchain? Use [container mode](../../docker/README.md)**: the `peashooter-swift`
 image (~2.5GB — the compiler is the size) ships the `swift build` gate and sourcekit-lsp
-(`docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/`, then
+(`docker build -f docker/peashooter-swift.Dockerfile -t peashooter-swift docker/`, then
 `CI_SANDBOX=oci`) — shipped and e2e-verified ([container-gate spec](../container-gate-spec.md)).
 
 ## Known gaps
@@ -39,10 +39,10 @@ image (~2.5GB — the compiler is the size) ships the `swift build` gate and sou
 ## Benchmark (preliminary)
 
 Same corpus and tasks as the [main suite A/B](../benchmarks.md#1-does-it-help--the-suite-ab),
-ported to a SwiftPM fixture (`swift build` as the gate). Median $ per task, baseline vs Marksman;
+ported to a SwiftPM fixture (`swift build` as the gate). Median $ per task, baseline vs Peashooter;
 **run 0, single pass — preliminary.**
 
-| task | baseline $ | Marksman $ | Δ$ | note |
+| task | baseline $ | Peashooter $ | Δ$ | note |
 |---|--:|--:|--:|---|
 | rename | 0.066 | 0.041 | **−39%** | sourcekit-lsp present (clean win) |
 | move | 0.038 | 0.036 | −4% | |

@@ -1,4 +1,4 @@
-# Marksman — benchmarks
+# Peashooter — benchmarks
 
 This file answers, in order:
 
@@ -14,14 +14,14 @@ This file answers, in order:
 ### Terms used throughout
 
 - **baseline / rust** — the two *arms* of every A/B: the same agent (Claude Code headless,
-  sonnet 4.6) with only its standard tools (baseline) vs with the Marksman MCP server loaded
+  sonnet 4.6) with only its standard tools (baseline) vs with the Peashooter MCP server loaded
   (rust). Nothing else differs.
 - **turn** — one agent↔model round trip. Every turn re-sends the whole conversation, so
   **turns are the dominant cost driver**, not the size of any single response.
 - **$** — Claude Code's own reported cost (`total_cost_usd`). The truest single score: it bakes
   in prompt caching and output pricing. Raw token counts (`in_tok`) can mislead — identical
   tokens can bill differently depending on cache hits — so read **turns** and **$**.
-- **the gate** — before a Marksman edit lands on disk, the change is type-checked together
+- **the gate** — before a Peashooter edit lands on disk, the change is type-checked together
   with every file the change could break; if anything *new* breaks, nothing is written and the
   reply lists every affected site. Pre-existing errors never block (the gate diffs against a
   baseline).
@@ -47,7 +47,7 @@ dates and run counts.
 ## 1. Does it help? — the suite A/B
 
 The experiment: give the same agent the same task on the same repo, with and without
-Marksman, and check the result objectively (a shell command per task: greps + the project's
+Peashooter, and check the result objectively (a shell command per task: greps + the project's
 own type-checker — an outcome the agent can't fake). Six **task identities** — rename, move,
 locate-edit, body-edit, schema-field, type-rename — each run against two same-shaped
 codebases (`--suite ts` and `--suite rust`), so every number has a cross-language twin.
@@ -61,18 +61,18 @@ it** and change its value…", "Move the tokenizer **module**…". The agent own
 — locate, decide, edit, verify. That makes these margins smaller than the legacy table's and
 more honest; **the two sets of numbers must not be compared against each other**. Checks are
 also strict about intent: type-rename's checker requires prose mentions (a doc comment) to
-follow the rename, which Marksman's rename now does in the same call.
+follow the rename, which Peashooter's rename now does in the same call.
 
 | suite | arm | input tok | output tok | $ | vs baseline (in/out/$) |
 |---|---|--:|--:|--:|---|
 | ts | baseline | 1,321,353 | 10,258 | 0.6356 | — |
-| ts | **Marksman** | **550,418** | **2,986** | **0.3004** | **−58% / −71% / −53%** |
+| ts | **Peashooter** | **550,418** | **2,986** | **0.3004** | **−58% / −71% / −53%** |
 | rust | baseline | 1,049,615 | 9,247 | 0.5227 | — |
-| rust | **Marksman** | **578,405** | **4,069** | **0.3348** | **−45% / −56% / −36%** |
+| rust | **Peashooter** | **578,405** | **4,069** | **0.3348** | **−45% / −56% / −36%** |
 
-Per task (median API calls / median $, Marksman **bold** where it wins on $):
+Per task (median API calls / median $, Peashooter **bold** where it wins on $):
 
-| task | ts baseline | ts Marksman | rust baseline | rust Marksman |
+| task | ts baseline | ts Peashooter | rust baseline | rust Peashooter |
 |---|--:|--:|--:|--:|
 | rename | 9 / 0.1025 | **3 / 0.0402** | 7 / 0.0760 | **3 / 0.0409** |
 | move | 11 / 0.1331 | **3 / 0.0416** | 10 / 0.1194 | **4 / 0.0712** |
@@ -95,7 +95,7 @@ directness the legacy benchmark measured. When the prompt withholds the target
 So: **the tool benefits from precise prompt direction, and still saves tokens when it
 doesn't get any** — the wide-prompt totals above are −36/−53% on cost with the agent doing
 its own finding. The one honest exception is body-edit: a task so small (one inserted line)
-that the marksman arm's tool schemas cost more than the baseline's whole grep-and-edit
+that the peashooter arm's tool schemas cost more than the baseline's whole grep-and-edit
 trajectory; on the rust suite that's a real +43% loss, on ts a −5% squeak. Below roughly a
 $0.05-baseline task there is nothing left to save.
 
@@ -168,7 +168,7 @@ These are **experimental** and not part of the headline result until a clean re-
 
 ## 2. Which parts of the design earn their keep? — the read-path ablation
 
-Marksman's TypeScript support stacks three layers: tree-sitter parsing (fast, in-process,
+Peashooter's TypeScript support stacks three layers: tree-sitter parsing (fast, in-process,
 syntactic), a SCIP index (compiler-accurate symbols and references), and the ts-morph
 compiler gate on edits. Which layer produces the win? `CI_TS_MODE` swaps the read path so
 the same suite isolates each one (measured on the
@@ -302,7 +302,7 @@ transcripts — totals alone attributed them to the wrong cause.
 MCP clients register a server's tools in one of two ways: **upfront** (tool definitions
 present from the first request) or **deferred** (the agent must call a tool-search tool to
 load them, spending its first turn on discovery). In every measurement above, Claude Code
-deferred Marksman's tools — so **every Marksman number in this file includes one discovery
+deferred Peashooter's tools — so **every Peashooter number in this file includes one discovery
 turn**. In the one full-suite run where the tools registered upfront (legacy suite), every
 task dropped a turn — renames completed in **2 turns at $0.027** (T1: −83% vs baseline instead of −70%) —
 and the suite-level advantage measured **−60%** ($0.59 vs $1.46, −61/−60/−59/−60 in/out/sec/$,
@@ -311,30 +311,30 @@ and the suite-level advantage measured **−60%** ($0.59 vs $1.46, −61/−60/�
 $1.01–1.14 in the controls), so the honest statement is **−45% with the discovery tax,
 trending toward −60% without it** — a multi-run confirmation would pin it down.
 
-The server is not the cause — `marksman-mcp` answers `initialize` in 0.13s; registration mode
+The server is not the cause — `peashooter-mcp` answers `initialize` in 0.13s; registration mode
 is client-side policy/timing. If your client supports eager MCP registration, use it: it's
 worth about one turn and ~2¢ per session.
 
-### 4.2 Token-compression middleware: compatible, and mostly redundant behind Marksman
+### 4.2 Token-compression middleware: compatible, and mostly redundant behind Peashooter
 
 We ran the full suite through [Headroom](https://github.com/headroomlabs-ai/headroom) (an
 open-source proxy that compresses tool outputs before they reach the model), wrapped vs two
 same-day controls:
 
-- **No interference.** 20/20 wrapped tasks passed; Marksman's replies passed through
+- **No interference.** 20/20 wrapped tasks passed; Peashooter's replies passed through
   byte-identical. Headroom's own content router *protects error outputs and skips small
-  content* — which is exactly what Marksman emits (small, dense replies; error-anchored
+  content* — which is exactly what Peashooter emits (small, dense replies; error-anchored
   rejects with verbatim fixes). The two designs are structurally disjoint.
 - **Nothing to compress.** Headroom's own telemetry: 5.2% of input tokens ($0.07) across the
   whole run; 40 of 116 requests had no compressible content. This suite's cost is *turns*,
   which no proxy can reduce.
 - **Where it would pay:** its single best hit (−73%) was a baseline whole-file read — the
-  waste class Marksman prevents from entering context in the first place. On a grep-and-read
-  agent with big files and long sessions, compression helps; behind Marksman there's little
+  waste class Peashooter prevents from entering context in the first place. On a grep-and-read
+  agent with big files and long sessions, compression helps; behind Peashooter there's little
   left to compress. Complementary, not competing.
 - **Methodology warning:** wrapping the proxy also flipped the client into upfront tool
   registration (§4.1) — two variables at once. The apparent "Headroom speedup" of the
-  Marksman arm was entirely §4.1. Attribute middleware effects with transcripts, not totals.
+  Peashooter arm was entirely §4.1. Attribute middleware effects with transcripts, not totals.
 
 Recipe: `headroom proxy --port 8787`; a shim that exports
 `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and executes the real claude binary;

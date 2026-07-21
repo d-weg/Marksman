@@ -1,4 +1,4 @@
-//! Config (`marksman.config.json`, camelCase keys — the legacy `codeindex.config.json`
+//! Config (`peashooter.config.json`, camelCase keys — the legacy `codeindex.config.json`
 //! names are still read),
 //! merged over defaults so a partial file only overrides what it sets.
 use crate::error::Result;
@@ -92,13 +92,13 @@ impl Default for Config {
                 "**/build/**".into(),
                 "**/*.d.ts".into(),
                 "**/.codeindex/**".into(),
-                "**/.marksman/**".into(),
+                "**/.peashooter/**".into(),
             ],
             languages: vec!["ts".into(), "tsx".into()],
             adjacency_bonus: 0.4,
             rrf_k: 60.0,
             symbol_match_bonus: default_symbol_match_bonus(),
-            index_dir: ".marksman".into(),
+            index_dir: ".peashooter".into(),
             query_embed_prefix: "Represent this sentence for searching relevant code: ".into(),
             query_layer_weighting: QueryLayerWeighting::default(),
             package_weights: BTreeMap::new(),
@@ -109,11 +109,16 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load `marksman.config.json` (or the legacy `codeindex.config.json`/`.codeindexrc.json`)
-    /// merged over defaults.
+    /// Load `peashooter.config.json` (or the legacy
+    /// `marksman.config.json`/`codeindex.config.json`/`.codeindexrc.json`) merged over defaults.
     /// Missing file → defaults.
     pub fn load(root: &Path) -> Result<Config> {
-        for name in ["marksman.config.json", "codeindex.config.json", ".codeindexrc.json"] {
+        for name in [
+            "peashooter.config.json",
+            "marksman.config.json",
+            "codeindex.config.json",
+            ".codeindexrc.json",
+        ] {
             let p = root.join(name);
             if let Ok(raw) = std::fs::read_to_string(&p) {
                 let over: serde_json::Value = serde_json::from_str(&raw)?;
@@ -206,7 +211,7 @@ mod tests {
     #[test]
     fn provider_manifest_parses_and_gates() {
         let over: serde_json::Value = serde_json::from_str(
-            r#"{ "providers": { "python": { "enabled": false }, "ts": { "version": "0.3.14", "bin": "/opt/vendored/marksman-provider-ts" } } }"#,
+            r#"{ "providers": { "python": { "enabled": false }, "ts": { "version": "0.3.14", "bin": "/opt/vendored/peashooter-provider-ts" } } }"#,
         )
         .unwrap();
         let mut base = serde_json::to_value(Config::default()).unwrap();
@@ -218,7 +223,7 @@ mod tests {
         assert!(c.provider_enabled("rust"), "unlisted language → default true");
         // version + vendored binary are surfaced for the tool-resolution seam.
         assert_eq!(c.provider_version("ts"), Some("0.3.14"));
-        assert_eq!(c.provider_bin("ts"), Some("/opt/vendored/marksman-provider-ts"));
+        assert_eq!(c.provider_bin("ts"), Some("/opt/vendored/peashooter-provider-ts"));
         assert_eq!(c.provider_bin("rust"), None);
         assert!(Config::default().providers.is_empty(), "empty by default");
     }

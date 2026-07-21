@@ -1,6 +1,6 @@
 //! ci-providers — the ONE `make_provider`: language name → constructed provider.
 //!
-//! Both binaries (`marksman` and `marksman-mcp`) used to carry their own copy of this match,
+//! Both binaries (`peashooter` and `peashooter-mcp`) used to carry their own copy of this match,
 //! and they drifted: the CLI silently lacked the php/swift gated arms, so those repos got
 //! ungated fallback edits from one binary and gated providers from the other. This crate is
 //! the single assembly point; a binary contributes only its log prefix and its registry
@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// files (a Rust-only repo never touches Node). Each language's TOOLCHAIN is checked before
 /// any of it runs: a missing dependency becomes `Unavailable` with the install instructions
 /// (permanent, carried on the registry), not a cryptic spawn error or a retry loop.
-/// `prefix` is the binary's log tag (`"[marksman]"` / `"[marksman-mcp]"`).
+/// `prefix` is the binary's log tag (`"[peashooter]"` / `"[peashooter-mcp]"`).
 pub fn make_provider(lang: &str, root: &Path, config: &Config, prefix: &str) -> ProviderBuild {
     if std::env::var("CI_PROVIDER").as_deref() == Ok("sidecar") {
         if let Some(cmd) = ci_proto::sidecar_command_with(lang, root, false, config.provider_bin(lang)) {
@@ -37,7 +37,7 @@ pub fn make_provider(lang: &str, root: &Path, config: &Config, prefix: &str) -> 
                 }
             }
         }
-        eprintln!("{prefix} CI_PROVIDER=sidecar but no marksman-provider-{lang} found — using in-process");
+        eprintln!("{prefix} CI_PROVIDER=sidecar but no peashooter-provider-{lang} found — using in-process");
     }
     match lang {
         "rust" => {

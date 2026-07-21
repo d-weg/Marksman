@@ -1,7 +1,7 @@
-# Marksman php gate image — PHPStan (the type-check gate) + phpactor (cross-file rename), so a
-# host running Marksman needs neither installed. Built locally:
+# Peashooter php gate image — PHPStan (the type-check gate) + phpactor (cross-file rename), so a
+# host running Peashooter needs neither installed. Built locally:
 #
-#   docker build -f docker/marksman-php.Dockerfile -t marksman-php docker/
+#   docker build -f docker/peashooter-php.Dockerfile -t peashooter-php docker/
 #
 # Both ship as PHARs run on the php runtime; the wrappers expose them as bare `phpstan`/`phpactor`
 # commands so the containerized engine resolves them by name (docs/container-gate-spec.md §9b).

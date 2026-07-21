@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300" role="img" aria-label="Emoji banner: sunflowers make sun (your tokens), pea shooters fire peas at zombies labelled grep whole repo, re-verify by hand, stale read and broken edit rework.">
+  <defs>
+    <style>
+      .em   { font-family: 'Apple Color Emoji','Segoe UI Emoji','Noto Color Emoji',sans-serif; }
+      .lbl  { font-family: 'Trebuchet MS','Segoe UI',system-ui,sans-serif; font-weight:700; }
+      .fire { font-family: 'Trebuchet MS','Segoe UI',system-ui,sans-serif; font-weight:700; fill:#8fdc5a; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="300" rx="18" fill="#1e2a16"/>
+  <rect x="0" y="0" width="1200" height="300" rx="18" fill="none" stroke="#3f5a2a" stroke-width="2"/>
+
+  <!-- token budget counter -->
+  <g>
+    <rect x="26" y="24" width="250" height="46" rx="12" fill="#2b3a1e" stroke="#5c7d38" stroke-width="1.5"/>
+    <text x="44" y="57" font-size="26" class="em">☀️</text>
+    <text x="82" y="56" font-size="24" class="lbl" fill="#ffe07a">9 999</text>
+    <text x="166" y="52" font-size="13" class="lbl" fill="#9fbf6a">token budget</text>
+  </g>
+
+  <!-- lane 1 -->
+  <g transform="translate(0,118)">
+    <text x="44"  y="8" font-size="30" class="em">🌻</text>
+    <text x="120" y="8" font-size="30" class="em">🫛</text>
+    <text x="168" y="4" font-size="22" class="fire">»»</text>
+    <text x="220" y="6" font-size="18" class="em">🟢  🟢  🟢</text>
+    <text x="470" y="8" font-size="32" class="em">🧟</text>
+    <text x="520" y="4"  font-size="18" class="lbl" fill="#e7efd8">grep the whole repo</text>
+  </g>
+
+  <!-- lane 2 -->
+  <g transform="translate(0,184)">
+    <text x="44"  y="8" font-size="30" class="em">🌻</text>
+    <text x="120" y="8" font-size="30" class="em">🫛</text>
+    <text x="168" y="4" font-size="22" class="fire">»»</text>
+    <text x="220" y="6" font-size="18" class="em">🟢  🟢  🟢</text>
+    <text x="470" y="8" font-size="32" class="em">🧟</text>
+    <text x="520" y="4"  font-size="18" class="lbl" fill="#e7efd8">re-verify the edit by hand</text>
+  </g>
+
+  <!-- lane 3 -->
+  <g transform="translate(0,250)">
+    <text x="120" y="8" font-size="30" class="em">🫛</text>
+    <text x="168" y="4" font-size="22" class="fire">»»</text>
+    <text x="220" y="6" font-size="18" class="em">🟢  🟢  🟢</text>
+    <text x="470" y="8" font-size="32" class="em">🧟</text>
+    <text x="520" y="4"  font-size="18" class="lbl" fill="#e7efd8">stale read · broken edit → rework</text>
+  </g>
+
+  <!-- tagline -->
+  <text x="1174" y="52" text-anchor="end" font-size="15" class="lbl" fill="#ffe07a">every token defended before it&#8217;s spent</text>
+</svg>

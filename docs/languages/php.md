@@ -26,15 +26,15 @@
 | `phpstan` | the edit gate | **required** for gated edits | `composer require --dev phpstan/phpstan`, or the `.phar` (`$CI_PHPSTAN`) |
 | `phpactor` | precise cross-file rename | optional | the PHAR from [phpactor releases](https://github.com/phpactor/phpactor/releases) (`$CI_PHPACTOR`) |
 
-`marksman doctor <repo>` reports what a PHP repo needs and what's present.
+`peashooter doctor <repo>` reports what a PHP repo needs and what's present.
 
 ## Known gaps
 
 - **Rename hard-requires phpactor** — no syntactic rename fallback yet; the gated `replace_text`
   path (surfaced in the reject) is the workaround, and it works well because the PHPStan gate
   validates it. **No host phpactor? Use [container mode](../../docker/README.md)**: the
-  `marksman-php` image ships phpstan AND phpactor (`docker build -f docker/marksman-php.Dockerfile
-  -t marksman-php docker/`, then `CI_SANDBOX=oci`) — shipped and e2e-verified
+  `peashooter-php` image ships phpstan AND phpactor (`docker build -f docker/peashooter-php.Dockerfile
+  -t peashooter-php docker/`, then `CI_SANDBOX=oci`) — shipped and e2e-verified
   ([container-gate spec](../container-gate-spec.md)).
 
 ## Recent fix
@@ -48,10 +48,10 @@ one benchmark cell to ~1M tokens as the agent worked around the phantom errors) 
 ## Benchmark (preliminary)
 
 Same corpus and tasks as the [main suite A/B](../benchmarks.md#1-does-it-help--the-suite-ab),
-ported to a PHP fixture (PHPStan as the gate). Median $ per task, baseline vs Marksman; **run 0,
+ported to a PHP fixture (PHPStan as the gate). Median $ per task, baseline vs Peashooter; **run 0,
 single pass, taken BEFORE the gate fix — do not cite.**
 
-| task | baseline $ | Marksman $ | Δ$ | note |
+| task | baseline $ | Peashooter $ | Δ$ | note |
 |---|--:|--:|--:|---|
 | rename | 0.064 | 0.062 | −4% | recovered via gated replace_text |
 | move | 0.216 | 0.046 | **−79%** | movefix (clean win) |
@@ -62,10 +62,10 @@ single pass, taken BEFORE the gate fix — do not cite.**
 | type-rename | 0.240 | 0.228 | −5% | phpactor absent → replace_text |
 
 **Status of this table — known bug, fixed, rerun pending.** The `schema-field` blowup was the
-isolated-overlay gate bug (the whole Marksman column also carried phantom "pre-existing" errors
+isolated-overlay gate bug (the whole Peashooter column also carried phantom "pre-existing" errors
 from the same cause). That bug is **fixed and regression-tested**
 (`phpstan_gate_resolves_sibling_class_across_files`, see [Recent fix](#recent-fix) above). A
-post-fix spot-check confirms the predicted collapse — `schema-field`'s Marksman cell drops from
+post-fix spot-check confirms the predicted collapse — `schema-field`'s Peashooter cell drops from
 the ~$0.755 (≈1M-token) run above to **~$0.12**, a clean win, and every other cell wins too. The
 table is **not yet updated** because that check was a single post-fix pass, not the 3-run median
 the headline standard requires; the numbers above are the pre-fix run and stay flagged until a

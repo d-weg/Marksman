@@ -18,7 +18,7 @@ ignore = "0.4"
 serde_json = { workspace = true }
 
 [[bin]]
-name = "marksman-provider-rust"
+name = "peashooter-provider-rust"
 path = "src/sidecar.rs"
 
 [dev-dependencies]

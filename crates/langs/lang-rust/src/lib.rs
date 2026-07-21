@@ -1,7 +1,7 @@
 //! lang-rust — the Rust [`LanguageProvider`]. v0 read path: in-process `tree-sitter-rust`
 //! (no external tooling — Rust's parser is a Rust crate) for `structure()` (items + fn
 //! sub-nodes) and `import_graph()` (`mod` resolution). Compiler-accurate references and
-//! type-checked edits via rust-analyzer are on the roadmap; this is what lets Marksman
+//! type-checked edits via rust-analyzer are on the roadmap; this is what lets Peashooter
 //! index and retrieve Rust — including its own source — today.
 use ci_core::{
     CommitResult, EditOp, EditOpts, Error, FileSummary, Granularity, ImportGraph,
@@ -102,7 +102,7 @@ impl RustProvider {
     /// loads instantly and drift is overlaid per file — startup never regenerates. Reads are
     /// never blocked: a failed generation warns and serves the tree-sitter graph.
     pub fn open(root: &Path, use_scip: bool) -> Self {
-        if use_scip && !root.join(".marksman").join("rust.scip").is_file() {
+        if use_scip && !root.join(".peashooter").join("rust.scip").is_file() {
             eprintln!("[lang-rust] generating rust-analyzer scip graph (first open, ≈ cargo check) …");
             if let Err(e) = refresh_scip(root) {
                 eprintln!("[lang-rust] scip graph unavailable ({e}); using the tree-sitter graph");
@@ -143,7 +143,7 @@ impl RustProvider {
 /// missing dependency.
 fn engine_factory() -> ci_edit::EngineFactory {
     Arc::new(|root: &Path| {
-        let sandbox = ci_core::resolve_sandbox(root, "marksman-rust");
+        let sandbox = ci_core::resolve_sandbox(root, "peashooter-rust");
         let ra = ci_core::tool_command(&*sandbox, "rust-analyzer", || Ok(rust_analyzer_command()))?;
         let lsp = LspClient::start_in(root, ra, &*sandbox).map_err(|e| {
             match toolchain().describe_missing() {
@@ -164,7 +164,7 @@ fn prewarm_engine(root: &Path) -> Option<Box<dyn GateEngine + Send>> {
     let warm = graph::rust_files(root)
         .into_iter()
         .find_map(|rel| std::fs::read_to_string(root.join(&rel)).ok().map(|c| (rel, c)));
-    let sandbox = ci_core::resolve_sandbox(root, "marksman-rust");
+    let sandbox = ci_core::resolve_sandbox(root, "peashooter-rust");
     let ra = ci_core::tool_command(&*sandbox, "rust-analyzer", || Ok(rust_analyzer_command())).ok()?;
     let mut client = LspClient::start_in(root, ra, &*sandbox).ok()?;
     if let Some((f, content)) = warm {
@@ -204,7 +204,7 @@ impl RustRead {
 
     /// The cached `rust-analyzer scip` index (the optional compiler-accurate graph source).
     fn scip_cache(&self) -> PathBuf {
-        self.root.join(".marksman").join("rust.scip")
+        self.root.join(".peashooter").join("rust.scip")
     }
 
     /// The `use`/reference import graph from the cached SCIP index, kept honest: the base
@@ -347,7 +347,7 @@ impl ReadIndex for RustRead {
     }
 }
 
-/// Generate the cached SCIP index (`<root>/.marksman/rust.scip`) by running
+/// Generate the cached SCIP index (`<root>/.peashooter/rust.scip`) by running
 /// `rust-analyzer scip` — the source for the optional compiler-accurate `use` graph
 /// (`CI_RUST_SCIP`). Run at index time (a batch step); `import_graph` then reads it. Slow (≈ a
 /// `cargo check`), so it's never on the live path. Errors propagate so the caller can warn and
@@ -356,7 +356,7 @@ impl ReadIndex for RustRead {
 /// zero drifted files) — `index` calls this so a fresh `open()`-generated cache isn't paid
 /// for twice, while a stale one is regenerated at the batch step where slow is acceptable.
 pub fn refresh_scip_if_stale(root: &Path) -> Result<bool> {
-    if root.join(".marksman").join("rust.scip").is_file() {
+    if root.join(".peashooter").join("rust.scip").is_file() {
         if let Some(drift) = graph::drifted_files(root) {
             if drift.is_empty() {
                 return Ok(false); // cache fresh — nothing to do
@@ -368,7 +368,7 @@ pub fn refresh_scip_if_stale(root: &Path) -> Result<bool> {
 }
 
 pub fn refresh_scip(root: &Path) -> Result<()> {
-    let out = root.join(".marksman").join("rust.scip");
+    let out = root.join(".peashooter").join("rust.scip");
     if let Some(d) = out.parent() {
         std::fs::create_dir_all(d).map_err(|e| Error::Driver(format!("scip cache dir: {e}")))?;
     }
@@ -683,10 +683,10 @@ mod tests {
     }
 
     // Requires docker (or another OCI runtime) up AND the rust image:
-    //   docker build -f docker/marksman-rust.Dockerfile -t marksman-rust docker/
+    //   docker build -f docker/peashooter-rust.Dockerfile -t peashooter-rust docker/
     // The `cargo check` gate AND the rust-analyzer rename both run in the container, so this passes
     // with NO host cargo/rustc/rust-analyzer. rust-analyzer sends experimental/serverStatus, which
-    // marksman already waits on (wait_quiescent) — so no readiness gotcha, unlike jdtls/sourcekit.
+    // peashooter already waits on (wait_quiescent) — so no readiness gotcha, unlike jdtls/sourcekit.
     // RUN ALONE (it sets $CI_SANDBOX): `cargo test -p lang-rust oci_rust -- --ignored --test-threads=1`.
     #[test]
     #[ignore]
@@ -788,7 +788,7 @@ mod tests {
 
         // SCIP graph: the `use crate::lexer::Token` dependency IS captured.
         refresh_scip(root).expect("rust-analyzer scip");
-        let cache = root.join(".marksman/rust.scip");
+        let cache = root.join(".peashooter/rust.scip");
         assert!(cache.is_file(), "scip cache written");
         let scip_g = ci_scip::ScipIndex::load(&cache).unwrap().import_graph().unwrap();
         let edges = scip_g.get(&PathBuf::from("src/parser.rs")).expect("parser.rs edges from scip");
@@ -870,7 +870,7 @@ mod tests {
         // Distinguish the sources by scope: delete the USE line on disk; a refused cache
         // means the syntactic graph re-reads disk and the edge disappears, while a (wrongly)
         // trusted cache would still serve the stale edge.
-        fs::remove_file(root.join(".marksman/rust.scip.fingerprint.json")).unwrap();
+        fs::remove_file(root.join(".peashooter/rust.scip.fingerprint.json")).unwrap();
         fs::write(root.join("src/parser.rs"), "pub fn parse() {}\n").unwrap();
         let p3 = RustProvider::new(root).with_scip(true);
         assert!(!has_edge(&p3.import_graph().unwrap()), "fingerprint-less cache must not be trusted (edge must reflect DISK, not the stale cache)");

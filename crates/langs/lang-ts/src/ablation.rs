@@ -28,7 +28,7 @@ pub struct TsTreeGated {
 impl TsTreeGated {
     pub fn new(root: &Path) -> Self {
         let read = FallbackProvider::new(root, FbLang::Ts);
-        let sandbox = ci_core::resolve_sandbox(root, "marksman-ts");
+        let sandbox = ci_core::resolve_sandbox(root, "peashooter-ts");
         Self { inner: Arc::new(Composed::new(root, read, Arc::new(move |root: &Path| start_engine(root, &sandbox)))) }
     }
 }

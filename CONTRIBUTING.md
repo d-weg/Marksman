@@ -1,4 +1,4 @@
-# Contributing to Marksman
+# Contributing to Peashooter
 
 Thanks for looking under the hood. This page is the practical map: how to build, test,
 benchmark, and get a change merged.

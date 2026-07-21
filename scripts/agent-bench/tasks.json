@@ -3,7 +3,7 @@
   "id": "T1-rename",
   "prompt": "Rename the function reciprocalRankFusion to fuseRanks everywhere in this codebase (definition and all call sites). Keep everything compiling.",
   "check": "! grep -rq 'reciprocalRankFusion' src && grep -rq 'fuseRanks' src/rrf.ts && npm run -s typecheck",
-  "why": "Cross-file rename \u2014 Marksman's strongest case (one apply_edits vs N str_replace)."
+  "why": "Cross-file rename \u2014 Peashooter's strongest case (one apply_edits vs N str_replace)."
  },
  {
   "id": "T2-move",

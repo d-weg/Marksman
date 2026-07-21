@@ -78,7 +78,7 @@ impl Drop for NpxCacheLock {
 /// download doesn't belong in the middle of someone's first edit. `CI_EDIT_ENGINE` forces one
 /// tier: `tsgo` | `tsmorph` | `lsp` (tsls, or whatever `CI_TS_LSP_SERVER` names).
 ///
-/// In a CONTAINER (`CI_SANDBOX=oci` + the `marksman-ts` image) the tier is tsgo, period: the
+/// In a CONTAINER (`CI_SANDBOX=oci` + the `peashooter-ts` image) the tier is tsgo, period: the
 /// image bakes it at a pinned version, and the ladder's lower rungs don't transplant —
 /// ts-morph stages an npm install at runtime (defeating the pinned image), and tsls can't
 /// resolve a global typescript install. tsgo is also the fastest tier, so the container gets

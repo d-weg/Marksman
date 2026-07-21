@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot runner (marksman agent-bench): paste your API key into scripts/agent-bench/.key (gitignored),
+# One-shot runner (peashooter agent-bench): paste your API key into scripts/agent-bench/.key (gitignored),
 # then run this. It wires up CLAUDE_BIN + the model and calls the harness against
 # the prepared /tmp/bench-target clone.
 #
@@ -36,7 +36,7 @@ export CI_NPM_CACHE="/tmp/ci-npm-cache"
 # a model bundled inside the TS checkout.
 export CODEINDEX_TS_DIR="${CODEINDEX_TS_DIR:-$HOME/codeindex}"
 if [ -z "${CI_MODEL_DIR:-}" ]; then
-  for cand in "$HOME/.marksman/models/potion-code-16M" "$CODEINDEX_TS_DIR/.models/potion-code-16M"; do
+  for cand in "$HOME/.peashooter/models/potion-code-16M" "$CODEINDEX_TS_DIR/.models/potion-code-16M"; do
     [ -d "$cand" ] && CI_MODEL_DIR="$cand" && break
   done
 fi

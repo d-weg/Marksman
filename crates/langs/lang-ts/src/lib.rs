@@ -184,19 +184,19 @@ fn engine_factory(sandbox: Arc<dyn ci_core::Sandbox>) -> ci_edit::EngineFactory 
 }
 
 impl TsProvider {
-    /// Open a provider for `root`, loading the cached `.marksman/index.scip` (milliseconds)
+    /// Open a provider for `root`, loading the cached `.peashooter/index.scip` (milliseconds)
     /// when the source is byte-identical to what produced it, else reindexing (~20s). The
     /// freshness check is the full source fingerprint (see `fingerprint.rs`), so content
     /// edits, import changes, and added/removed/moved files all invalidate; anything doubtful
     /// (no fingerprint, unreadable index) reindexes — a stale load is a correctness bug, a
     /// spurious reindex only a slow start.
     pub fn open(root: &Path) -> Result<Self> {
-        Self::open_in(root, ci_core::resolve_sandbox(root, "marksman-ts"))
+        Self::open_in(root, ci_core::resolve_sandbox(root, "peashooter-ts"))
     }
 
     /// [`open`] with an explicit sandbox — the seam the OCI e2e drives directly.
     fn open_in(root: &Path, sandbox: Arc<dyn ci_core::Sandbox>) -> Result<Self> {
-        let out = root.join(".marksman").join("index.scip");
+        let out = root.join(".peashooter").join("index.scip");
         let current = source_fingerprint(root);
         if out.exists() {
             match load_fingerprint(&fingerprint_path(root)) {
@@ -219,7 +219,7 @@ impl TsProvider {
     /// Index `root` with scip-typescript (`npx @sourcegraph/scip-typescript`), then load it.
     /// Always reindexes; `open` is the cached path.
     pub fn index(root: &Path) -> Result<Self> {
-        Self::index_with(root, source_fingerprint(root), ci_core::resolve_sandbox(root, "marksman-ts"))
+        Self::index_with(root, source_fingerprint(root), ci_core::resolve_sandbox(root, "peashooter-ts"))
     }
 
     /// The fingerprint is computed by the caller BEFORE scip runs: if a file changes while the
@@ -227,12 +227,12 @@ impl TsProvider {
     /// `open` sees a mismatch and reindexes (conservative), rather than blessing an index that
     /// missed the mid-run edit.
     fn index_with(root: &Path, fp: Fingerprint, sandbox: Arc<dyn ci_core::Sandbox>) -> Result<Self> {
-        let out = root.join(".marksman").join("index.scip");
+        let out = root.join(".peashooter").join("index.scip");
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
         }
         // The PRODUCER runs where the toolchain runs (contract §10): bare `scip-typescript` on
-        // the image's PATH in a container (the artifact lands under .marksman/, which the
+        // the image's PATH in a container (the artifact lands under .peashooter/, which the
         // sandbox bind-mounts at the same path), the pinned npx staging on the host. The npx
         // cache lock serializes HOST staging only — a container needs no staging.
         let mut cmd = ci_core::tool_command(&*sandbox, "scip-typescript", || {
@@ -277,13 +277,13 @@ impl TsProvider {
 
     /// Index `root` by SWEEPING the tsgo language server (documentSymbol + references via
     /// [`ci_lsp_index`]) instead of running scip-typescript — the `CI_TS_MODE=lsp` comparison
-    /// arm. Emits a genuine SCIP protobuf to `.marksman/index.lspx.scip`, so the whole read
+    /// arm. Emits a genuine SCIP protobuf to `.peashooter/index.lspx.scip`, so the whole read
     /// path (structure, import graph, blast radius) is byte-for-byte the same consumer as the
     /// scip-typescript index. No fingerprint cache yet: this arm always re-sweeps.
     pub fn index_with_lsp_sweep(root: &Path) -> Result<Self> {
         let files = discover_ts_files(root)?;
         let bytes = ci_lsp_index::sweep_index(root, &files, engine::tsgo_lsp_command(), "lspx-ts")?;
-        let out = root.join(".marksman").join("index.lspx.scip");
+        let out = root.join(".peashooter").join("index.lspx.scip");
         if let Some(dir) = out.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -293,7 +293,7 @@ impl TsProvider {
 
     /// Load a provider from an existing `index.scip` (skip running the indexer).
     pub fn from_index(root: &Path, index_scip: &Path) -> Result<Self> {
-        Self::from_index_in(root, index_scip, ci_core::resolve_sandbox(root, "marksman-ts"))
+        Self::from_index_in(root, index_scip, ci_core::resolve_sandbox(root, "peashooter-ts"))
     }
 
     fn from_index_in(root: &Path, index_scip: &Path, sandbox: Arc<dyn ci_core::Sandbox>) -> Result<Self> {
@@ -422,8 +422,8 @@ mod tests {
     fn fresh_overrides_shadow_the_scip_index() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        fs::create_dir_all(root.join(".marksman")).unwrap();
-        let idx = root.join(".marksman/index.scip");
+        fs::create_dir_all(root.join(".peashooter")).unwrap();
+        let idx = root.join(".peashooter/index.scip");
         fs::write(&idx, b"").unwrap(); // valid, empty SCIP index
         fs::write(root.join("a.ts"), "export function add(a: number): number {\n  return a;\n}\n").unwrap();
 
@@ -519,7 +519,7 @@ mod tests {
 
         // Unchanged source -> `open` loads the cached index.scip instead of re-running scip
         // (the file's mtime must not move — reindexing rewrites it).
-        let scip = root.join(".marksman/index.scip");
+        let scip = root.join(".peashooter/index.scip");
         let cached_mtime = fs::metadata(&scip).unwrap().modified().unwrap();
         let reopened = TsProvider::open(root).expect("open from cache");
         assert_eq!(fs::metadata(&scip).unwrap().modified().unwrap(), cached_mtime, "open() re-ran the indexer on unchanged source");
@@ -535,12 +535,12 @@ mod tests {
         assert!(refreshed.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.name.as_deref() == Some("sub")));
     }
 
-    // M6 (docs/container-gate-spec.md): the WHOLE TypeScript toolchain from the `marksman-ts`
+    // M6 (docs/container-gate-spec.md): the WHOLE TypeScript toolchain from the `peashooter-ts`
     // image — indexing (scip-typescript, the producer), the gate verdict, and the cross-file
     // rename (both tsgo) all run in-container, so this passes with NO host Node. TS is the
     // only language whose READ path needs the toolchain, which is why this e2e also asserts
     // the index. Requires docker (or another OCI runtime) up AND the ts image:
-    //   docker build -f docker/marksman-ts.Dockerfile -t marksman-ts docker/
+    //   docker build -f docker/peashooter-ts.Dockerfile -t peashooter-ts docker/
     #[test]
     #[ignore]
     fn oci_ts_index_gate_and_rename_without_host_tools() {
@@ -562,9 +562,9 @@ mod tests {
         let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
             root.to_path_buf(),
             runtime,
-            "marksman-ts".into(),
+            "peashooter-ts".into(),
         ));
-        // Index in-container: the image's scip-typescript writes .marksman/index.scip through
+        // Index in-container: the image's scip-typescript writes .peashooter/index.scip through
         // the identical-path mount.
         let p = TsProvider::open_in(root, sandbox).expect("in-container scip-typescript indexing");
         assert!(p.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.id == "src/math.ts#add"));
@@ -605,7 +605,7 @@ mod tests {
 
         let p = TsTreeGated::new(root);
         // tree-sitter read path sees the symbols with no scip index anywhere.
-        assert!(!root.join(".marksman/index.scip").exists());
+        assert!(!root.join(".peashooter/index.scip").exists());
         assert!(p.structure(Path::new("src/math.ts")).unwrap().iter().any(|n| n.id == "src/math.ts#add"));
         let opts = EditOpts { write: true, dry_run: false, tsconfig: None };
 

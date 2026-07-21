@@ -15,7 +15,7 @@ whose scope was the gate/edit surface) inventoried the READ-ARTIFACT side: what 
 language's semantic data, how it is invoked, pinned, cached, and refreshed. The headline,
 stated up front: **the consumption layer is already uniform** (every producer's output is
 normalized into the one internal model; both scip users share `ci_core::fingerprint`; all
-artifacts live under `.marksman/`) — the inconsistencies are concentrated at the producer
+artifacts live under `.peashooter/`) — the inconsistencies are concentrated at the producer
 *invocation* seam, and most of the discipline that exists (pins, fingerprint participation,
 npx serialization) is folklore encoded in two crates rather than contract. This spec pins the
 one unpinned tool, fixes the one environment-blind derivation, and writes the discipline down
@@ -36,9 +36,9 @@ was measured and rejected (LSP-sweep parity at 38x the cost; see `benchmarks.md`
 
 | | producer | pinned | fingerprint | artifact |
 |---|---|---|---|---|
-| TS | `npx @sourcegraph/scip-typescript@0.4.0` | ✅ (version participates in the fingerprint) | shared `ci_core::fingerprint` | `.marksman/index.scip` |
-| TS (lsp-sweep arm) | tsgo sweep via ci-lsp-index | n/a | **none — always re-sweeps** | `.marksman/index.lspx.scip` |
-| Rust | `rust-analyzer scip` | host binary (unconditional-trust env) | shared, drift-seeded partial refresh | `.marksman/rust.scip` |
+| TS | `npx @sourcegraph/scip-typescript@0.4.0` | ✅ (version participates in the fingerprint) | shared `ci_core::fingerprint` | `.peashooter/index.scip` |
+| TS (lsp-sweep arm) | tsgo sweep via ci-lsp-index | n/a | **none — always re-sweeps** | `.peashooter/index.lspx.scip` |
+| Rust | `rust-analyzer scip` | host binary (unconditional-trust env) | shared, drift-seeded partial refresh | `.peashooter/rust.scip` |
 | java/php/swift/fallback | none (tree-sitter live) | n/a | n/a | none |
 
 Gate-tier tooling pins (context): ts-morph pinned, tsls+typescript pinned (test and
@@ -73,7 +73,7 @@ is a drift risk, not a soundness flaw).
 
 What makes TS/Rust producers well-behaved today — pinned version **participating in the
 fingerprint** (a tool bump = a reindex, never a stale artifact served under a new tool),
-artifacts under `.marksman/`, staleness via `ci_core::fingerprint`, npx staging serialized
+artifacts under `.peashooter/`, staleness via `ci_core::fingerprint`, npx staging serialized
 against concurrent instances, producer stdout never touching the protocol stream — is
 implemented convention. Nothing obliges the next producer to any of it. The contract has
 gate-tool clauses (§9) but no producer clauses.
@@ -122,7 +122,7 @@ host without them — the documented honest tier.
 
 **P3. Contract clauses** (addresses F3, F4) — new provider-contract **§10. Read-artifact
 producers**: pinned version participating in the source fingerprint; artifact + fingerprint
-under `.marksman/` via `ci_core::fingerprint`; concurrent-staging serialization; stdout
+under `.peashooter/` via `ci_core::fingerprint`; concurrent-staging serialization; stdout
 hygiene; "adopt a producer only at the ladder's maturity step". Plus one clause in §5 naming
 the **deletion convention** (empty buffer = deletion stand-in; every materialization strategy
 must make the deleted file *absent to the checker* — the four current spellings listed), and

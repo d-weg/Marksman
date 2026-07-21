@@ -1,12 +1,12 @@
 #!/bin/sh
 # Container-mode helper (docs/container-guide.md). Build and check the
-# per-language Marksman images so a host runs the gate/rename toolchain from
+# per-language Peashooter images so a host runs the gate/rename toolchain from
 # a pinned OCI image instead of installing N language toolchains.
 #
-#   scripts/marksman-images.sh check              # runtime + which images exist + pin sync
-#   scripts/marksman-images.sh build              # build every image
-#   scripts/marksman-images.sh build ts rust      # build only these
-#   scripts/marksman-images.sh list               # what each image holds
+#   scripts/peashooter-images.sh check              # runtime + which images exist + pin sync
+#   scripts/peashooter-images.sh build              # build every image
+#   scripts/peashooter-images.sh build ts rust      # build only these
+#   scripts/peashooter-images.sh list               # what each image holds
 #
 # The images are plain OCI and NEVER pulled — always built locally, so the
 # toolchain is auditable. See docker/README.md and docs/container-gate-spec.md.
@@ -53,7 +53,7 @@ img_pin() {
       for (i = 1; i <= n; i++) {
         t = toks[i]; sub(/\\$/, "", t)
         if (index(t, pkg "@") == 1) { print substr(t, length(pkg) + 2); exit }
-      } }' docker/marksman-ts.Dockerfile
+      } }' docker/peashooter-ts.Dockerfile
 }
 
 check_ts_pins() {
@@ -86,8 +86,8 @@ shift 2>/dev/null || true
 
 case "$cmd" in
   list)
-    echo "Marksman language images (build only what your repos need):"
-    for l in $LANGS; do printf "  marksman-%-6s %s\n" "$l" "$(lang_note "$l")"; done
+    echo "Peashooter language images (build only what your repos need):"
+    for l in $LANGS; do printf "  peashooter-%-6s %s\n" "$l" "$(lang_note "$l")"; done
     ;;
 
   check)
@@ -99,15 +99,15 @@ case "$cmd" in
       echo "runtime:   $rt"
       echo "images:"
       for l in $LANGS; do
-        if image_exists "$rt" "marksman-$l"; then
-          echo "  present  marksman-$l"
+        if image_exists "$rt" "peashooter-$l"; then
+          echo "  present  peashooter-$l"
         else
-          echo "  missing  marksman-$l   (build: scripts/marksman-images.sh build $l)"
+          echo "  missing  peashooter-$l   (build: scripts/peashooter-images.sh build $l)"
         fi
       done
     fi
     echo "ts pins:"
-    check_ts_pins || echo "  -> fix the drift before building marksman-ts, or the verdict won't be reproducible"
+    check_ts_pins || echo "  -> fix the drift before building peashooter-ts, or the verdict won't be reproducible"
     ;;
 
   build)
@@ -117,15 +117,15 @@ case "$cmd" in
     # TS drift is fatal for a build (the image would pin a verdict the code
     # doesn't expect); check before building ts.
     case " $targets " in
-      *" ts "*) check_ts_pins || { echo "refusing to build marksman-ts with drifted pins" >&2; exit 1; } ;;
+      *" ts "*) check_ts_pins || { echo "refusing to build peashooter-ts with drifted pins" >&2; exit 1; } ;;
     esac
     for l in $targets; do
-      f="docker/marksman-$l.Dockerfile"
+      f="docker/peashooter-$l.Dockerfile"
       [ -f "$f" ] || { echo "unknown language '$l' (have: $LANGS)" >&2; exit 1; }
-      echo "== building marksman-$l  ($(lang_note "$l"))"
-      "$rt" build -f "$f" -t "marksman-$l" docker/
+      echo "== building peashooter-$l  ($(lang_note "$l"))"
+      "$rt" build -f "$f" -t "peashooter-$l" docker/
     done
-    echo "done. Enable with:  CI_SANDBOX=oci marksman-mcp --root /path/to/repo"
+    echo "done. Enable with:  CI_SANDBOX=oci peashooter-mcp --root /path/to/repo"
     ;;
 
   *)

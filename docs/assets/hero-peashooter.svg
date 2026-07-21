@@ -1,0 +1,150 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 430" width="1200" height="430" font-family="'Trebuchet MS','Segoe UI',system-ui,sans-serif" role="img" aria-label="A Plants-vs-Zombies lawn: sunflowers produce sun (your tokens), peashooters fire peas at incoming zombies labelled with token-wasters like stale reads and re-verifying by hand.">
+  <defs>
+    <!-- calmer lawn: subtle checker so bright plants pop -->
+    <pattern id="lawn" width="120" height="120" patternUnits="userSpaceOnUse">
+      <rect width="120" height="120" fill="#63a930"/>
+      <rect width="60" height="60" fill="#5a9f2b"/>
+      <rect x="60" y="60" width="60" height="60" fill="#5a9f2b"/>
+    </pattern>
+    <radialGradient id="sunGrad" cx="40%" cy="35%" r="70%">
+      <stop offset="0%" stop-color="#fff2a8"/><stop offset="55%" stop-color="#ffcf33"/><stop offset="100%" stop-color="#f5a300"/>
+    </radialGradient>
+    <radialGradient id="peaHead" cx="35%" cy="30%" r="80%">
+      <stop offset="0%" stop-color="#b6ea77"/><stop offset="65%" stop-color="#72c53a"/><stop offset="100%" stop-color="#4f9e28"/>
+    </radialGradient>
+    <radialGradient id="peaBall" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#f0ffcb"/><stop offset="55%" stop-color="#b7ee63"/><stop offset="100%" stop-color="#79cc37"/>
+    </radialGradient>
+
+    <!-- a single sun token -->
+    <g id="sun">
+      <g fill="#ffce2e">
+        <rect x="-2.5" y="-22" width="5" height="12" rx="2.5"/><rect x="-2.5" y="10" width="5" height="12" rx="2.5"/>
+        <rect x="-22" y="-2.5" width="12" height="5" rx="2.5"/><rect x="10" y="-2.5" width="12" height="5" rx="2.5"/>
+        <rect x="-2.5" y="-22" width="5" height="12" rx="2.5" transform="rotate(45)"/><rect x="-2.5" y="10" width="5" height="12" rx="2.5" transform="rotate(45)"/>
+        <rect x="-22" y="-2.5" width="12" height="5" rx="2.5" transform="rotate(45)"/><rect x="10" y="-2.5" width="12" height="5" rx="2.5" transform="rotate(45)"/>
+      </g>
+      <circle r="13" fill="url(#sunGrad)" stroke="#e08a00" stroke-width="1"/>
+    </g>
+
+    <!-- sunflower, origin at ground/base -->
+    <g id="sunflower">
+      <ellipse cx="0" cy="0" rx="30" ry="7" fill="#123008" opacity="0.22"/>
+      <rect x="-5" y="-80" width="10" height="80" rx="5" fill="#4f9e28" stroke="#2c6a16" stroke-width="1.6"/>
+      <ellipse cx="-16" cy="-34" rx="16" ry="8" fill="#5bb02f" stroke="#2c6a16" stroke-width="1.4" transform="rotate(-24 -16 -34)"/>
+      <ellipse cx="16" cy="-52" rx="15" ry="8" fill="#5bb02f" stroke="#2c6a16" stroke-width="1.4" transform="rotate(24 16 -52)"/>
+      <g stroke="#e0a600" stroke-width="1">
+        <ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(0 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(36 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(72 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(108 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(144 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(180 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(216 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(252 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(288 0 -92)"/><ellipse cx="0" cy="-118" rx="8" ry="16" fill="#ffd23b" transform="rotate(324 0 -92)"/>
+      </g>
+      <circle cx="0" cy="-92" r="21" fill="#8a5220" stroke="#5c3312" stroke-width="2.4"/>
+      <g fill="#a8692c"><circle cx="-7" cy="-97" r="2.4"/><circle cx="2" cy="-99" r="2.4"/><circle cx="8" cy="-93" r="2.4"/><circle cx="-9" cy="-88" r="2.4"/><circle cx="0" cy="-90" r="2.4"/><circle cx="6" cy="-84" r="2.4"/><circle cx="-3" cy="-83" r="2.4"/></g>
+      <circle cx="-6" cy="-95" r="2.2" fill="#3a230f"/><circle cx="6" cy="-95" r="2.2" fill="#3a230f"/>
+      <path d="M-6 -86 q6 5 12 0" stroke="#3a230f" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+    </g>
+
+    <!-- peashooter, origin at ground/base, barrel points +x -->
+    <g id="peashooter">
+      <ellipse cx="0" cy="0" rx="34" ry="8" fill="#123008" opacity="0.24"/>
+      <rect x="-7" y="-88" width="14" height="88" rx="7" fill="#4f9e28" stroke="#2c6a16" stroke-width="1.8"/>
+      <ellipse cx="-15" cy="-40" rx="15" ry="8" fill="#5bb02f" stroke="#2c6a16" stroke-width="1.4" transform="rotate(-24 -15 -40)"/>
+      <ellipse cx="15" cy="-58" rx="14" ry="8" fill="#5bb02f" stroke="#2c6a16" stroke-width="1.4" transform="rotate(26 15 -58)"/>
+      <rect x="14" y="-105" width="42" height="26" rx="13" fill="#57a82c" stroke="#2c6a16" stroke-width="2.4"/>
+      <circle cx="0" cy="-92" r="27" fill="url(#peaHead)" stroke="#2c6a16" stroke-width="2.8"/>
+      <ellipse cx="56" cy="-92" rx="7.5" ry="12.5" fill="#2a5f16"/><ellipse cx="56" cy="-92" rx="4" ry="7" fill="#183a0d"/>
+      <ellipse cx="-9" cy="-102" rx="9" ry="6" fill="#e2ffbe" opacity="0.9"/>
+      <ellipse cx="-2" cy="-98" rx="7" ry="8" fill="#ffffff"/><circle cx="1" cy="-98" r="3.4" fill="#26350f"/>
+      <path d="M-11 -108 q9 -4 18 -1" stroke="#2c6a16" stroke-width="2.6" fill="none" stroke-linecap="round"/>
+    </g>
+
+    <!-- zombie, origin at feet, faces -x (toward the plants) -->
+    <g id="zombie">
+      <ellipse cx="-3" cy="0" rx="30" ry="7" fill="#123008" opacity="0.24"/>
+      <rect x="-12" y="-36" width="9" height="36" rx="4" fill="#586b59" stroke="#33402f" stroke-width="1.4"/>
+      <rect x="3" y="-36" width="9" height="36" rx="4" fill="#4c5e4d" stroke="#33402f" stroke-width="1.4"/>
+      <rect x="-9" y="-4" width="16" height="6" rx="3" fill="#3a2a1f"/>
+      <path d="M-17 -80 h34 v42 q-17 8 -34 0 z" fill="#6f6a86" stroke="#403a55" stroke-width="1.6"/>
+      <path d="M-17 -50 l7 8 l6 -8 l6 8 l6 -8 l6 8 v12 h-37 z" fill="#5b5670"/>
+      <rect x="-46" y="-74" width="34" height="11" rx="5.5" fill="#a3b3a0" stroke="#5f705c" stroke-width="1.3" transform="rotate(-7 -46 -74)"/>
+      <rect x="-48" y="-70" width="12" height="10" rx="4" fill="#93a390" stroke="#5f705c" stroke-width="1.3" transform="rotate(-7 -48 -70)"/>
+      <rect x="-40" y="-60" width="30" height="11" rx="5.5" fill="#93a390" stroke="#5f705c" stroke-width="1.3" transform="rotate(6 -40 -60)"/>
+      <circle cx="0" cy="-96" r="17" fill="#aebe9f" stroke="#5f705c" stroke-width="1.6"/>
+      <path d="M-14 -102 q3 -12 15 -12 q10 0 13 9 q-8 -5 -16 -2 q-7 3 -12 5 z" fill="#3f3227"/>
+      <circle cx="-6" cy="-98" r="3" fill="#241d16"/><circle cx="6" cy="-98" r="3" fill="#241d16"/>
+      <circle cx="-5.4" cy="-99" r="0.9" fill="#c9503f"/><circle cx="6.6" cy="-99" r="0.9" fill="#c9503f"/>
+      <path d="M-7 -87 q7 4 14 0" stroke="#241d16" stroke-width="1.8" fill="none" stroke-linecap="round"/>
+      <rect x="4" y="-90" width="3" height="5" fill="#eae6d2"/>
+    </g>
+
+    <!-- reusable pea projectile: bright, outlined, with a specular dot -->
+    <g id="pea">
+      <circle r="10.5" fill="url(#peaBall)" stroke="#2c5416" stroke-width="2"/>
+      <circle cx="-3.4" cy="-3.6" r="2.6" fill="#ffffff" opacity="0.92"/>
+    </g>
+  </defs>
+
+  <!-- ===== scene ===== -->
+  <rect x="0" y="0" width="1200" height="430" rx="18" fill="url(#lawn)"/>
+  <!-- gentle top shading so the lawn reads as ground, not a flat block -->
+  <rect x="0" y="0" width="1200" height="120" rx="18" fill="#000000" opacity="0.05"/>
+  <!-- house / soil edge on the left (what you're defending) -->
+  <rect x="0" y="0" width="60" height="430" fill="#5a3d22"/>
+  <rect x="52" y="0" width="10" height="430" fill="#6b4a2b"/>
+
+  <!-- floating sun tokens rising from the sunflowers -->
+  <g opacity="0.97">
+    <use href="#sun" transform="translate(150,120) scale(0.8)"/>
+    <use href="#sun" transform="translate(205,190) scale(0.62)"/>
+    <use href="#sun" transform="translate(120,250) scale(0.7)"/>
+  </g>
+
+  <!-- sun bank / token counter (top-left, the thing under threat) -->
+  <g>
+    <rect x="16" y="16" width="196" height="52" rx="13" fill="#efe0ad" stroke="#8f6f22" stroke-width="2.5"/>
+    <use href="#sun" transform="translate(46,42) scale(1.15)"/>
+    <text x="74" y="50" font-size="27" font-weight="700" fill="#5a4712" letter-spacing="0.5">9 999</text>
+    <text x="152" y="35" font-size="10.5" font-weight="700" fill="#6f5716">TOKEN</text>
+    <text x="152" y="48" font-size="10.5" font-weight="700" fill="#6f5716">BUDGET</text>
+  </g>
+
+  <!-- producers -->
+  <use href="#sunflower" transform="translate(120,285)"/>
+  <use href="#sunflower" transform="translate(150,405)"/>
+
+  <!-- defenders: one peashooter per lane -->
+  <use href="#peashooter" transform="translate(270,145)"/>
+  <use href="#peashooter" transform="translate(270,275)"/>
+  <use href="#peashooter" transform="translate(270,400)"/>
+
+  <!-- lane A: ground 145, fire line y=53 -->
+  <g stroke="#ffffff" stroke-width="2.5" opacity="0.5" stroke-linecap="round">
+    <line x1="345" y1="53" x2="322" y2="53"/><line x1="437" y1="53" x2="414" y2="53"/><line x1="545" y1="53" x2="522" y2="53"/>
+  </g>
+  <use href="#pea" transform="translate(360,53)"/><use href="#pea" transform="translate(452,53)"/><use href="#pea" transform="translate(560,53)"/>
+  <use href="#zombie" transform="translate(700,145)"/>
+  <g transform="translate(700,0)"><rect x="-64" y="20" width="128" height="26" rx="13" fill="#ffffff" stroke="#c94b3a" stroke-width="1.5"/><text x="0" y="37" text-anchor="middle" font-size="14" font-weight="700" fill="#333">grep whole repo</text></g>
+  <use href="#zombie" transform="translate(1010,145)"/>
+  <g transform="translate(1010,0)"><rect x="-52" y="20" width="104" height="26" rx="13" fill="#ffffff" stroke="#c94b3a" stroke-width="1.5"/><text x="0" y="37" text-anchor="middle" font-size="14" font-weight="700" fill="#333">stale read</text></g>
+
+  <!-- lane B: ground 275, fire line y=183 -->
+  <g stroke="#ffffff" stroke-width="2.5" opacity="0.5" stroke-linecap="round">
+    <line x1="345" y1="183" x2="322" y2="183"/><line x1="455" y1="183" x2="432" y2="183"/><line x1="585" y1="183" x2="562" y2="183"/>
+  </g>
+  <use href="#pea" transform="translate(360,183)"/><use href="#pea" transform="translate(470,183)"/><use href="#pea" transform="translate(600,183)"/>
+  <use href="#zombie" transform="translate(880,275)"/>
+  <g transform="translate(880,130)"><rect x="-74" y="20" width="148" height="26" rx="13" fill="#ffffff" stroke="#c94b3a" stroke-width="1.5"/><text x="0" y="37" text-anchor="middle" font-size="14" font-weight="700" fill="#333">re-verify by hand</text></g>
+
+  <!-- lane C: ground 400, fire line y=308 -->
+  <g stroke="#ffffff" stroke-width="2.5" opacity="0.5" stroke-linecap="round">
+    <line x1="345" y1="308" x2="322" y2="308"/><line x1="440" y1="308" x2="417" y2="308"/><line x1="550" y1="308" x2="527" y2="308"/>
+  </g>
+  <use href="#pea" transform="translate(360,308)"/><use href="#pea" transform="translate(455,308)"/><use href="#pea" transform="translate(565,308)"/>
+  <use href="#zombie" transform="translate(760,400)"/>
+  <g transform="translate(705,308)" fill="#f4ffe0" stroke="#8fd24a" stroke-width="1"><path d="M0 0 l6 -13 l3 12 l12 -5 l-9 10 l12 6 l-13 1 l4 12 l-10 -8 l-7 10 l1 -13 l-13 2 l11 -8 l-9 -9 l13 3 z"/></g>
+  <g transform="translate(760,255)"><rect x="-86" y="20" width="172" height="26" rx="13" fill="#ffffff" stroke="#c94b3a" stroke-width="1.5"/><text x="0" y="37" text-anchor="middle" font-size="14" font-weight="700" fill="#333">broken edit &#8594; rework</text></g>
+
+  <!-- tagline ribbon -->
+  <g>
+    <rect x="770" y="376" width="418" height="40" rx="20" fill="#241a33" stroke="#4a3a63" stroke-width="1.5"/>
+    <text x="979" y="402" text-anchor="middle" font-size="16.5" font-weight="700" fill="#ffe98a">every token defended before it&#8217;s spent</text>
+  </g>
+</svg>

@@ -1,9 +1,9 @@
-# Marksman java gate image — the JDK gate (javac / javax.tools sidecar) + jdtls (cross-file
-# rename), so a host running Marksman needs neither installed. Built locally:
+# Peashooter java gate image — the JDK gate (javac / javax.tools sidecar) + jdtls (cross-file
+# rename), so a host running Peashooter needs neither installed. Built locally:
 #
-#   docker build -f docker/marksman-java.Dockerfile -t marksman-java docker/
+#   docker build -f docker/peashooter-java.Dockerfile -t peashooter-java docker/
 #
-# Then Marksman runs the java toolchain inside it with CI_SANDBOX=oci (docs/container-gate-spec.md
+# Then Peashooter runs the java toolchain inside it with CI_SANDBOX=oci (docs/container-gate-spec.md
 # §9b). Java 21 is jdtls's runtime floor and also runs the JEP-330 single-file javax.tools sidecar.
 FROM eclipse-temurin:21-jdk
 

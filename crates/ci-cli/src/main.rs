@@ -1,8 +1,8 @@
-//! Marksman CLI — `index` and `retrieve`. v1: TypeScript via SCIP
+//! Peashooter CLI — `index` and `retrieve`. v1: TypeScript via SCIP
 //! (scip-typescript) + native Model2Vec embeddings.
 //!
-//!   marksman index    <root>
-//!   marksman retrieve <root> "<task>" [--top N] [--json]
+//!   peashooter index    <root>
+//!   peashooter retrieve <root> "<task>" [--top N] [--json]
 //!
 //! Model files resolve from $CI_MODEL_DIR (a Model2Vec dir with model.safetensors
 //! + tokenizer.json), defaulting to the sibling Node repo's potion-code-16M.
@@ -17,10 +17,10 @@ use std::process::exit;
 fn model_dir() -> PathBuf {
     std::env::var("CI_MODEL_DIR").map(PathBuf::from).unwrap_or_else(|_| {
         // Default to the path the README's download step uses, so the documented
-        // `git clone … ~/.marksman/models/potion-code-16M` works without setting CI_MODEL_DIR.
+        // `git clone … ~/.peashooter/models/potion-code-16M` works without setting CI_MODEL_DIR.
         std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".marksman/models/potion-code-16M"))
-            .unwrap_or_else(|_| PathBuf::from(".marksman/models/potion-code-16M"))
+            .map(|h| PathBuf::from(h).join(".peashooter/models/potion-code-16M"))
+            .unwrap_or_else(|_| PathBuf::from(".peashooter/models/potion-code-16M"))
     })
 }
 
@@ -29,7 +29,7 @@ fn model_dir() -> PathBuf {
 fn rust_config(root: &Path) -> Config {
     let mut c = Config::load(root).unwrap_or_default();
     c.embedding_model = "minishlab/potion-code-16M".into();
-    c.index_dir = ".marksman".into();
+    c.index_dir = ".peashooter".into();
     c
 }
 
@@ -48,13 +48,13 @@ fn cmd_index(root: &Path) {
     // Rust+TS+Python repo indexes fully). `cfg` is a snapshot for the constructors — build_registry
     // only rewrites include/exclude, which they don't read.
     let cfg = config.clone();
-    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[marksman]"))
+    let built = build_registry(root, &mut config, |lang| ci_providers::make_provider(lang, root, &cfg, "[peashooter]"))
         .unwrap_or_else(|e| die(e));
     // A partial index (one language's toolchain down) still beats none for the CLI indexer, so we
     // proceed — but warn, since those files won't be indexed until the toolchain is fixed.
     if !built.failed.is_empty() {
         eprintln!(
-            "[marksman] warning: skipping language(s) whose provider failed to start: {} — their files are NOT indexed",
+            "[peashooter] warning: skipping language(s) whose provider failed to start: {} — their files are NOT indexed",
             built.failed.join(", ")
         );
     }
@@ -66,13 +66,13 @@ fn cmd_index(root: &Path) {
     let rust_active = registry.provider_for(Path::new("_.rs")).is_some();
     if rust_active && config.scip_enabled("rust") {
         match lang_rust::refresh_scip_if_stale(root) {
-            Ok(true) => eprintln!("[marksman] rust scip graph regenerated (source drifted since the cache)"),
+            Ok(true) => eprintln!("[peashooter] rust scip graph regenerated (source drifted since the cache)"),
             Ok(false) => {}
-            Err(e) => eprintln!("[marksman] rust scip graph unavailable ({e}); using the tree-sitter mod graph"),
+            Err(e) => eprintln!("[peashooter] rust scip graph unavailable ({e}); using the tree-sitter mod graph"),
         }
     }
 
-    eprintln!("[marksman] embedding + indexing …");
+    eprintln!("[peashooter] embedding + indexing …");
     let index = build_index(root, &config, &registry, |t| {
         embedder.embed(t).unwrap_or_else(|_| vec![0.0; dim])
     })
@@ -84,7 +84,7 @@ fn cmd_index(root: &Path) {
         eprintln!("[timing] save_index {:.3}s", t.elapsed().as_secs_f64());
     }
     eprintln!(
-        "[marksman] done: {} symbols · {} chunks · dim {} -> {}/",
+        "[peashooter] done: {} symbols · {} chunks · dim {} -> {}/",
         index.symbols.len(),
         index.chunks.len(),
         index.meta.dims,
@@ -101,7 +101,7 @@ fn cmd_doctor(root: &Path) {
     let config = rust_config(root);
     let present = ci_walk::present_langs(root, &config).unwrap_or_else(|e| die(e));
     let has = |l: ci_walk::Lang| present.contains(&l);
-    println!("marksman doctor — {}\n", root.display());
+    println!("peashooter doctor — {}\n", root.display());
 
     let mut unhealthy = false;
     // `optional` names tools whose absence narrows a capability (with the hint shown) without
@@ -170,7 +170,7 @@ fn cmd_doctor(root: &Path) {
     if index_exists(root, &config) {
         println!("  ok       {}/{}", root.display(), config.index_dir);
     } else {
-        println!("  none     run `marksman index {}`", root.display());
+        println!("  none     run `peashooter index {}`", root.display());
     }
 
     if unhealthy {
@@ -359,7 +359,7 @@ fn main() {
             cmd_eval(Path::new(&root), Path::new(&eval), k);
         }
         _ => {
-            eprintln!("usage:\n  marksman index <root>\n  marksman retrieve <root> \"<task>\" [--top N] [--json]\n  marksman doctor [<root>]\n  marksman eval <root> <eval.json> [--top N]");
+            eprintln!("usage:\n  peashooter index <root>\n  peashooter retrieve <root> \"<task>\" [--top N] [--json]\n  peashooter doctor [<root>]\n  peashooter eval <root> <eval.json> [--top N]");
             exit(2);
         }
     }

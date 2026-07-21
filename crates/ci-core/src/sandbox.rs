@@ -249,7 +249,7 @@ mod tests {
     fn find_on_path_resolves_absolute_and_bare_and_rejects_missing() {
         assert_eq!(find_on_path("/bin/sh").as_deref(), Some(Path::new("/bin/sh")));
         assert!(find_on_path("sh").is_some(), "a bare name resolves via PATH");
-        assert!(find_on_path("marksman-no-such-binary-xyz").is_none());
+        assert!(find_on_path("peashooter-no-such-binary-xyz").is_none());
         assert!(find_on_path("/nonexistent/abs/path").is_none());
     }
 
@@ -260,7 +260,7 @@ mod tests {
         let s = OciSandbox::new(
             PathBuf::from("/repo"),
             PathBuf::from("/nonexistent/oci-runtime"),
-            "marksman-java".into(),
+            "peashooter-java".into(),
         );
         let mut cmd = Command::new("true");
         assert!(s.run_capped(&mut cmd, Duration::from_secs(5), 4096).is_err());
@@ -273,7 +273,7 @@ mod tests {
     }
 
     // Needs docker (or another OCI runtime) up AND the java image built:
-    //   docker build -f docker/marksman-java.Dockerfile -t marksman-java docker/
+    //   docker build -f docker/peashooter-java.Dockerfile -t peashooter-java docker/
     // Proves the whole M2.2 path: warm container start, identical-path mount, exec, teardown.
     #[test]
     #[ignore]
@@ -282,7 +282,7 @@ mod tests {
             eprintln!("SKIP: no OCI runtime (docker/podman/nerdctl/container) on PATH");
             return;
         };
-        let sb = OciSandbox::new(std::env::temp_dir(), runtime, "marksman-java".into());
+        let sb = OciSandbox::new(std::env::temp_dir(), runtime, "peashooter-java".into());
         let mut cmd = Command::new("java");
         cmd.arg("-version");
         let out = sb

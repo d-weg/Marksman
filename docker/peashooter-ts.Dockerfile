@@ -1,9 +1,9 @@
-# Marksman ts image — the full TypeScript toolchain at PINNED versions, so a host running
-# Marksman needs no Node at all (M6: unlike the other languages, TS's READ path — the
+# Peashooter ts image — the full TypeScript toolchain at PINNED versions, so a host running
+# Peashooter needs no Node at all (M6: unlike the other languages, TS's READ path — the
 # scip-typescript producer — needs the toolchain too, so this image serves indexing AND the
 # gate). Built locally:
 #
-#   docker build -f docker/marksman-ts.Dockerfile -t marksman-ts docker/
+#   docker build -f docker/peashooter-ts.Dockerfile -t peashooter-ts docker/
 #
 # Global installs expose bare `scip-typescript` and `tsgo` on PATH so the containerized
 # provider resolves them by name (docs/container-gate-spec.md §9b). The gate tier in-container

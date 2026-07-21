@@ -3,10 +3,10 @@ name = "ci-mcp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Marksman MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits."
+description = "Peashooter MCP server (stdio): retrieve_context / describe_architecture / list_anchors / apply_edits."
 
 [[bin]]
-name = "marksman-mcp"
+name = "peashooter-mcp"
 path = "src/main.rs"
 
 [dependencies]
