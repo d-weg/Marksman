@@ -1,11 +1,11 @@
-# Peashooter
+# Peashooter MCP
 
 <p align="center">
   <img src="docs/assets/hero-peashooter.svg" width="100%"
        alt="A Plants-vs-Zombies lawn: sunflowers produce sun labelled 'token budget', while peashooters gun down zombies labelled with token-wasters — 'grep whole repo', 're-verify by hand', 'stale read', 'broken edit → rework'. Tagline: every token defended before it's spent.">
 </p>
 
-[![CI](https://github.com/d-weg/Peashooter/actions/workflows/ci.yml/badge.svg)](https://github.com/d-weg/Peashooter/actions/workflows/ci.yml)
+[![CI](https://github.com/d-weg/peashooter-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/d-weg/peashooter-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 **Precise code retrieval and type-checked edits for coding agents, over MCP.**
@@ -69,8 +69,8 @@ Three steps to set up — build, index, register — plus a one-time **agent pre
 ### 1. Build
 
 ```bash
-git clone https://github.com/d-weg/Peashooter.git
-cd Peashooter
+git clone https://github.com/d-weg/peashooter-mcp.git
+cd peashooter-mcp
 cargo build --release   # → target/release/peashooter (CLI) and peashooter-mcp (MCP server)
 ```
 
@@ -87,7 +87,7 @@ target/release/peashooter retrieve /path/to/your/repo "where is the rate limiter
 **Claude Code:**
 
 ```bash
-claude mcp add peashooter -- /absolute/path/to/Peashooter/target/release/peashooter-mcp
+claude mcp add peashooter -- /absolute/path/to/peashooter-mcp/target/release/peashooter-mcp
 ```
 
 **Any MCP client:**
@@ -96,7 +96,7 @@ claude mcp add peashooter -- /absolute/path/to/Peashooter/target/release/peashoo
 {
   "mcpServers": {
     "peashooter": {
-      "command": "/absolute/path/to/Peashooter/target/release/peashooter-mcp"
+      "command": "/absolute/path/to/peashooter-mcp/target/release/peashooter-mcp"
     }
   }
 }
