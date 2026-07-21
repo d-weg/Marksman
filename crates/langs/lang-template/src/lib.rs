@@ -24,7 +24,7 @@
 //! 4. **Proof**: fixtures in `ci-conformance/tests/conformance.rs` (the fast battery), plus an
 //!    `#[ignore]` e2e against the real checker in your crate: reject a type error, accept a
 //!    clean edit, land a cross-file rename (`treesitter_gated_gates_and_renames` in lang-ts is
-//!    the pattern). A `marksman-provider-<lang>` sidecar bin comes with the real crate
+//!    the pattern). A `peashooter-provider-<lang>` sidecar bin comes with the real crate
 //!    (`lang-rust/src/sidecar.rs` is the pattern); the template ships none on purpose.
 //! 5. **Moves/deletes**: implement the reference-model hooks from `provider-contract.md` §8
 //!    (`file_to_ref` / `ref_occurrences` / `membership_edits`) — and if your language is the

@@ -91,7 +91,7 @@ fn engine_factory(root: &Path) -> EngineFactory {
         Ok(Box::new(gate::PhpEngine::new(
             engine_root,
             phpstan,
-            ci_core::resolve_sandbox(engine_root, "marksman-php"),
+            ci_core::resolve_sandbox(engine_root, "peashooter-php"),
         )) as Box<dyn GateEngine + Send>)
     })
 }
@@ -552,7 +552,7 @@ mod tests {
         );
     }
 
-    // An engine whose toolchain runs inside the `marksman-php` OCI container (bypassing the host
+    // An engine whose toolchain runs inside the `peashooter-php` OCI container (bypassing the host
     // probe, as `CI_SANDBOX=oci` would at runtime). `phpstan` field is a placeholder — the
     // containerized gate resolves phpstan by bare name in the image.
     fn oci_php_factory() -> EngineFactory {
@@ -560,7 +560,7 @@ mod tests {
             let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
                 engine_root.to_path_buf(),
                 ci_core::oci_runtime().expect("an OCI runtime on PATH"),
-                "marksman-php".into(),
+                "peashooter-php".into(),
             ));
             Ok(Box::new(gate::PhpEngine::new(
                 engine_root,
@@ -571,7 +571,7 @@ mod tests {
     }
 
     // M2.4 (docs/container-gate-spec.md §9b). Requires docker (or another OCI runtime) up AND the
-    // php image:  docker build -f docker/marksman-php.Dockerfile -t marksman-php docker/
+    // php image:  docker build -f docker/peashooter-php.Dockerfile -t peashooter-php docker/
     // The PHPStan gate AND the phpactor cross-file rename both run in the container from the image
     // (the gate's overlay tree lives under $TMPDIR, which the sandbox mounts), so this passes with
     // NO host php/phpstan/phpactor — the second bench "absent LSP" case (php rename), closed.

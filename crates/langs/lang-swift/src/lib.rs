@@ -93,7 +93,7 @@ fn engine_factory() -> EngineFactory {
         if let Some(missing) = gate_missing() {
             return Err(ci_core::Error::Driver(format!("swift edit engine unavailable.\n{missing}")));
         }
-        Ok(Box::new(gate::SwiftEngine::new(root, ci_core::resolve_sandbox(root, "marksman-swift")))
+        Ok(Box::new(gate::SwiftEngine::new(root, ci_core::resolve_sandbox(root, "peashooter-swift")))
             as Box<dyn GateEngine + Send>)
     })
 }
@@ -502,13 +502,13 @@ mod tests {
         );
     }
 
-    // An engine whose toolchain runs inside the `marksman-swift` OCI container.
+    // An engine whose toolchain runs inside the `peashooter-swift` OCI container.
     fn oci_swift_factory() -> EngineFactory {
         Arc::new(|root: &Path| {
             let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
                 root.to_path_buf(),
                 ci_core::oci_runtime().expect("an OCI runtime on PATH"),
-                "marksman-swift".into(),
+                "peashooter-swift".into(),
             ));
             Ok(Box::new(gate::SwiftEngine::new(root, sandbox))
                 as Box<dyn GateEngine + Send>)
@@ -516,7 +516,7 @@ mod tests {
     }
 
     // Requires docker (or another OCI runtime) up AND the swift image:
-    //   docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/
+    //   docker build -f docker/peashooter-swift.Dockerfile -t peashooter-swift docker/
     // `swift build` gate AND the sourcekit-lsp rename both run in the container, so this passes
     // with NO host swift toolchain. Swift-on-Linux differs slightly from macOS; the rename must
     // still land cross-file.

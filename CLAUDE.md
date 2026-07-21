@@ -1,8 +1,8 @@
 # Working in this repo
 
-**Use the Marksman MCP tools for code navigation and edits here.** This *is* the Marksman codebase
+**Use the Peashooter MCP tools for code navigation and edits here.** This *is* the Peashooter codebase
 (a Rust workspace of `ci-*` spine crates + per-language providers under `crates/langs/`) — dogfood
-it. When the `marksman` MCP server is registered, prefer its **two tools** over raw
+it. When the `peashooter` MCP server is registered, prefer its **two tools** over raw
 `grep`/`Read`/`Edit`:
 
 - **`inspect`** — read and locate code; one tool, `mode`-dispatched:
@@ -21,9 +21,9 @@ it. When the `marksman` MCP server is registered, prefer its **two tools** over 
 
 Handles/ids from `inspect` feed straight into `apply_edits`.
 
-If those tools aren't present, the `marksman` MCP server isn't registered (or points at a stale
-binary): build it — `cargo build --release`, then `claude mcp add marksman --
-target/release/marksman-mcp` — or fall back to the standard tools.
+If those tools aren't present, the `peashooter` MCP server isn't registered (or points at a stale
+binary): build it — `cargo build --release`, then `claude mcp add peashooter --
+target/release/peashooter-mcp` — or fall back to the standard tools.
 
 ## Non-negotiables (see CONTRIBUTING.md)
 

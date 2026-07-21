@@ -1,4 +1,4 @@
-# Marksman language images — container mode
+# Peashooter language images — container mode
 
 One image per gated language, holding its whole toolchain at **pinned versions**: the gate
 (type-check verdict), the rename engine (LSP), and — for TypeScript only — the indexer
@@ -9,16 +9,16 @@ accepts. Design + measurements: [docs/container-gate-spec.md](../docs/container-
 
 ## Build (local — images are never pulled)
 
-> The helper `scripts/marksman-images.sh` wraps all of this with runtime detection and a pin
+> The helper `scripts/peashooter-images.sh` wraps all of this with runtime detection and a pin
 > check — `check` / `build [langs...]` / `list`. See [docs/container-guide.md](../docs/container-guide.md)
 > for the full walkthrough. The manual commands below are the equivalent it runs.
 
 ```bash
-docker build -f docker/marksman-ts.Dockerfile    -t marksman-ts    docker/   # ~515MB — scip-typescript + tsgo + typescript
-docker build -f docker/marksman-rust.Dockerfile  -t marksman-rust  docker/   #        — cargo + rust-analyzer
-docker build -f docker/marksman-java.Dockerfile  -t marksman-java  docker/   # ~905MB — JDK 21 + jdtls
-docker build -f docker/marksman-php.Dockerfile   -t marksman-php   docker/   # ~450MB — php + phpstan + phpactor
-docker build -f docker/marksman-swift.Dockerfile -t marksman-swift docker/   # ~2.5GB — the Swift toolchain (the compiler is the size)
+docker build -f docker/peashooter-ts.Dockerfile    -t peashooter-ts    docker/   # ~515MB — scip-typescript + tsgo + typescript
+docker build -f docker/peashooter-rust.Dockerfile  -t peashooter-rust  docker/   #        — cargo + rust-analyzer
+docker build -f docker/peashooter-java.Dockerfile  -t peashooter-java  docker/   # ~905MB — JDK 21 + jdtls
+docker build -f docker/peashooter-php.Dockerfile   -t peashooter-php   docker/   # ~450MB — php + phpstan + phpactor
+docker build -f docker/peashooter-swift.Dockerfile -t peashooter-swift docker/   # ~2.5GB — the Swift toolchain (the compiler is the size)
 ```
 
 Build only what your repos need — a language's container starts lazily, on its first
@@ -27,7 +27,7 @@ operation, and only when that language's files exist in the repo.
 ## Enable
 
 ```bash
-CI_SANDBOX=oci marksman-mcp --root /path/to/repo
+CI_SANDBOX=oci peashooter-mcp --root /path/to/repo
 # or in an MCP client config:  "env": { "CI_SANDBOX": "oci" }
 ```
 
@@ -40,7 +40,7 @@ CI_SANDBOX=oci marksman-mcp --root /path/to/repo
   change the verdict environment silently, which the provider contract forbids (§9).
 - **Mechanics**: one warm, detached container per language, reused across operations, removed
   on exit. The repo and the system temp dir are bind-mounted at their identical host paths,
-  so every path in requests, replies, and artifacts (`.marksman/`) is valid on both sides.
+  so every path in requests, replies, and artifacts (`.peashooter/`) is valid on both sides.
   Tools are resolved by bare name on the image's PATH (`ci_core::tool_command`).
 
 ## Version pins

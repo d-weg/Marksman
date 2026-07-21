@@ -22,7 +22,7 @@ use tree_sitter::Node as TsNode;
 const FP_VERSION: u64 = 1;
 
 pub(crate) fn fingerprint_path(root: &Path) -> PathBuf {
-    root.join(".marksman").join("rust.scip.fingerprint.json")
+    root.join(".peashooter").join("rust.scip.fingerprint.json")
 }
 
 /// Does this file feed `rust-analyzer scip`? The `.rs` sources plus the manifests that shape

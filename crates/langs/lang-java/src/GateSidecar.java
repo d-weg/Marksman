@@ -48,7 +48,7 @@ public class GateSidecar {
         }
         // Class output goes to a throwaway dir (never on any lookup path): the gate wants
         // diagnostics, not artifacts, but javac insists on somewhere to write.
-        Path classOut = Files.createTempDirectory("marksman-java-gate");
+        Path classOut = Files.createTempDirectory("peashooter-java-gate");
         classOut.toFile().deleteOnExit();
         BufferedReader in = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
         String line;

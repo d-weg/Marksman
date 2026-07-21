@@ -20,7 +20,7 @@ const FP_VERSION: u64 = 2;
 const TOOL_KEY: &str = "//scip-typescript";
 
 pub(crate) fn fingerprint_path(root: &Path) -> PathBuf {
-    root.join(".marksman").join("index.scip.fingerprint.json")
+    root.join(".peashooter").join("index.scip.fingerprint.json")
 }
 
 /// Does this file feed scip-typescript's output? Sources (`.d.ts` included — it can't hurt),

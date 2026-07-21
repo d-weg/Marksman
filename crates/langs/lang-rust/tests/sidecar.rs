@@ -1,11 +1,11 @@
-//! End-to-end: spawn the `marksman-provider-rust` sidecar and drive it over the protobuf wire.
+//! End-to-end: spawn the `peashooter-provider-rust` sidecar and drive it over the protobuf wire.
 use ci_core::{CommitResult, EditOp, EditOpts, Granularity, LanguageProvider};
 use ci_proto::ProcessProvider;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn sidecar(root: &Path) -> ProcessProvider {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_marksman-provider-rust"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_peashooter-provider-rust"));
     cmd.arg("--root").arg(root);
     ProcessProvider::spawn(cmd).expect("spawn sidecar")
 }

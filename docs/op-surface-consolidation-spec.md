@@ -4,7 +4,7 @@
 implemented and verified green (workspace build zero-warning, full non-ignored suite, all
 real-tool `#[ignore]` e2e batteries). Decisions recorded: F9 → option (a) (delete the
 hidden arms). The P6 bench spot-check ran 2026-07-06 (full sweep, both suites, both arms,
-1 run/cell, same model as the published table): **no freshness regression** — Marksman-arm
+1 run/cell, same model as the published table): **no freshness regression** — Peashooter-arm
 turn counts equal the published §1 medians in 10/12 comparable cells, `move-rust` improved
 (4→3 calls, $0.0712→$0.0466), and the one over-median cell (`body-edit-ts`, 5→7) is an
 agent-side placement correction whose transcript *demonstrates* the freshness channel

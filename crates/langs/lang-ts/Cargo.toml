@@ -21,7 +21,7 @@ tree-sitter-typescript = "0.23.2"
 lang-fallback = { path = "../lang-fallback" }
 
 [[bin]]
-name = "marksman-provider-ts"
+name = "peashooter-provider-ts"
 path = "src/sidecar.rs"
 
 [dev-dependencies]

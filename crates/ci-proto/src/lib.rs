@@ -535,7 +535,7 @@ pub fn sidecar_command_with(
     allow_path: bool,
     manifest_bin: Option<&str>,
 ) -> Option<Command> {
-    let bin = format!("marksman-provider-{lang}");
+    let bin = format!("peashooter-provider-{lang}");
     let from_manifest = manifest_bin.map(PathBuf::from).filter(|p| p.is_file());
     let from_env = std::env::var(format!("CI_PROVIDER_{}", lang.to_uppercase()))
         .ok()
@@ -610,7 +610,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("vendored-provider");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        // `zzlang` avoids colliding with any real `marksman-provider-*` sibling of the test exe.
+        // `zzlang` avoids colliding with any real `peashooter-provider-*` sibling of the test exe.
         let cmd = sidecar_command_with("zzlang", dir.path(), false, bin.to_str())
             .expect("a vendored manifest bin resolves the sidecar");
         assert_eq!(cmd.get_program(), bin.as_os_str(), "vendored binary used verbatim");

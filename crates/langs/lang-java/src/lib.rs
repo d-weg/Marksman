@@ -85,7 +85,7 @@ impl LanguageProvider for JavaProvider {
 /// a dependency.
 fn engine_factory() -> EngineFactory {
     Arc::new(|root: &Path| {
-        let sandbox = ci_core::resolve_sandbox(root, "marksman-java");
+        let sandbox = ci_core::resolve_sandbox(root, "peashooter-java");
         let sidecar = gate::JavacSidecar::start(root, &*sandbox).map_err(|e| match gate_missing() {
             Some(missing) => {
                 ci_core::Error::Driver(format!("java edit engine failed to start ({e}).\n{missing}"))
@@ -553,14 +553,14 @@ mod tests {
         );
     }
 
-    // An engine whose toolchain runs inside the `marksman-java` OCI container (bypassing the
+    // An engine whose toolchain runs inside the `peashooter-java` OCI container (bypassing the
     // registry's host probe, exactly as `CI_SANDBOX=oci` would at runtime).
     fn oci_java_factory() -> EngineFactory {
         Arc::new(|root: &Path| {
             let sandbox: Arc<dyn ci_core::Sandbox> = Arc::new(ci_core::OciSandbox::new(
                 root.to_path_buf(),
                 ci_core::oci_runtime().expect("an OCI runtime on PATH"),
-                "marksman-java".into(),
+                "peashooter-java".into(),
             ));
             let sidecar = gate::JavacSidecar::start(root, &*sandbox)?;
             Ok(Box::new(gate::JavaEngine::new(root, sidecar, sandbox)) as Box<dyn GateEngine + Send>)
@@ -569,7 +569,7 @@ mod tests {
 
     // The M2.3 PAYOFF (docs/container-gate-spec.md §9b). Requires docker (or another OCI runtime)
     // up AND the java image:
-    //   docker build -f docker/marksman-java.Dockerfile -t marksman-java docker/
+    //   docker build -f docker/peashooter-java.Dockerfile -t peashooter-java docker/
     // Gate (javac sidecar) AND cross-file rename (jdtls) both run in the container from the image,
     // so this passes with NO host jdtls/javac — the exact bench finding (java rename fell back to
     // manual when host jdtls was absent), closed. jdtls does a real project import in a cold

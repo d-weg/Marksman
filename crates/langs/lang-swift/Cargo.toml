@@ -17,7 +17,7 @@ tempfile = { workspace = true }
 ignore = "0.4"
 
 [[bin]]
-name = "marksman-provider-swift"
+name = "peashooter-provider-swift"
 path = "src/sidecar.rs"
 
 [dev-dependencies]

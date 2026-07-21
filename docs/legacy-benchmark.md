@@ -1,4 +1,4 @@
-# Marksman — the legacy benchmark (T1–T10, direct prompts)
+# Peashooter — the legacy benchmark (T1–T10, direct prompts)
 
 This is the original headline A/B, preserved verbatim as a historical result. It has been
 superseded as the primary benchmark by the **suite benchmark** in
@@ -9,7 +9,7 @@ is: the measurement of the tool's *mechanics* under maximally direct prompts.
 hand the agent the answer's location. T3 names the exact class and field ("In the BM25
 class, change the default value of the k1 field"); T2 frames the move as a file operation
 with both paths spelled out; T4 names the function, the file, and quotes the exact strings
-to change. Under those prompts the agent skips all research — the marksman arm's typical
+to change. Under those prompts the agent skips all research — the peashooter arm's typical
 trajectory is `ToolSearch → apply_edits`, and retrieval is never called. That isolates the
 edit machinery beautifully, but it measures a *narrower* loop than real sessions run. The
 suite benchmark widens the prompts to intent level ("Find it and change its value…", "Move
@@ -26,7 +26,7 @@ unless stated (historical 3-run medians showed the same shape); dates are 2026-0
 ## The legacy A/B
 
 The experiment: give the same agent the same task on the same repo, with and without
-Marksman, and check the result objectively (a shell command per task: greps + the project's
+Peashooter, and check the result objectively (a shell command per task: greps + the project's
 own type-checker — an outcome the agent can't fake). Ten tasks: six on a ~600-symbol
 TypeScript repo, plus four purpose-built fixtures — a mixed Rust+TS repo (T7), Python+Go on
 the ungated tier (T8), a barrel-heavy repo (T9), and a TypeScript workspace monorepo (T10).
@@ -34,7 +34,7 @@ the ungated tier (T8), a barrel-heavy repo (T9), and a TypeScript workspace mono
 | arm | input tok | output tok | sec | $ | vs baseline (in/out/sec/$) | success |
 |---|--:|--:|--:|--:|---|--:|
 | baseline | 1,982,003 | 15,726 | 331 | 1.1989 | — | 10/10 |
-| **rust (Marksman)** | **990,222** | **8,388** | **194** | **0.6648** | **−50% / −47% / −42% / −45%** | **10/10** |
+| **rust (Peashooter)** | **990,222** | **8,388** | **194** | **0.6648** | **−50% / −47% / −42% / −45%** | **10/10** |
 
 | task | what it tests | baseline turns / $ | rust turns / $ |
 |---|---|--:|--:|
@@ -81,8 +81,8 @@ the ungated tier (T8), a barrel-heavy repo (T9), and a TypeScript workspace mono
   registration; the same suite measured **−60%** when the tools registered upfront
   ([benchmarks.md §4.1](benchmarks.md#41-the-tool-loading-turn-your-mcp-client-may-cost-you-a-turn-per-session)).
 
-*Historical note:* the first 7-task run also carried the frozen Node.js prototype Marksman
-was rewritten from, as a third arm. Marksman won or tied it on every task (−53% vs baseline
+*Historical note:* the first 7-task run also carried the frozen Node.js prototype Peashooter
+was rewritten from, as a third arm. Peashooter won or tied it on every task (−53% vs baseline
 overall). Details, including a contamination incident that led to stricter arm isolation,
 are in git history (`docs/benchmarks.md` @ 43d4caf).
 

@@ -26,15 +26,15 @@
 | `jdtls` | precise cross-file rename | optional | `brew install jdtls` (needs Java 21+, e.g. `brew install openjdk@21`) |
 | `mvn` / `gradle` | dependency classpath (typed 3rd-party code) | optional | build tool on `PATH` |
 
-`marksman doctor <repo>` reports what a Java repo needs and what's present.
+`peashooter doctor <repo>` reports what a Java repo needs and what's present.
 
 ## Known gaps
 
 - **Rename hard-requires jdtls** — there is no syntactic rename fallback yet; the gated
   `replace_text` path (surfaced in the reject) is the workaround. **No host jdtls? Use
-  [container mode](../../docker/README.md)**: the `marksman-java` image ships the JDK gate AND
-  jdtls, so rename works with no host install (`docker build -f docker/marksman-java.Dockerfile
-  -t marksman-java docker/`, then `CI_SANDBOX=oci`) — shipped and e2e-verified
+  [container mode](../../docker/README.md)**: the `peashooter-java` image ships the JDK gate AND
+  jdtls, so rename works with no host install (`docker build -f docker/peashooter-java.Dockerfile
+  -t peashooter-java docker/`, then `CI_SANDBOX=oci`) — shipped and e2e-verified
   ([container-gate spec](../container-gate-spec.md)).
 - Symbol resolution has two papercuts that cost a round-trip: `"'DocEntry' is ambiguous (2
   definitions)"` (a class vs its same-named constructor) and `"symbol not found — pass a path"`
@@ -43,10 +43,10 @@
 ## Benchmark (preliminary)
 
 Same corpus and tasks as the [main suite A/B](../benchmarks.md#1-does-it-help--the-suite-ab),
-ported to a Java fixture (`javac` as the gate). Median $ per task, baseline vs Marksman; **run
+ported to a Java fixture (`javac` as the gate). Median $ per task, baseline vs Peashooter; **run
 0, single pass, contaminated — do not cite.**
 
-| task | baseline $ | Marksman $ | Δ$ | note |
+| task | baseline $ | Peashooter $ | Δ$ | note |
 |---|--:|--:|--:|---|
 | rename | 0.071 | 0.108 | +54% | jdtls absent → manual fallback |
 | move | 0.132 | 0.047 | **−64%** | movefix (clean win) |

@@ -3,7 +3,7 @@ name = "ci-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The one make_provider: language name -> constructed provider, for every Marksman binary."
+description = "The one make_provider: language name -> constructed provider, for every Peashooter binary."
 
 [dependencies]
 ci-core = { path = "../ci-core" }

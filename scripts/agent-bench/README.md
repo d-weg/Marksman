@@ -1,6 +1,6 @@
-# Agent A/B benchmark — does Marksman actually help an agent?
+# Agent A/B benchmark — does Peashooter actually help an agent?
 
-The question: **on the same task, does an agent with Marksman spend fewer tokens (and
+The question: **on the same task, does an agent with Peashooter spend fewer tokens (and
 succeed at least as often) as the same agent without it?**
 
 This measures the thing that matters — the agent, end to end — not a synthetic retrieval
@@ -9,7 +9,7 @@ metric. It's built to be trustworthy, not to look good.
 ## Why you can trust it
 
 1. **One variable.** Both arms are the *same* model, *same* prompt, *same* repo at the
-   *same* commit. The only difference is whether the marksman MCP tools are on the
+   *same* commit. The only difference is whether the peashooter MCP tools are on the
    allow-list. (Tools you don't use cost nothing, so this is a fair "availability" test.)
 2. **Objective success.** Each task has a `check` command that exits 0/1 — a cross-file
    rename is "no old name left + new name present + still type-checks", not a vibe. No human
@@ -38,8 +38,8 @@ metric. It's built to be trustworthy, not to look good.
 
 ## Run it (step by step)
 
-Arms: **baseline** (no Marksman) · **rust** (marksman MCP) — the comparison that matters.
-A third **ts** arm (the Node codeindex MCP — the frozen, unmaintained prototype Marksman
+Arms: **baseline** (no Peashooter) · **rust** (peashooter MCP) — the comparison that matters.
+A third **ts** arm (the Node codeindex MCP — the frozen, unmaintained prototype Peashooter
 rewrote) is opt-in via `--arms baseline,rust,ts`, kept only for historical comparison.
 Each arm is a single agent — the subagent-spawn tool is disallowed, so the top-level token/cost
 numbers describe the whole run (a delegated run would otherwise report the main agent's tokens while
@@ -72,7 +72,7 @@ are generated at runtime from this checkout's paths, and every arm runs with
 preflight aborts loudly if `claude` can't return JSON — the run never silently reports zeros.
 
 The script builds each arm's index once, then for each task runs
-the agent twice (with / without Marksman), checks success, and prints a markdown table +
+the agent twice (with / without Peashooter), checks success, and prints a markdown table +
 totals (input/output token deltas, success counts).
 
 > Uses `--dangerously-skip-permissions` so the agent can edit unattended. That's safe **here**
@@ -84,7 +84,7 @@ totals (input/output token deltas, success counts).
 - **Proves:** the real token + success delta of giving *this* agent *these* tools on *these*
   tasks, fully accounted.
 - **Doesn't prove:** generalization beyond the task set. So keep `tasks.json` honest — a mix
-  of Marksman's strengths (cross-file rename, file move) *and* its neutral cases (a tiny
+  of Peashooter's strengths (cross-file rename, file move) *and* its neutral cases (a tiny
   one-line edit), so the average isn't stacked. Add your own tasks; the harness doesn't care
   what they are as long as the `check` is objective.
 
@@ -193,7 +193,7 @@ Two accounting rules for cross-provider tables:
   `CI_BENCH_PRICE="in=<$/MTok>,out=<$/MTok>[,cache_read=…][,cache_write=…]"` to recompute
   from the run's token counts — or ignore `$` and read tokens/turns, which are always true.
 - **Compare arms within a model, never $ across models.** The claim worth testing is "does
-  Marksman's delta hold on model X", not "is model X cheaper" — each model gets its own
+  Peashooter's delta hold on model X", not "is model X cheaper" — each model gets its own
   baseline.
 
 Different *harnesses* (OpenCode, …) are a separate axis: different tool loop, upfront MCP

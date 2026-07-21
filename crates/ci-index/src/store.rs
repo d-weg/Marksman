@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 /// On-disk index schema version. Bump when a persisted shape changes; `load_index` refuses a
 /// mismatched index (with a "re-run index" hint) rather than silently mis-reading an old layout.
-/// v2: dropped the `doc` symbol kind — Marksman is code-only, so an old index that holds doc
+/// v2: dropped the `doc` symbol kind — Peashooter is code-only, so an old index that holds doc
 /// chunks is rejected and rebuilt cleanly.
 /// v3: protobuf single-file store (`index.pb`, see `pb.rs`) replacing the JSON sidecars; an old
 /// JSON dir has no `index.pb`, so it reads as "no index" and rebuilds cleanly.
@@ -185,15 +185,15 @@ mod tests {
 
     // Timing utility, not a correctness test:
     //   CI_TIMING_DIR=/path/to/repo cargo test -p ci-index --release -- --ignored load_timing --nocapture
-    // (expects `<dir>/.marksman`). Used to compare store formats (JSON → protobuf).
+    // (expects `<dir>/.peashooter`). Used to compare store formats (JSON → protobuf).
     #[test]
     #[ignore]
     fn load_timing() {
         let Ok(root) = std::env::var("CI_TIMING_DIR") else {
-            eprintln!("set CI_TIMING_DIR to a repo with a .marksman index");
+            eprintln!("set CI_TIMING_DIR to a repo with a .peashooter index");
             return;
         };
-        let config = Config { index_dir: ".marksman".into(), ..Default::default() };
+        let config = Config { index_dir: ".peashooter".into(), ..Default::default() };
         let mut best = std::time::Duration::MAX;
         for _ in 0..20 {
             let t = std::time::Instant::now();
@@ -340,14 +340,14 @@ mod tests {
     #[test]
     fn index_lock_is_exclusive_then_released() {
         let dir = tempfile::tempdir().unwrap();
-        let l1 = IndexLock::acquire(dir.path(), ".marksman").expect("first lock acquires");
+        let l1 = IndexLock::acquire(dir.path(), ".peashooter").expect("first lock acquires");
         assert!(
-            IndexLock::acquire(dir.path(), ".marksman").is_err(),
+            IndexLock::acquire(dir.path(), ".peashooter").is_err(),
             "a second writer is blocked while the first holds the lock"
         );
         drop(l1);
         assert!(
-            IndexLock::acquire(dir.path(), ".marksman").is_ok(),
+            IndexLock::acquire(dir.path(), ".peashooter").is_ok(),
             "lock is released on drop"
         );
     }

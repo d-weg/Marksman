@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Agent A/B/C benchmark — same agent, same tasks, same repo, across arms:
-  baseline  (no marksman)   ·   rust (marksman MCP)   ·   ts (the Node prototype MCP)
+  baseline  (no peashooter)   ·   rust (peashooter MCP)   ·   ts (the Node prototype MCP)
 
 Trustworthy by construction (see README.md): the only thing that varies between arms is
 which MCP server is loaded; model, prompt, and repo start-state are identical; every run
@@ -18,19 +18,19 @@ import argparse, json, os, pathlib, shutil, statistics, subprocess, sys, tempfil
 HERE = pathlib.Path(__file__).parent
 TASKS = json.loads((HERE / "tasks.json").read_text())
 ROOT = HERE.parent.parent
-RUST = str(ROOT / "target/release/marksman")
+RUST = str(ROOT / "target/release/peashooter")
 CLAUDE = os.environ.get("CLAUDE_BIN", "claude")
 TS_DIR = os.environ.get("CODEINDEX_TS_DIR", os.path.expanduser("~/codeindex"))
 
 BASE_TOOLS = "Read,Grep,Glob,Edit,Write,Bash"
 CI_TOOLS = ",".join([
-    "mcp__marksman__apply_edits",
-    "mcp__marksman__inspect",
+    "mcp__peashooter__apply_edits",
+    "mcp__peashooter__inspect",
 ])
 
-# The three arms; "baseline" runs with no marksman MCP. Configs are GENERATED at runtime
+# The three arms; "baseline" runs with no peashooter MCP. Configs are GENERATED at runtime
 # (see mcp_config_for) so the repo carries no machine-specific absolute paths. Both servers
-# are named "marksman" so the same mcp__marksman__* tool allow-list works for either.
+# are named "peashooter" so the same mcp__peashooter__* tool allow-list works for either.
 ARMS = ("baseline", "rust", "ts")
 
 
@@ -47,9 +47,9 @@ def mcp_config_for(arm):
         for k in ("CI_MODEL_DIR", "CI_TS_MODE"):
             if os.environ.get(k):
                 env[k] = os.environ[k]
-        cfg = {"mcpServers": {"marksman": {"command": str(ROOT / "target/release/marksman-mcp"), "env": env}}}
+        cfg = {"mcpServers": {"peashooter": {"command": str(ROOT / "target/release/peashooter-mcp"), "env": env}}}
     else:  # ts — the Node oracle
-        cfg = {"mcpServers": {"marksman": {
+        cfg = {"mcpServers": {"peashooter": {
             "command": os.path.join(TS_DIR, "node_modules/.bin/tsx"),
             "args": [os.path.join(TS_DIR, "src/mcp.ts")],
         }}}
@@ -66,11 +66,11 @@ def sh(cmd, cwd=None, env=None):
 # Index dirs are NOT plain build artifacts: apply_edits reindexes-on-commit, so a run that
 # edits the repo mutates its index. If we merely preserved them across resets, run N+1 would
 # search an index that reflects run N's edits (e.g. a symbol already renamed) while the SOURCE
-# was reset — a stale, source-inconsistent index that silently penalizes the marksman arms.
+# was reset — a stale, source-inconsistent index that silently penalizes the peashooter arms.
 # So we snapshot the freshly-built, base-consistent indexes ONCE and RESTORE them on every
 # reset (a file copy, not a reindex — no API cost). Every run starts from an identical index
 # that matches the reset source.
-INDEX_DIRS = [".codeindex", ".marksman"]
+INDEX_DIRS = [".codeindex", ".peashooter"]
 
 
 def snapshot_indexes(repo):
@@ -114,13 +114,13 @@ def materialize_fixture(name):
     return tmp
 
 
-# Nudge the marksman arms to actually USE the tools — otherwise the benchmark
+# Nudge the peashooter arms to actually USE the tools — otherwise the benchmark
 # measures the agent's whim (it often defaults to grep + manual edits) instead of the
 # tool. The baseline gets no such nudge; it uses its standard tools.
 PREAMBLE = (
-    "You have marksman MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
+    "You have peashooter MCP tools. They are DEFERRED — load them FIRST, in ONE call, with their FULL "
     "names:\n"
-    "  ToolSearch  query=\"select:mcp__marksman__apply_edits,mcp__marksman__inspect\"\n"
+    "  ToolSearch  query=\"select:mcp__peashooter__apply_edits,mcp__peashooter__inspect\"\n"
     "What they do: apply_edits (ALL code edits — structural + surgical, type-checked before landing "
     "when the language has a checker; TRUST the reply — never re-verify by hand), inspect (ALL "
     "reads/locating — mode: search|symbol|file|node|map).\n"
@@ -313,7 +313,7 @@ def preflight():
 
 def build_indexes(repo, arms):
     if "rust" in arms and os.path.exists(RUST):
-        print("  building marksman index (.marksman) …")
+        print("  building peashooter index (.peashooter) …")
         sh([RUST, "index", repo], env={**os.environ, "CI_NPM_CACHE": "/tmp/ci-npm-cache"})
     if "ts" in arms and os.path.isdir(TS_DIR):
         print("  building TS index (.codeindex) …")
@@ -336,7 +336,7 @@ def prepare_repo(repo, arms):
             f"  Delete it and re-run — go.sh re-clones a fresh one: rm -rf {repo}"
         )
     base = probe.stdout.strip()
-    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `marksman
+    # Build the snapshot index from a PRISTINE, base-consistent tree. Critical: `peashooter
     # index` updates INCREMENTALLY (mtime-keyed), so a stale index left by a prior run — or a
     # dirty working tree — would be snapshotted and then restored on every reset, leaving the
     # index inconsistent with the reset SOURCE (the T6 postmortem). Reset tracked source to
@@ -353,7 +353,7 @@ def main():
     ap.add_argument("--repo", help="main benchmark repo; required unless every selected task has its own `fixture`")
     ap.add_argument("--task")
     ap.add_argument("--runs", type=int, default=1)
-    # "ts" (the Node prototype Marksman rewrote) is opt-in: it's frozen/unmaintained and exists
+    # "ts" (the Node prototype Peashooter rewrote) is opt-in: it's frozen/unmaintained and exists
     # only as a historical comparison arm — the benchmark that matters is baseline vs rust.
     ap.add_argument("--arms", default="baseline,rust")
     ap.add_argument("--model", default=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),

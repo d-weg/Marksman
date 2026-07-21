@@ -22,7 +22,7 @@ use std::process::Command;
 fn workspace_dir(root: &Path) -> PathBuf {
     let mut h = DefaultHasher::new();
     root.hash(&mut h);
-    std::env::temp_dir().join("marksman-jdtls").join(format!("{:016x}", h.finish()))
+    std::env::temp_dir().join("peashooter-jdtls").join(format!("{:016x}", h.finish()))
 }
 
 pub(crate) const INSTALL_HINT: &str =
@@ -71,7 +71,7 @@ fn java_major(home: &Path) -> Option<u32> {
 }
 
 /// Start jdtls for `root`. The eclipse workspace persists per repo
-/// (`.marksman/jdtls-workspace`): first import of a real Maven/Gradle repo can take minutes,
+/// (`.peashooter/jdtls-workspace`): first import of a real Maven/Gradle repo can take minutes,
 /// warm restarts don't — persisting it is load-bearing, not an optimization.
 pub(crate) fn start(root: &Path, sandbox: &dyn ci_core::Sandbox) -> Result<LspClient> {
     // The image ships jdtls (Java 21 + the server on PATH); `tool_command` resolves it by bare name

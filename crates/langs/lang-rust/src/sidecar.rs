@@ -1,8 +1,8 @@
-//! `marksman-provider-rust` — the Rust language provider as a standalone sidecar process.
+//! `peashooter-provider-rust` — the Rust language provider as a standalone sidecar process.
 //!
 //! The core spawns this and talks to it over the [`ci_proto`] protobuf wire instead of linking
 //! `RustProvider` in-process — the first step toward downloadable, language-agnostic providers.
-//! Usage: `marksman-provider-rust --root /path/to/repo` (then it serves stdin/stdout).
+//! Usage: `peashooter-provider-rust --root /path/to/repo` (then it serves stdin/stdout).
 use lang_rust::{outline, RustProvider};
 use std::path::PathBuf;
 
@@ -19,7 +19,7 @@ fn main() {
     let use_scip = ci_core::Config::load(&root).map(|c| c.scip_enabled("rust")).unwrap_or(false);
     let provider = RustProvider::new(&root).with_scip(use_scip);
     if let Err(e) = ci_proto::serve_stdio(provider, outline) {
-        eprintln!("[marksman-provider-rust] serve error: {e}");
+        eprintln!("[peashooter-provider-rust] serve error: {e}");
         std::process::exit(1);
     }
 }

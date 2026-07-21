@@ -1,11 +1,11 @@
-# Marksman — roadmap
+# Peashooter — roadmap
 
 Directions with a delivery plan: the open work is organized into **batches**, executed one at a
 time — smallest safe change, suite stays green, a test for every new branch, one commit per
 batch, checkboxes ticked here.
 
 ## Invariants (the bar every batch holds)
-- **Code only.** Marksman indexes and edits **source code** — nothing else. No docs (`.md`), no
+- **Code only.** Peashooter indexes and edits **source code** — nothing else. No docs (`.md`), no
   config/data (`.toml`/`.json`/`.yaml`). Code already has richer structural editing (AST-anchored,
   gated `apply_edits`) than any key-path editor could give a data file, and non-code files are a
   different domain agents handle with plain text tools. Keeps the surface (and the MCP tool schema)
@@ -30,7 +30,7 @@ Node is only touched when `.ts*` files are present; the remaining gap is that th
 isn't lazily fetched (Batch 3).
 
 **Chosen distribution model:** providers live in-repo under `crates/langs/`, each with a
-`marksman-provider-<lang>` bin; one `cargo build` produces them all, and `CI_PROVIDER=sidecar`
+`peashooter-provider-<lang>` bin; one `cargo build` produces them all, and `CI_PROVIDER=sidecar`
 spawns the one a repo needs (resolved next to the exe). Adding a language is a new folder in
 `langs/` — no download system. Downloadable/third-party providers stay deferred until there's a
 reason (a slim core, or externally-published providers).
@@ -44,7 +44,7 @@ reason (a slim core, or externally-published providers).
 - **Provider selection v0** — manifest/extension pick (Cargo.toml vs package.json; `CI_LANG`); Node
   only for a TS repo.
 - **Sidecar protocol** — `ci-proto` (protobuf wire + framing), `ProcessProvider` host, and
-  `marksman-provider-{rust,ts}` sidecars; `CI_PROVIDER=sidecar` routes CLI/MCP over the wire.
+  `peashooter-provider-{rust,ts}` sidecars; `CI_PROVIDER=sidecar` routes CLI/MCP over the wire.
 - **Skeletal context** — `retrieve_context detailLevel` (`pointers`/`outline`/`full`), secondary
   import-graph files auto-fold to outline, plus the `read_node` drill-down tool.
 - **Surgical sub-node edits** — `set_body`, `replace_node target:body|return|param.N|doc`,
@@ -91,7 +91,7 @@ against the pre-edit world.
 
 ### Batch 3 — Provisioning parity (embedder + schema)  ✅
 **Why:** the lazy-fetch invariant applied to provider tooling but **not** the embedding model, which
-was a manual `git clone … ~/.marksman/models`; and a query embedded with the wrong dim could panic
+was a manual `git clone … ~/.peashooter/models`; and a query embedded with the wrong dim could panic
 `cosine_normalized`.
 - [x] `ci_embed::ensure_model` — lazy-fetches the Model2Vec files from HuggingFace via `curl` on
       first use (same lazy-tooling model as the providers), no-op when present; `CI_MODEL_DIR` still
@@ -137,11 +137,11 @@ or Python repo gets degraded weighting even once indexing is multi-language.
       Rust (axum/actix/rocket/sqlx/diesel/sea-orm, leptos/yew) and Python (django/flask/fastapi/
       sqlalchemy/celery/…). Tested: Cargo+pyproject dep parsing, `[workspace]`-root skip, and a
       crate with an `axum` dep persisting `role: "backend"`.
-- [x] **5c — labeled eval harness (done).** `marksman eval <root> <eval.json> [--top N]` runs a
+- [x] **5c — labeled eval harness (done).** `peashooter eval <root> <eval.json> [--top N]` runs a
       labeled set (`{task, expectFiles}`) against `retrieve` and reports overlap@k + MRR — the gate
       for any future weight change (see Invariants). Scoring (`score_case`: reciprocal rank + hit@k)
-      is a pure, unit-tested function; a seed set on Marksman's own crates lives at
-      [docs/eval/marksman.json](eval/marksman.json). (Wiring `scripts/agent-bench` to consume it is
+      is a pure, unit-tested function; a seed set on Peashooter's own crates lives at
+      [docs/eval/peashooter.json](eval/peashooter.json). (Wiring `scripts/agent-bench` to consume it is
       follow-up.)
 - [ ] (ref) the three-way + agent A/B benchmark design lives in [benchmarks.md](benchmarks.md).
 
@@ -191,7 +191,7 @@ alongside code.
       contract is now documented as 0-based UTF-8 bytes (matches tree-sitter + the VFS); non-ASCII
       tests in `ci-core` and `ci-vfs`. (SCIP/LSP UTF-16 boundaries convert at their own edges.)
 - ~~Structured providers (TOML/JSON/YAML/Markdown): edit config/docs by key / heading path in the
-      same atomic batch as code.~~ **Cut — deliberately descoped.** Marksman is a **code-only** tool:
+      same atomic batch as code.~~ **Cut — deliberately descoped.** Peashooter is a **code-only** tool:
       non-code files aren't code, and code already has richer structural editing (AST-anchored,
       gated `apply_edits`). `set_key`/`delete_key` added surface area (a parser module, two edit ops,
       MCP-schema tokens paid every turn) for a niche "edit a `Cargo.toml` dep atomically with the
@@ -270,8 +270,8 @@ existing hub/expansion tests plus the eval are the gate.
       (`#[serde(default)]`). In `retrieve`, fold a bounded, **rank-normalized** centrality multiplier
       (`1.0 + centrality_weight · normrank(pr[file])`, `normrank`∈[0,1] over the candidate set — rank
       is robust to one hub dominating raw PR) into the same `weighted_fused` multiply that applies
-      `weight_for`. **Per the "no ranking change without an eval" invariant:** run `marksman eval
-      <root> docs/eval/marksman.json` at weight ∈ {0, 0.1, 0.2, 0.3}; commit the default that
+      `weight_for`. **Per the "no ranking change without an eval" invariant:** run `peashooter eval
+      <root> docs/eval/peashooter.json` at weight ∈ {0, 0.1, 0.2, 0.3}; commit the default that
       maximizes overlap@k + MRR **without regressing** baseline. If nothing beats weight=0, ship the
       mechanism with default `0.0` (off) + a note — the knob still helps hub-heavy repos and the
       invariant (no regression) holds. Tests: hub/expansion tests stay green; a synthetic case where

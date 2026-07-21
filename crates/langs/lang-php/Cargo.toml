@@ -16,7 +16,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 
 [[bin]]
-name = "marksman-provider-php"
+name = "peashooter-provider-php"
 path = "src/sidecar.rs"
 
 [dev-dependencies]

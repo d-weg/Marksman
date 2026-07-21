@@ -1,6 +1,6 @@
 use std::path::Path;
 
-/// Coarse language tag used for provider dispatch. Marksman is code-only; anything that isn't a
+/// Coarse language tag used for provider dispatch. Peashooter is code-only; anything that isn't a
 /// source language a provider handles is `Other` (ignored).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Lang {

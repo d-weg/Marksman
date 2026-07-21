@@ -15,7 +15,7 @@ P1–P13 landed, one proposal per commit, verified green.** The record:
   `ci-providers` crate hosting the one `make_provider` (the CLI gains the php/swift gated arms —
   the F8 drift, closed). Recorded LEAVEs stand (provider lib.rs delegation, sidecar bins,
   CI_TIMING).
-- **Consistency (P9–P12):** serverInfo `"marksman"`; all agent-facing text rewritten in
+- **Consistency (P9–P12):** serverInfo `"peashooter"`; all agent-facing text rewritten in
   `inspect`-mode vocabulary; `MOVE_COVERAGE` for java/php/swift wired + pin test extended to
   five languages; `CI_PARITY_REPO` override. **Bonus:** clippy is now 0-warning across
   `--all-targets` (the tree never was; all 31 pre-existing findings fixed — type aliases,
@@ -97,7 +97,7 @@ lie — fix first), **real duplication** (consolidate), **overlap by design** (k
 (`ci-core/src/sandbox.rs:37-40`) says UNCAPPED/UNTIMED — while php (`gate.rs:131`) and swift
 (`gate.rs:56`) bound their verdicts with `run_capped(gate_timeout())` and REJECT on timeout
 (rollout-audit B3/B4). The highest-traffic gate is the unprotected one, and the MCP server loop
-(`ci-mcp/src/main.rs:2087`) is single-threaded: a hung `cargo check` freezes Marksman whole.
+(`ci-mcp/src/main.rs:2087`) is single-threaded: a hung `cargo check` freezes Peashooter whole.
 Compounding trap: `RustEngine::diagnostics` (`gate.rs:139-149`) treats *any* error as "cargo
 unavailable" and falls back to rust-analyzer diagnostics — so a naive timeout-as-`Err` fix would
 silently swap the verdict engine, the exact degrade the house rule forbids. The fix must make
@@ -179,7 +179,7 @@ dependency); the shared body needs a new leaf crate above the lang crates.
 ### F9. The MCP server introduces itself as `codeindex-rs` — consistency
 
 `ci-mcp/src/main.rs:2108`: `serverInfo.name = "codeindex-rs"` — client-visible identity,
-two lines below a `[marksman-mcp]` log prefix. Nothing pins it (verified).
+two lines below a `[peashooter-mcp]` log prefix. Nothing pins it (verified).
 
 ### F10. The live `apply_edits` description teaches a removed vocabulary — consistency
 
@@ -331,7 +331,7 @@ should not re-home this).
 
 ### Phase 4 — consistency + docs
 
-**P9. serverInfo → `"marksman"`** (F9). Acceptance: `cargo test -p ci-mcp` green.
+**P9. serverInfo → `"peashooter"`** (F9). Acceptance: `cargo test -p ci-mcp` green.
 **P10. Purge removed tool names from agent-facing text** (F10) — description, error strings,
 module header, rewritten in `inspect`-mode vocabulary. Acceptance: `ci-mcp` tests green; grep
 for the four names in string literals returns only code comments.
@@ -350,7 +350,7 @@ read true afterward.
 
 - No ci-edit mock consolidation, no ci-mcp `main.rs` split, no README/test-count fixes — owned by
   `test-surface-consolidation-spec.md` (T1/T7) and `file-surface-consolidation-spec.md` (P1/F3/F4).
-- No `CI_` → `MARKSMAN_` env rename (open question 1).
+- No `CI_` → `PEASHOOTER_` env rename (open question 1).
 - No re-typing of ci-mcp's `Result<String, String>` handler signatures (open question 2).
 - No logging framework; `eprintln!` + prefixes stays.
 - No provider-boilerplate macro, no sidecar-bin macro, no CI_TIMING helper (cleared above).
@@ -358,7 +358,7 @@ read true afterward.
 
 ## 4. Open questions for review
 
-1. **Rename the `CI_` env prefix to `MARKSMAN_`?** ~30 vars, bench harnesses and container
+1. **Rename the `CI_` env prefix to `PEASHOOTER_`?** ~30 vars, bench harnesses and container
    images read them. (Rec: keep `CI_`; the migration cost lands on every consumer for a purely
    cosmetic win. Revisit only if a public release forces it.)
 2. **ci-mcp's stringly-typed `Result<String, String>` handlers** — unify on `ci_core::Error`?
