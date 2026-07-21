@@ -34,7 +34,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/d-weg/peashooter-mcp"
+repository = "https://github.com/d-weg/Marksman"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
